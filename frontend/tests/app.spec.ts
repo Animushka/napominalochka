@@ -120,6 +120,84 @@ test('Native MainButton and Back retain one handler and remove it on editor exit
   await app.assertClean()
 })
 
+test('Native Back dismisses the editor Select before leaving its unsaved draft', async ({ page }) => {
+  const app = new MockApp(); await app.install(page, { native: true }); await app.open(page)
+  const bridgeState = () => page.evaluate(() => {
+    const b = (window as any).__bridge
+    return { main: b.mainHandlers.size, back: b.backHandlers.size, mainVisible: b.mainVisible, backVisible: b.backVisible }
+  })
+  await page.getByRole('button', { name: 'Edit reminder: Water the plants' }).click()
+  const description = page.getByRole('textbox', { name: 'What should we remind you about?' })
+  await description.fill('Keep this unsaved draft')
+  const recurrence = page.getByRole('button', { name: /Repeat/ }).and(page.locator('[data-slot="select-trigger"]'))
+  await recurrence.click()
+  await expect(page.getByRole('listbox')).toBeVisible()
+  await expect.poll(bridgeState).toEqual({ main: 1, back: 1, mainVisible: true, backVisible: true })
+  await page.evaluate(() => (window as any).__bridge.back())
+  await expect(page.getByRole('listbox')).toHaveCount(0)
+  await expect(description).toHaveValue('Keep this unsaved draft')
+  await expect(page.getByRole('heading', { name: 'Edit reminder', exact: true })).toBeVisible()
+  await expect.poll(bridgeState).toEqual({ main: 1, back: 1, mainVisible: true, backVisible: true })
+  await page.evaluate(() => (window as any).__bridge.back())
+  await expect(page.getByRole('heading', { name: 'Your plans, all here' })).toBeVisible()
+  await expect.poll(bridgeState).toEqual({ main: 0, back: 0, mainVisible: false, backVisible: false })
+  expect(app.matching('PUT', '/api/reminders/11')).toHaveLength(0)
+  await app.assertClean()
+})
+
+test('Native Back is shown only while a settings Select is open', async ({ page }) => {
+  const app = new MockApp(); await app.install(page, { native: true }); await app.open(page)
+  const bridgeState = () => page.evaluate(() => {
+    const b = (window as any).__bridge
+    return { main: b.mainHandlers.size, back: b.backHandlers.size, mainVisible: b.mainVisible, backVisible: b.backVisible }
+  })
+  await expect.poll(bridgeState).toEqual({ main: 0, back: 0, mainVisible: false, backVisible: false })
+  await preferencesAccordion(page).click()
+  const interval = page.getByRole('button', { name: /Repeat until I tap/ })
+  await interval.click()
+  await expect(page.getByRole('listbox')).toBeVisible()
+  await expect.poll(bridgeState).toEqual({ main: 0, back: 1, mainVisible: false, backVisible: true })
+  await page.evaluate(() => (window as any).__bridge.back())
+  await expect(page.getByRole('listbox')).toHaveCount(0)
+  await expect(page.getByRole('heading', { name: 'Your plans, all here' })).toBeVisible()
+  await expect(preferencesAccordion(page)).toHaveAttribute('aria-expanded', 'true')
+  await expect.poll(bridgeState).toEqual({ main: 0, back: 0, mainVisible: false, backVisible: false })
+  expect(app.matching('PATCH', '/api/preferences')).toHaveLength(0)
+  await interval.click()
+  await page.getByRole('option', { name: 'Every 30 minutes', exact: true }).click()
+  await expect(interval).toContainText('Every 30 minutes')
+  await expect.poll(bridgeState).toEqual({ main: 0, back: 0, mainVisible: false, backVisible: false })
+  await app.assertClean()
+})
+
+test('Native Back removes editor and overlay registrations when the account changes', async ({ page }) => {
+  const app = new MockApp(); await app.install(page, { native: true }); await app.open(page)
+  const bridgeState = () => page.evaluate(() => {
+    const b = (window as any).__bridge
+    return { main: b.mainHandlers.size, back: b.backHandlers.size, mainVisible: b.mainVisible, backVisible: b.backVisible }
+  })
+  await page.getByRole('button', { name: 'Edit reminder: Water the plants' }).click()
+  await page.getByRole('button', { name: /Repeat/ }).and(page.locator('[data-slot="select-trigger"]')).click()
+  await expect(page.getByRole('listbox')).toBeVisible()
+  await expect.poll(bridgeState).toEqual({ main: 1, back: 1, mainVisible: true, backVisible: true })
+  app.state.pending = []
+  app.state.reminders = [{ ...app.state.reminders[0], id: 202, description: 'Second account plan' }]
+  await page.evaluate(() => {
+    const tg = (window as any).Telegram.WebApp
+    tg.initData = 'fixture-account-202'; tg.initDataUnsafe.user.id = 202
+    window.dispatchEvent(new Event('focus'))
+  })
+  await expect(page.getByRole('button', { name: 'Edit reminder: Second account plan' })).toBeVisible()
+  await expect(page.getByRole('listbox')).toHaveCount(0)
+  await expect.poll(bridgeState).toEqual({ main: 0, back: 0, mainVisible: false, backVisible: false })
+  await page.getByRole('button', { name: 'Edit reminder: Second account plan' }).click()
+  await expect.poll(bridgeState).toEqual({ main: 1, back: 1, mainVisible: true, backVisible: true })
+  await page.evaluate(() => (window as any).__bridge.back())
+  await expect(page.getByRole('heading', { name: 'Your plans, all here' })).toBeVisible()
+  await expect.poll(bridgeState).toEqual({ main: 0, back: 0, mainVisible: false, backVisible: false })
+  await app.assertClean()
+})
+
 test('Alice connects, saves audio off, tests, and enables only after explicit heard confirmation', async ({ page }) => {
   const app = new MockApp(); await app.install(page); await app.open(page); await openAlice(page)
   await expect(page.getByText('Yandex requests permission to view and control your entire smart home.', { exact: false })).toBeVisible()

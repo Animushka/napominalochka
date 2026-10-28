@@ -53,6 +53,66 @@ function telegramCall(action: () => unknown): void {
   try { action(); } catch { /* Optional methods differ across Telegram client versions. */ }
 }
 
+interface BackHandler {
+  callback: () => void;
+  priority: number;
+}
+interface BackCoordinator {
+  handlers: BackHandler[];
+  dispatch: () => void;
+}
+const backCoordinators = new WeakMap<TelegramBackButton, BackCoordinator>();
+
+function registerBackHandler(back: TelegramBackButton, callback: () => void, priority: number): () => void {
+  let coordinator = backCoordinators.get(back);
+  if (!coordinator) {
+    const handlers: BackHandler[] = [];
+    coordinator = {
+      handlers,
+      dispatch: () => {
+        // Only the highest-priority, most recently registered layer consumes Back.
+        const top = handlers.reduce<BackHandler | undefined>((previous, handler) =>
+          !previous || handler.priority >= previous.priority ? handler : previous, undefined);
+        top?.callback();
+      },
+    };
+    backCoordinators.set(back, coordinator);
+    const dispatch = coordinator.dispatch;
+    telegramCall(() => back.onClick(dispatch));
+  }
+  const handler = { callback, priority };
+  coordinator.handlers.push(handler);
+  telegramCall(() => back.show());
+  let registered = true;
+  return () => {
+    if (!registered) return;
+    registered = false;
+    const index = coordinator.handlers.indexOf(handler);
+    if (index !== -1) coordinator.handlers.splice(index, 1);
+    if (coordinator.handlers.length) telegramCall(() => back.show());
+    else {
+      telegramCall(() => back.offClick(coordinator.dispatch));
+      telegramCall(() => back.hide());
+      backCoordinators.delete(back);
+    }
+  };
+}
+
+/** Shares one SDK listener between the current screen and any open overlays. */
+export function useTelegramBack(onBack: (() => void) | undefined, {
+  enabled = true,
+  priority = "screen",
+}: { enabled?: boolean; priority?: "screen" | "overlay" } = {}): void {
+  const back = getTelegram()?.BackButton;
+  const current = useRef(onBack);
+  current.current = onBack;
+  const hasHandler = Boolean(onBack);
+  useEffect(() => {
+    if (!enabled || !hasHandler || typeof back?.onClick !== "function" || typeof back?.offClick !== "function") return;
+    return registerBackHandler(back, () => current.current?.(), priority === "overlay" ? 1 : 0);
+  }, [back, enabled, hasHandler, priority]);
+}
+
 export function haptic(type: "selection" | "error" | "success" | "warning" = "selection"): void {
   telegramCall(() => type === "selection"
     ? getTelegram()?.HapticFeedback?.selectionChanged?.()
@@ -115,10 +175,10 @@ export interface TelegramButtonOptions {
 export function useTelegramButtons({ onSave, onBack, saveLabel, canSave = true, busy = false }: TelegramButtonOptions): { hasNativeSave: boolean } {
   const tg = getTelegram();
   const main = tg?.MainButton;
-  const back = tg?.BackButton;
   const hasNativeSave = Boolean(tg?.initData && typeof main?.setParams === "function" && typeof main?.onClick === "function" && typeof main?.offClick === "function");
   const current = useRef({ onSave, onBack, canSave, busy });
   current.current = { onSave, onBack, canSave, busy };
+  useTelegramBack(() => { if (!current.current.busy) current.current.onBack?.(); }, { enabled: Boolean(onBack) });
 
   useEffect(() => {
     if (!hasNativeSave || !main) return;
@@ -134,20 +194,9 @@ export function useTelegramButtons({ onSave, onBack, saveLabel, canSave = true, 
   }, [hasNativeSave, main]);
 
   useEffect(() => {
-    if (!back?.onClick || !back.offClick) return;
-    const goBack = () => { if (!current.current.busy) current.current.onBack?.(); };
-    telegramCall(() => back.onClick(goBack));
-    return () => {
-      telegramCall(() => back.offClick(goBack));
-      telegramCall(() => back.hide());
-    };
-  }, [back]);
-
-  useEffect(() => {
     if (hasNativeSave) telegramCall(() => main?.setParams({ text: saveLabel, is_visible: Boolean(onSave), is_active: canSave && !busy }));
     telegramCall(() => busy ? main?.showProgress?.() : main?.hideProgress?.());
-    telegramCall(() => onBack ? back?.show() : back?.hide());
-  }, [back, main, hasNativeSave, onSave, onBack, saveLabel, canSave, busy]);
+  }, [main, hasNativeSave, onSave, saveLabel, canSave, busy]);
 
   return { hasNativeSave };
 }

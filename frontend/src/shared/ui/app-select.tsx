@@ -1,3 +1,5 @@
+import { useState } from "react";
+import { useTelegramBack } from "@/shared/lib/telegram";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./select";
 
 export interface AppSelectProps {
@@ -17,8 +19,12 @@ export interface AppSelectProps {
 }
 
 export function AppSelect({ id, value, onValueChange, options, placeholder, disabled, ariaLabel, className, ...props }: AppSelectProps) {
+  const [isOpen, setIsOpen] = useState(false);
+  useTelegramBack(() => setIsOpen(false), { enabled: isOpen, priority: "overlay" });
   return (
     <Select
+      isOpen={isOpen}
+      onOpenChange={setIsOpen}
       value={value || null}
       onChange={(key) => { if (key !== null) onValueChange(String(key)); }}
       isDisabled={disabled}
