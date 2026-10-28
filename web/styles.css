@@ -107,8 +107,6 @@ textarea::placeholder { color: var(--muted); opacity: .8; }
 .button-row { display: flex; gap: 8px; margin-top: 10px; }
 .button-row > * { flex: 1; padding: 12px 9px; font-size: 12px; }
 .privacy-note { display: flex; gap: 7px; margin-top: 12px; font-size: 10px; color: var(--muted); line-height: 1.6; }
-.source-link { display: flex; align-items: center; justify-content: space-between; border-radius: 11px; background: var(--mint); padding: 11px 13px; margin-top: 14px; font-size: 12px; font-weight: 650; text-decoration: none; }
-.attribution { margin-top: 11px; font-size: 9px; color: var(--muted); }
 .page-footer { display: flex; justify-content: center; gap: 7px; align-items: center; font-size: 11px; color: var(--muted); padding: 17px 0 2px; }
 .page-footer > :first-child { color: var(--mint-strong); font-size: 17px; }
 .back-link { display: inline-flex; align-items: center; gap: 9px; background: transparent; padding: 4px 0 11px; min-height: 44px; font-size: 13px; color: var(--muted); }

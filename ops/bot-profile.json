@@ -2,11 +2,11 @@
   "ru": {
     "name": "Напоминалочка 🔔",
     "short_description": "Напоминания о важном в Telegram. Настраивай расписание, отмечай выполнение и откладывай на потом.",
-    "description": "🔔 Напоминалочка — чтобы важное не потерялось.\n\nЛекарства, дела, вода и привычки — по твоему расписанию.\n\nОткрой «Напоминания», задай время и повторы. Я напомню и подожду отметку «Готово». Можно отложить, выбрать интервал повторов и включить контрольную проверку через 20 минут.\n\n🇷🇺 Русский · 🇬🇧 English\nИсходники: github.com/Animushka/napominalochka"
+    "description": "🔔 Напоминалочка — чтобы важное не потерялось.\n\nЛекарства, дела, вода и привычки — по твоему расписанию.\n\nОткрой «Напоминания», задай время и повторы. Я напомню и подожду отметку «Готово». Можно отложить, выбрать интервал повторов и включить контрольную проверку через 20 минут.\n\n🇷🇺 Русский · 🇬🇧 English"
   },
   "en": {
     "name": "Napominalochka 🔔",
     "short_description": "Your reminder companion in Telegram. Set schedules, mark things done, or snooze them for later.",
-    "description": "🔔 Napominalochka keeps the important things in sight.\n\nMedication, errands, water and habits — on your schedule.\n\nOpen Reminders to choose a time and recurrence. I will remind you until you tap Done. Snooze a reminder, choose its repeat interval, or enable a completion check 20 minutes later.\n\n🇬🇧 English · 🇷🇺 Русский\nSource: github.com/Animushka/napominalochka"
+    "description": "🔔 Napominalochka keeps the important things in sight.\n\nMedication, errands, water and habits — on your schedule.\n\nOpen Reminders to choose a time and recurrence. I will remind you until you tap Done. Snooze a reminder, choose its repeat interval, or enable a completion check 20 minutes later.\n\n🇬🇧 English · 🇷🇺 Русский"
   }
 }

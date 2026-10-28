@@ -96,7 +96,7 @@
   "relative.hours_minutes": "in {hours} h {minutes} min",
   "relative.days": "in {days} days",
   "help.commands": "/start — open the bot\n/remindme — create a reminder\n/list — your reminders\n/timezone — timezone\n/language — русский / English\n/calendar — phone calendar\n/clearall — delete reminders\n/unregister — delete your data\n/about — about this bot",
-  "about": "Napominalochka helps you remember what matters. Create reminders in the Mini App or chat, mark them done, and choose how often to be reminded.\n\nOur source: {source}\nBased on ExtremelyNaggyBot by @decryp7:\n{upstream}",
+  "about": "Napominalochka helps you remember what matters. Create reminders in the Mini App or chat, mark them done, and choose how often to be reminded.",
   "command.help": "Help and commands",
   "command.remindme": "Create a reminder",
   "command.list": "Your reminders",

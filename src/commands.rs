@@ -14,9 +14,6 @@ use crate::model::Recurrence;
 use crate::panels;
 use crate::service::{self, ReminderInput, Service};
 
-const SOURCE_URL: &str = "https://github.com/Animushka/napominalochka";
-const UPSTREAM_URL: &str = "https://dev.decryptology.net/decryp7/ExtremelyNaggyBot";
-
 #[derive(BotCommands, Clone, Debug, PartialEq, Eq)]
 #[command(rename_rule = "lowercase", description = "Commands:")]
 pub enum Command {
@@ -124,13 +121,7 @@ pub async fn execute(
             )),
             lang,
         )],
-        Command::About => vec![Reply::text(lang.render(
-            "about",
-            &[
-                ("source", SOURCE_URL.into()),
-                ("upstream", UPSTREAM_URL.into()),
-            ],
-        ))],
+        Command::About => vec![Reply::text(lang.text("about"))],
         Command::Language(code) => {
             let code = code.trim().to_ascii_lowercase();
             if code.is_empty() {

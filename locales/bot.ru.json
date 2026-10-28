@@ -96,7 +96,7 @@
   "relative.hours_minutes": "через {hours} ч {minutes} мин",
   "relative.days": "через {days} дн.",
   "help.commands": "/start — открыть бота\n/remindme — создать напоминание\n/list — мои напоминания\n/timezone — часовой пояс\n/language — русский / English\n/calendar — календарь телефона\n/clearall — удалить напоминания\n/unregister — удалить свои данные\n/about — об этом боте",
-  "about": "Напоминалочка помогает помнить о важных делах. Создавай напоминания в Mini App или в чате, отмечай выполнение и выбирай удобный интервал повторов.\n\nНаш код: {source}\nОсновано на ExtremelyNaggyBot от @decryp7:\n{upstream}",
+  "about": "Напоминалочка помогает помнить о важных делах. Создавай напоминания в Mini App или в чате, отмечай выполнение и выбирай удобный интервал повторов.",
   "command.help": "Помощь и команды",
   "command.remindme": "Создать напоминание",
   "command.list": "Мои напоминания",
