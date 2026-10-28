@@ -11,6 +11,33 @@ use chrono_tz::Tz;
 use regex::Regex;
 use thiserror::Error;
 
+/// Settings are independent of timezone registration and isolated by Telegram user id.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Preferences {
+    pub language: String,
+    pub nag_interval_minutes: i64,
+    pub confirmation_check_minutes: i64,
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            language: "ru".into(),
+            nag_interval_minutes: 10,
+            confirmation_check_minutes: 0,
+        }
+    }
+}
+
+/// A single optional check after completion, never part of the nagging loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Confirmation {
+    pub id: i64,
+    pub user_id: i64,
+    pub description: String,
+    pub due_at: DateTime<Utc>,
+}
+
 /// How often a reminder repeats once it has fired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recurrence {
@@ -362,7 +389,7 @@ pub struct Draft {
     pub created_at: DateTime<Utc>,
 }
 
-/// User-correctable input problems. The `Display` text is sent back to the user.
+/// User-correctable input problems, translated by the presentation layer.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum InputError {
     #[error(

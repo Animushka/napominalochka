@@ -14,7 +14,8 @@ use teloxide::{ApiError, RequestError};
 
 use crate::commands::{self, BotInfo, Command};
 use crate::conversation::{self, Markup, Reply, Sender};
-use crate::model::Nagging;
+use crate::i18n::Lang;
+use crate::model::{Confirmation, Nagging};
 use crate::panels;
 use crate::scheduler::{Delivery, Notifier};
 use crate::service::Service;
@@ -27,12 +28,23 @@ pub struct AppState {
     pub bot_info: BotInfo,
 }
 
-const INTERNAL_ERROR: &str = "Sorry, something went wrong. Please try again later.";
-
 pub async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> HandlerResult {
     let sender = sender_of(&msg);
     let now = Utc::now();
     let service = &state.service;
+    service
+        .initialize_language(
+            sender.chat_id,
+            msg.from
+                .as_ref()
+                .and_then(|user| user.language_code.as_deref()),
+        )
+        .await?;
+    let lang = conversation::language(service, sender.chat_id).await?;
+    let refresh_menu = sender.private
+        && msg
+            .text()
+            .is_some_and(|text| text.starts_with("/start") || text.starts_with("/language"));
 
     let result = if let Some(location) = msg.location() {
         conversation::on_location(service, &sender, location.latitude, location.longitude, now)
@@ -46,9 +58,7 @@ pub async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Han
                 }
                 // Addressed to another bot in a group chat.
                 Err(ParseError::WrongBotName(_)) => return Ok(()),
-                Err(_) => Ok(vec![Reply::text(
-                    "Sorry, I don't know that command. Send /help to see what I can do.",
-                )]),
+                Err(_) => Ok(vec![Reply::text(lang.text("command.unknown"))]),
             }
         } else if sender.private {
             conversation::on_text(service, &sender, text, forwarded, now).await
@@ -62,10 +72,20 @@ pub async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Han
 
     let replies = result.unwrap_or_else(|error| {
         tracing::error!(?error, chat_id = sender.chat_id, "failed to handle message");
-        vec![Reply::text(INTERNAL_ERROR)]
+        vec![Reply::text(
+            error
+                .downcast_ref::<crate::service::Error>()
+                .map(|error| lang.service_error(error))
+                .unwrap_or_else(|| lang.text("error.internal")),
+        )]
     });
     for reply in replies {
-        send(&bot, msg.chat.id, reply).await?;
+        send(&bot, msg.chat.id, reply, lang).await?;
+    }
+    if refresh_menu {
+        let selected = conversation::language(service, sender.chat_id).await?;
+        publish_chat_menu_button(&bot, msg.chat.id, state.bot_info.web_app.as_ref(), selected)
+            .await;
     }
     Ok(())
 }
@@ -78,6 +98,43 @@ pub async fn handle_callback(
     let message = query.regular_message();
     let user_id = message.map_or(query.from.id.0 as i64, |m| m.chat.id.0);
     let data = query.data.as_deref().unwrap_or_default();
+    state
+        .service
+        .initialize_language(user_id, query.from.language_code.as_deref())
+        .await?;
+    let lang = conversation::language(&state.service, user_id).await?;
+    if let Some(code) = data
+        .strip_prefix("lang:")
+        .filter(|code| matches!(*code, "ru" | "en"))
+    {
+        state
+            .service
+            .set_preferences(user_id, Some(code), None, None)
+            .await?;
+        let selected = Lang::parse(code);
+        bot.answer_callback_query(query.id.clone())
+            .text(selected.text("language.saved"))
+            .await?;
+        let panel = commands::language_panel(selected);
+        if let Some(message) = message {
+            let request = bot.edit_message_text(message.chat.id, message.id, panel.text);
+            if let Markup::Inline(keyboard) = panel.markup
+                && let Err(error) = request.reply_markup(keyboard).await
+            {
+                tracing::debug!(?error, "could not refresh language picker");
+            }
+            if matches!(message.chat.kind, ChatKind::Private(_)) {
+                publish_chat_menu_button(
+                    &bot,
+                    message.chat.id,
+                    state.bot_info.web_app.as_ref(),
+                    selected,
+                )
+                .await;
+            }
+        }
+        return Ok(());
+    }
 
     let reply = match conversation::on_callback(
         &state.service,
@@ -93,7 +150,7 @@ pub async fn handle_callback(
         Err(error) => {
             tracing::error!(?error, user_id, data, "failed to handle button");
             bot.answer_callback_query(query.id.clone())
-                .text(INTERNAL_ERROR)
+                .text(lang.text("error.internal"))
                 .await?;
             return Ok(());
         }
@@ -121,14 +178,14 @@ pub async fn handle_callback(
     Ok(())
 }
 
-async fn send(bot: &Bot, chat_id: ChatId, reply: Reply) -> Result<(), RequestError> {
+async fn send(bot: &Bot, chat_id: ChatId, reply: Reply, lang: Lang) -> Result<(), RequestError> {
     let request = bot.send_message(chat_id, reply.text);
     let request = match reply.markup {
         Markup::None => request,
         Markup::Inline(keyboard) => request.reply_markup(keyboard),
         Markup::AskLocation => request.reply_markup(ReplyMarkup::Keyboard(
             KeyboardMarkup::new([[
-                KeyboardButton::new("📍 Share my location").request(ButtonRequest::Location)
+                KeyboardButton::new(lang.text("location.share")).request(ButtonRequest::Location)
             ]])
             .resize_keyboard()
             .one_time_keyboard(),
@@ -142,19 +199,46 @@ async fn send(bot: &Bot, chat_id: ChatId, reply: Reply) -> Result<(), RequestErr
 }
 
 /// Sends reminders as Telegram messages with Done/Snooze buttons.
-pub struct TelegramNotifier(pub Bot);
+pub struct TelegramNotifier(pub Bot, pub Service);
 
 impl Notifier for TelegramNotifier {
     async fn send(&self, nagging: &Nagging) -> Delivery {
+        let lang = self
+            .1
+            .preferences(nagging.user_id)
+            .await
+            .map(|p| Lang::parse(&p.language))
+            .unwrap_or_default();
         let result = self
             .0
             .send_message(
                 ChatId(nagging.user_id),
                 format!("⏰ {}", nagging.description),
             )
-            .reply_markup(panels::nag_keyboard(nagging.id))
+            .reply_markup(panels::nag_keyboard_lang(nagging.id, lang))
             .await;
         match result {
+            Ok(_) => Delivery::Sent,
+            Err(RequestError::Api(error)) if is_unreachable(&error) => Delivery::Unreachable,
+            Err(error) => Delivery::Failed(error.to_string()),
+        }
+    }
+    async fn send_confirmation(&self, confirmation: &Confirmation) -> Delivery {
+        let lang = self
+            .1
+            .preferences(confirmation.user_id)
+            .await
+            .map(|p| Lang::parse(&p.language))
+            .unwrap_or_default();
+        let text = lang.render(
+            "confirmation",
+            &[("description", confirmation.description.clone())],
+        );
+        match self
+            .0
+            .send_message(ChatId(confirmation.user_id), text)
+            .await
+        {
             Ok(_) => Delivery::Sent,
             Err(RequestError::Api(error)) if is_unreachable(&error) => Delivery::Unreachable,
             Err(error) => Delivery::Failed(error.to_string()),
@@ -180,10 +264,7 @@ fn sender_of(msg: &Message) -> Sender {
             user.first_name.clone(),
             user.last_name.clone().unwrap_or_default(),
         ),
-        None => (
-            msg.chat.title().unwrap_or("there").to_owned(),
-            String::new(),
-        ),
+        None => (msg.chat.title().unwrap_or("👋").to_owned(), String::new()),
     };
     Sender {
         chat_id: msg.chat.id.0,
@@ -198,7 +279,7 @@ fn sender_of(msg: &Message) -> Sender {
 pub async fn publish_menu_button(bot: &Bot, web_app_url: Option<&url::Url>) {
     let button = match web_app_url {
         Some(url) => MenuButton::WebApp {
-            text: "Reminders".into(),
+            text: Lang::Ru.text("app.menu"),
             web_app: WebAppInfo { url: url.clone() },
         },
         None => MenuButton::Commands,
@@ -208,9 +289,44 @@ pub async fn publish_menu_button(bot: &Bot, web_app_url: Option<&url::Url>) {
     }
 }
 
-/// Publishes the command menu shown by Telegram clients.
+async fn publish_chat_menu_button(
+    bot: &Bot,
+    chat_id: ChatId,
+    web_app: Option<&url::Url>,
+    lang: Lang,
+) {
+    let button = match web_app {
+        Some(url) => MenuButton::WebApp {
+            text: lang.text("app.menu"),
+            web_app: WebAppInfo { url: url.clone() },
+        },
+        None => MenuButton::Commands,
+    };
+    if let Err(error) = bot
+        .set_chat_menu_button()
+        .chat_id(chat_id)
+        .menu_button(button)
+        .await
+    {
+        tracing::warn!(?error, "failed to set localized menu button");
+    }
+}
+
+/// Publishes the default Russian command menu and explicit RU/EN translations.
 pub async fn publish_commands(bot: &Bot) {
-    if let Err(error) = bot.set_my_commands(Command::bot_commands()).await {
-        tracing::warn!(?error, "failed to publish the command list");
+    if let Err(error) = bot
+        .set_my_commands(commands::localized_commands(Lang::Ru))
+        .await
+    {
+        tracing::warn!(?error, "failed to publish the default command list");
+    }
+    for lang in [Lang::Ru, Lang::En] {
+        if let Err(error) = bot
+            .set_my_commands(commands::localized_commands(lang))
+            .language_code(lang.code())
+            .await
+        {
+            tracing::warn!(?error, "failed to publish a localized command list");
+        }
     }
 }

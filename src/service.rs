@@ -5,7 +5,7 @@ use chrono::{DateTime, Duration, NaiveDateTime, NaiveTime, Utc};
 use thiserror::Error;
 
 use crate::db::{Db, Registration};
-use crate::model::{Draft, InputError, Recurrence, Reminder, Snooze, User, UserTz};
+use crate::model::{Draft, InputError, Preferences, Recurrence, Reminder, Snooze, User, UserTz};
 
 pub const MAX_DESCRIPTION_CHARS: usize = 1000;
 /// "Snooze until tomorrow" means this local time.
@@ -18,6 +18,8 @@ pub enum Error {
     /// The reminder or draft does not exist or belongs to someone else.
     #[error("This reminder is no longer available.")]
     NotFound,
+    #[error("Invalid preference: {0}")]
+    InvalidPreferences(&'static str),
     #[error(transparent)]
     Input(#[from] InputError),
     #[error(transparent)]
@@ -48,6 +50,56 @@ pub struct Service {
 impl Service {
     pub fn new(db: Db) -> Self {
         Self { db }
+    }
+
+    pub async fn preferences(&self, user_id: i64) -> Result<Preferences> {
+        Ok(self.db.preferences(user_id).await?)
+    }
+
+    /// A manually chosen language is never overwritten by Telegram's language code.
+    pub async fn initialize_language(
+        &self,
+        user_id: i64,
+        telegram_language: Option<&str>,
+    ) -> Result<()> {
+        let language = if telegram_language.is_some_and(|code| {
+            code.eq_ignore_ascii_case("en") || code.to_ascii_lowercase().starts_with("en-")
+        }) {
+            "en"
+        } else {
+            "ru"
+        };
+        self.db
+            .initialize_language(user_id, language.into())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_preferences(
+        &self,
+        user_id: i64,
+        language: Option<&str>,
+        nag_interval_minutes: Option<i64>,
+        confirmation_check_minutes: Option<i64>,
+    ) -> Result<Preferences> {
+        if language.is_some_and(|value| !matches!(value, "ru" | "en")) {
+            return Err(Error::InvalidPreferences("language"));
+        }
+        if nag_interval_minutes.is_some_and(|value| ![1, 5, 10, 20, 30, 60].contains(&value)) {
+            return Err(Error::InvalidPreferences("nag_interval_minutes"));
+        }
+        if confirmation_check_minutes.is_some_and(|value| ![0, 20].contains(&value)) {
+            return Err(Error::InvalidPreferences("confirmation_check_minutes"));
+        }
+        Ok(self
+            .db
+            .set_preferences(
+                user_id,
+                language.map(str::to_owned),
+                nag_interval_minutes,
+                confirmation_check_minutes,
+            )
+            .await?)
     }
 
     // ---- users ---------------------------------------------------------------------------
@@ -183,9 +235,14 @@ impl Service {
 
     // ---- naggings ------------------------------------------------------------------------
 
-    /// Stops a nagging. Returns `false` if it was already done.
+    /// Records completion and optionally schedules one check. Returns `false` if already done.
+    #[cfg(test)]
     pub async fn done(&self, user_id: i64, nagging_id: i64) -> Result<bool> {
-        Ok(self.db.acknowledge_nagging(user_id, nagging_id).await?)
+        self.done_at(user_id, nagging_id, Utc::now()).await
+    }
+
+    pub async fn done_at(&self, user_id: i64, nagging_id: i64, now: DateTime<Utc>) -> Result<bool> {
+        Ok(self.db.complete_nagging(user_id, nagging_id, now).await?)
     }
 
     /// Stops naggings by reminder id, for buttons sent by the .NET bot.
@@ -465,5 +522,52 @@ mod tests {
             Some(user.id)
         );
         assert!(service.calendar_feed("nope").await.unwrap().is_none());
+    }
+    #[tokio::test]
+    async fn preferences_work_before_registration_and_manual_language_wins() {
+        let service = Service::new(Db::open_in_memory().unwrap());
+        assert_eq!(
+            service.preferences(7).await.unwrap(),
+            Preferences::default()
+        );
+        service.initialize_language(7, Some("en-US")).await.unwrap();
+        assert_eq!(service.preferences(7).await.unwrap().language, "en");
+        service
+            .set_preferences(7, Some("ru"), Some(30), Some(20))
+            .await
+            .unwrap();
+        service.initialize_language(7, Some("en")).await.unwrap();
+        let preferences = service.preferences(7).await.unwrap();
+        assert_eq!(preferences.language, "ru");
+        assert_eq!(preferences.nag_interval_minutes, 30);
+        assert_eq!(preferences.confirmation_check_minutes, 20);
+        assert!(service.user(7).await.unwrap().is_none());
+        assert_eq!(
+            service.preferences(8).await.unwrap(),
+            Preferences::default()
+        );
+        service.initialize_language(8, Some("de")).await.unwrap();
+        assert_eq!(service.preferences(8).await.unwrap().language, "ru");
+        for (language, interval, check) in [
+            (Some("fr"), None, None),
+            (None, Some(2), None),
+            (None, None, Some(10)),
+        ] {
+            assert!(matches!(
+                service.set_preferences(7, language, interval, check).await,
+                Err(Error::InvalidPreferences(_))
+            ));
+            assert_eq!(
+                service.preferences(7).await.unwrap(),
+                preferences,
+                "invalid patches must be atomic"
+            );
+        }
+        service.unregister(7).await.unwrap();
+        assert_eq!(
+            service.preferences(7).await.unwrap(),
+            Preferences::default(),
+            "unregister also clears preferences before timezone registration"
+        );
     }
 }

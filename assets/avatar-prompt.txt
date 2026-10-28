@@ -1,0 +1,10 @@
+Use case: logo-brand
+Asset type: square Telegram bot avatar for a friendly reminder assistant named Napominalozhka (Напоминаложка); no lettering in the image.
+Primary request: a charming, memorable bell-and-calendar mascot with a checkmark, warm cheerful expression, clean mint, cream and coral illustration.
+Scene/backdrop: solid pale warm cream background with a very subtle soft mint circular halo.
+Subject: one rounded mint reminder bell character, simple friendly dark eyes and a small curved smile, soft coral blush, a small cream calendar card incorporated naturally against the lower body with one large dark mint checkmark, tiny coral calendar binding. Clearly reads as a reminder helper.
+Style/medium: polished flat editorial illustration, soft rounded shapes, confident clean outlines, very restrained subtle shading, professional app mascot icon.
+Composition/framing: square 1:1 canvas, centered compact mascot filling roughly 70 percent of the frame; all important parts comfortably inside the central circle so Telegram circular cropping keeps the entire character and checkmark intact; strong silhouette and legibility at 48 pixels.
+Lighting/mood: warm, approachable, reassuring and cheerful.
+Color palette: mint green, warm cream, restrained coral accents, very dark desaturated green details.
+Constraints: no text, no letters, no numbers, no watermark, no medical cross, no red cross; exactly one central character, simple uncluttered background; checkmark unmistakable; avoid tiny decorative details.

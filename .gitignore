@@ -4,3 +4,12 @@
 .DS_Store
 .idea/
 .vscode/
+
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+*.sqlite*
+*.log
+coverage/

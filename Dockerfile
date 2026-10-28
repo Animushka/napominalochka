@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM rust:1-alpine AS build
+FROM rust:1-alpine AS dependencies
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 
@@ -10,7 +10,9 @@ RUN mkdir src && echo 'fn main() {}' > src/main.rs \
     && cargo build --release --locked \
     && rm -rf src
 
+FROM dependencies AS build
 COPY migrations ./migrations
+COPY locales ./locales
 COPY web ./web
 COPY src ./src
 RUN touch src/main.rs && cargo build --release --locked

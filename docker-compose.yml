@@ -1,35 +1,26 @@
 services:
-  extremelynaggybot:
-    image: dev.decryptology.net/decryp7/extremelynaggybot:latest
-    # To build from source instead of pulling: docker compose up -d --build
+  napominalochka:
+    image: ${NAPOMINALOCHKA_IMAGE:-napominalochka:local}
     build: .
-    container_name: extremelynaggybot
+    container_name: napominalochka
     restart: unless-stopped
     env_file: .env
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8097}:8080"
     volumes:
-      # The container runs as uid 10001; the directory must be writable by it:
-      #   mkdir -p data && sudo chown 10001:10001 data
       - ./data:/app/data
-    # The Mini App is served on port 8080 and must be reachable by your reverse proxy.
-    # Pick ONE of the two options below.
-    #
-    # Option A: Caddy runs in Docker. Join Caddy's network and proxy to
-    #   extremelynaggybot:8080 (uncomment, and the "networks:" block at the bottom).
-    # networks:
-    #   - caddy
-    #
-    # Option B: Caddy runs on the host. Publish the port on localhost only and proxy to
-    #   127.0.0.1:8080.
-    # ports:
-    #   - "127.0.0.1:8080:8080"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    cpus: "0.75"
     stop_grace_period: 15s
     logging:
       driver: json-file
       options:
         max-size: 10m
         max-file: "3"
-
-# For option A: the existing Docker network your Caddy container is on.
-# networks:
-#   caddy:
-#     external: true

@@ -24,7 +24,7 @@ pub fn parse(text: &str, tz: UserTz, now: DateTime<Utc>) -> Option<NaiveDateTime
     });
 
     let text = text.trim();
-    if text.is_empty() || text.len() > MAX_LEN {
+    if text.is_empty() || text.chars().count() > MAX_LEN {
         return None;
     }
     let normalised = normalise(text);
@@ -36,7 +36,7 @@ pub fn parse(text: &str, tz: UserTz, now: DateTime<Utc>) -> Option<NaiveDateTime
         UserTz::Named(zone) => parse_in(&normalised, zone, now)?,
         UserTz::Fixed(offset) => parse_in(&normalised, offset.fixed(), now)?,
     };
-    if !is_duration && !HAS_TIME.is_match(text) {
+    if !is_duration && !HAS_TIME.is_match(&normalised) {
         at = at.date().and_time(DEFAULT_TIME);
     }
 
@@ -61,13 +61,33 @@ fn parse_in<T: TimeZone>(text: &str, tz: T, now: DateTime<Utc>) -> Option<NaiveD
 fn normalise(text: &str) -> String {
     let lower = text.to_lowercase();
     let lower = lower
-        .strip_prefix("in ")
+        .replace("сегодня вечером", "today 20:00")
+        .replace("завтра утром", "tomorrow 09:00");
+    let lower = lower
+        .strip_prefix("через ")
+        .or_else(|| lower.strip_prefix("в "))
+        .or_else(|| lower.strip_prefix("in "))
         .or_else(|| lower.strip_prefix("at "))
         .or_else(|| lower.strip_prefix("on "))
         .unwrap_or(&lower);
     lower
         .split_whitespace()
         .map(|word| match word {
+            "сегодня" => "today",
+            "завтра" => "tomorrow",
+            "послезавтра" => "in 2 days",
+            "пн" | "понедельник" => "monday",
+            "вт" | "вторник" => "tuesday",
+            "ср" | "среду" | "среда" => "wednesday",
+            "чт" | "четверг" => "thursday",
+            "пт" | "пятницу" | "пятница" => "friday",
+            "сб" | "субботу" | "суббота" => "saturday",
+            "вс" | "воскресенье" => "sunday",
+            "мин" | "минуту" | "минуты" | "минут" => "minutes",
+            "ч" | "час" | "часа" | "часов" => "hours",
+            "день" | "дня" | "дней" => "days",
+            "полдень" => "12:00",
+            "полночь" => "23:59",
             "noon" | "midday" => "12:00",
             "midnight" => "23:59",
             "tonight" => "today 20:00",
@@ -114,6 +134,20 @@ mod tests {
             ("at noon", local(2026, 10, 13, 12, 0)),
             ("tonight", local(2026, 10, 13, 20, 0)),
             ("1/11/2026 07:15", local(2026, 11, 1, 7, 15)),
+        ] {
+            assert_eq!(parse(input, SGT, now()), Some(expected), "{input}");
+        }
+    }
+
+    #[test]
+    fn parses_russian_time_expressions() {
+        for (input, expected) in [
+            ("завтра", local(2026, 10, 14, 9, 0)),
+            ("завтра 07:30", local(2026, 10, 14, 7, 30)),
+            ("через 20 минут", local(2026, 10, 13, 10, 50)),
+            ("через 2 часа", local(2026, 10, 13, 12, 30)),
+            ("пятницу 18:00", local(2026, 10, 16, 18, 0)),
+            ("сегодня вечером", local(2026, 10, 13, 20, 0)),
         ] {
             assert_eq!(parse(input, SGT, now()), Some(expected), "{input}");
         }

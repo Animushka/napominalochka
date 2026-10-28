@@ -4,6 +4,7 @@
 use chrono::{DateTime, Utc};
 use url::Url;
 
+use crate::i18n::Lang;
 use crate::model::{Recurrence, Reminder, UserTz};
 
 /// Alarms per occurrence, in minutes after the start: a little naggy, like the bot.
@@ -21,29 +22,31 @@ pub fn webcal(url: &Url) -> String {
     format!("webcal://{}", url.as_str().trim_start_matches("https://"))
 }
 
+#[allow(dead_code)]
 pub fn instructions(url: &Url) -> String {
-    format!(
-        "📅 Your private calendar link:\n{}\n\n\
-         Subscribe to it once and your reminders show up in your phone's calendar, with alarms that work even offline \
-         (at the time, then again after 5 and 10 minutes). Changes appear within about 15 minutes.\n\n\
-         iPhone: copy the link, then Settings → Calendar (Apps → Calendar on iOS 18) → Accounts → Add Account → Other → \
-         Add Subscribed Calendar. Turn OFF \"Remove Alerts\".\n\
-         Google Calendar (web): Other calendars → + → From URL, with:\n{}\n\
-         Google refreshes only every few hours and may not alert you.\n\n\
-         Keep the link private: anyone with it can see your reminders. Tap \"New link\" to revoke it.",
-        webcal(url),
-        url
+    instructions_lang(url, Lang::En)
+}
+
+pub fn instructions_lang(url: &Url, lang: Lang) -> String {
+    lang.render(
+        "calendar.instructions",
+        &[("webcal", webcal(url)), ("url", url.to_string())],
     )
 }
 
+#[cfg(test)]
 pub fn feed(reminders: &[Reminder], tz: UserTz, now: DateTime<Utc>) -> String {
+    feed_lang(reminders, tz, now, Lang::En)
+}
+
+pub fn feed_lang(reminders: &[Reminder], tz: UserTz, now: DateTime<Utc>, lang: Lang) -> String {
     let mut ics = Ics::default();
     ics.line("BEGIN:VCALENDAR");
     ics.line("VERSION:2.0");
-    ics.line("PRODID:-//ExtremelyNaggyBot//Reminders//EN");
+    ics.line("PRODID:-//Napominalochka//Reminders//RU-EN");
     ics.line("CALSCALE:GREGORIAN");
     ics.line("METHOD:PUBLISH");
-    ics.line("X-WR-CALNAME:Naggy reminders");
+    ics.line(&format!("X-WR-CALNAME:{}", lang.text("calendar.name")));
     if let Some(name) = tz.name() {
         ics.line(&format!("X-WR-TIMEZONE:{name}"));
     }

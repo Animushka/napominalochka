@@ -4,6 +4,7 @@ mod commands;
 mod config;
 mod conversation;
 mod db;
+mod i18n;
 mod model;
 mod panels;
 mod scheduler;
@@ -74,7 +75,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
     let bot = teloxide::Bot::new(&config.telegram_token).throttle(Limits::default());
     let me = bot.get_me().await.context("connecting to Telegram")?;
     let bot_info = BotInfo {
-        name: me.first_name.clone(),
+        name: "Напоминалочка".into(),
         username: me.username().to_owned(),
         web_app: config.web_app_url.clone(),
     };
@@ -84,19 +85,22 @@ async fn run(config: Config) -> anyhow::Result<()> {
     telegram::publish_menu_button(&bot, config.web_app_url.as_ref()).await;
     if let Some(chat_id) = config.admin_chat_id
         && let Err(error) = bot
-            .send_message(ChatId(chat_id), "Extremely Naggy Bot is online!")
+            .send_message(
+                ChatId(chat_id),
+                "Напоминалочка запущена / Napominalochka is online!",
+            )
             .await
     {
         tracing::warn!(?error, "failed to notify admin chat");
     }
 
     let shutdown = CancellationToken::new();
+    let service = Service::new(db.clone());
     let scheduler = tokio::spawn(scheduler::run(
-        telegram::TelegramNotifier(bot.clone()),
-        db.clone(),
+        telegram::TelegramNotifier(bot.clone(), service.clone()),
+        db,
         shutdown.clone(),
     ));
-    let service = Service::new(db);
     let web_state = Arc::new(web::WebState {
         service: service.clone(),
         bot_token: config.telegram_token.clone(),

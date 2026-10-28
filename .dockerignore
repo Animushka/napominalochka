@@ -6,3 +6,7 @@ data/
 *.md
 docker-compose.yml
 Caddyfile.example
+
+.github/
+ops/
+assets/

@@ -12,7 +12,9 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 
-use crate::model::{Draft, Nagging, Recurrence, Reminder, User, UserTz, UtcOffset};
+use crate::model::{
+    Confirmation, Draft, Nagging, Preferences, Recurrence, Reminder, User, UserTz, UtcOffset,
+};
 
 /// Migrations are applied in order; `PRAGMA user_version` records how many have run.
 /// The first one is the schema of the original .NET bot, so existing databases upgrade in place.
@@ -21,6 +23,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/002_offsets_and_scheduling.sql"),
     include_str!("../migrations/003_timezones_and_drafts.sql"),
     include_str!("../migrations/004_calendar_feed.sql"),
+    include_str!("../migrations/005_preferences_and_confirmations.sql"),
 ];
 
 const USER_COLUMNS: &str = "user_id, first_name, last_name, utc_offset_minutes, timezone";
@@ -80,6 +83,49 @@ impl Db {
         .await
         .context("database task panicked")?;
         Ok(result?)
+    }
+
+    /// Reading defaults does not register a user or overwrite Telegram's initial language.
+    pub async fn preferences(&self, user_id: i64) -> anyhow::Result<Preferences> {
+        self.call(move |conn| {
+            Ok(conn.query_row(
+                "SELECT language, nag_interval_minutes, confirmation_check_minutes FROM preferences WHERE user_id = ?1",
+                [user_id], preferences_from_row,
+            ).optional()?.unwrap_or_default())
+        }).await
+    }
+
+    pub async fn initialize_language(&self, user_id: i64, language: String) -> anyhow::Result<()> {
+        self.call(move |conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO preferences (user_id, language) VALUES (?1, ?2)",
+                params![user_id, language],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn set_preferences(
+        &self,
+        user_id: i64,
+        language: Option<String>,
+        nag_interval_minutes: Option<i64>,
+        confirmation_check_minutes: Option<i64>,
+    ) -> anyhow::Result<Preferences> {
+        self.call(move |conn| {
+            let tx = conn.transaction()?;
+            tx.execute("INSERT OR IGNORE INTO preferences (user_id) VALUES (?1)", [user_id])?;
+            let settings = tx.query_row(
+                "UPDATE preferences SET language = COALESCE(?1, language), nag_interval_minutes = COALESCE(?2, nag_interval_minutes), confirmation_check_minutes = COALESCE(?3, confirmation_check_minutes) WHERE user_id = ?4 RETURNING language, nag_interval_minutes, confirmation_check_minutes",
+                params![language, nag_interval_minutes, confirmation_check_minutes, user_id], preferences_from_row,
+            )?;
+            if settings.confirmation_check_minutes == 0 {
+                tx.execute("DELETE FROM confirmations WHERE user_id = ?1", [user_id])?;
+            }
+            tx.commit()?;
+            Ok(settings)
+        }).await
     }
 
     // ---- users -------------------------------------------------------------------------
@@ -164,10 +210,15 @@ impl Db {
         .await
     }
 
-    /// Removes the user together with their reminders and naggings (via `ON DELETE CASCADE`).
+    /// Removes preferences/drafts even before registration; owned reminder data cascades.
     pub async fn delete_user(&self, user_id: i64) -> anyhow::Result<bool> {
         self.call(move |conn| {
-            Ok(conn.execute("DELETE FROM users WHERE user_id = ?1", [user_id])? > 0)
+            let tx = conn.transaction()?;
+            tx.execute("DELETE FROM preferences WHERE user_id = ?1", [user_id])?;
+            tx.execute("DELETE FROM drafts WHERE user_id = ?1", [user_id])?;
+            let removed = tx.execute("DELETE FROM users WHERE user_id = ?1", [user_id])? > 0;
+            tx.commit()?;
+            Ok(removed)
         })
         .await
     }
@@ -273,6 +324,7 @@ impl Db {
         self.call(move |conn| {
             let tx = conn.transaction()?;
             tx.execute("DELETE FROM naggings WHERE user_id = ?1", [user_id])?;
+            tx.execute("DELETE FROM confirmations WHERE user_id = ?1", [user_id])?;
             let removed = tx.execute("DELETE FROM reminders WHERE user_id = ?1", [user_id])?;
             tx.commit()?;
             Ok(removed)
@@ -365,13 +417,59 @@ impl Db {
         .await
     }
 
-    /// Stops a nagging. Only the user being nagged can acknowledge it.
+    /// Test helper for the acknowledgement contract; service calls use an explicit clock.
+    #[cfg(test)]
     pub async fn acknowledge_nagging(&self, user_id: i64, nagging_id: i64) -> anyhow::Result<bool> {
+        self.complete_nagging(user_id, nagging_id, Utc::now()).await
+    }
+
+    /// Completion and its optional one-time check are recorded atomically.
+    pub async fn complete_nagging(
+        &self,
+        user_id: i64,
+        nagging_id: i64,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
         self.call(move |conn| {
-            Ok(conn.execute(
-                "DELETE FROM naggings WHERE nagging_id = ?1 AND user_id = ?2",
-                [nagging_id, user_id],
-            )? > 0)
+            let tx = conn.transaction()?;
+            let completed: Option<(String, Option<i64>)> = tx.query_row(
+                "DELETE FROM naggings WHERE nagging_id = ?1 AND user_id = ?2 RETURNING description, reminder_id",
+                [nagging_id, user_id], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional()?;
+            let Some((description, reminder_id)) = completed else { return Ok(false) };
+            let delay: i64 = tx.query_row("SELECT confirmation_check_minutes FROM preferences WHERE user_id = ?1", [user_id], |row| row.get(0)).optional()?.unwrap_or(0);
+            if delay == 20 {
+                tx.execute("INSERT INTO confirmations (source_nagging_id, reminder_id, user_id, description, due_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![nagging_id, reminder_id, user_id, description, DbTime(now + chrono::Duration::minutes(delay))])?;
+            }
+            tx.commit()?;
+            Ok(true)
+        }).await
+    }
+
+    pub async fn due_confirmations(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<Confirmation>> {
+        self.call(move |conn| conn.prepare("SELECT confirmation_id, user_id, description, due_at FROM confirmations WHERE due_at <= ?1 ORDER BY due_at, confirmation_id")?
+            .query_map([DbTime(now)], |row| Ok(Confirmation { id: row.get(0)?, user_id: row.get(1)?, description: row.get(2)?, due_at: row.get::<_, DbTime>(3)?.0 }))?.collect()).await
+    }
+
+    pub async fn delete_confirmation(&self, id: i64) -> anyhow::Result<()> {
+        self.call(move |conn| {
+            conn.execute("DELETE FROM confirmations WHERE confirmation_id = ?1", [id])?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn postpone_confirmation(
+        &self,
+        id: i64,
+        due_at: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        self.call(move |conn| {
+            conn.execute(
+                "UPDATE confirmations SET due_at = ?1 WHERE confirmation_id = ?2",
+                params![DbTime(due_at), id],
+            )?;
+            Ok(())
         })
         .await
     }
@@ -398,13 +496,21 @@ impl Db {
         user_id: i64,
         reminder_id: i64,
     ) -> anyhow::Result<bool> {
+        let due_at = Utc::now() + chrono::Duration::minutes(20);
         self.call(move |conn| {
-            Ok(conn.execute(
-                "DELETE FROM naggings WHERE reminder_id = ?1 AND user_id = ?2",
-                [reminder_id, user_id],
-            )? > 0)
-        })
-        .await
+            let tx = conn.transaction()?;
+            tx.execute(
+                "INSERT INTO confirmations (source_nagging_id, reminder_id, user_id, description, due_at)
+                 SELECT nagging_id, reminder_id, user_id, description, ?1 FROM naggings
+                 WHERE reminder_id = ?2 AND user_id = ?3
+                 AND EXISTS (SELECT 1 FROM preferences WHERE user_id = ?3 AND confirmation_check_minutes = 20)
+                 ON CONFLICT (source_nagging_id) DO NOTHING",
+                params![DbTime(due_at), reminder_id, user_id],
+            )?;
+            let removed = tx.execute("DELETE FROM naggings WHERE reminder_id = ?1 AND user_id = ?2", [reminder_id, user_id])? > 0;
+            tx.commit()?;
+            Ok(removed)
+        }).await
     }
 
     /// Stops nagging a user, e.g. after they blocked the bot.
@@ -567,6 +673,14 @@ fn user_tz(tx: &Transaction<'_>, user_id: i64) -> rusqlite::Result<Option<UserTz
         |row| tz_from_columns(row, 0, 1),
     )
     .optional()
+}
+
+fn preferences_from_row(row: &Row<'_>) -> rusqlite::Result<Preferences> {
+    Ok(Preferences {
+        language: row.get(0)?,
+        nag_interval_minutes: row.get(1)?,
+        confirmation_check_minutes: row.get(2)?,
+    })
 }
 
 fn user_from_row(row: &Row<'_>) -> rusqlite::Result<User> {
@@ -1053,6 +1167,122 @@ mod tests {
         assert_eq!(
             db.user_by_calendar_token(new).await.unwrap().map(|u| u.id),
             Some(1)
+        );
+    }
+    #[tokio::test]
+    async fn preferences_and_completion_checks_survive_reopening() {
+        let path = std::env::temp_dir().join(format!(
+            "napominalochka-test-{}.sqlite",
+            new_token().unwrap()
+        ));
+        let db = Db::open(&path).unwrap();
+        db.set_preferences(7, Some("en".into()), Some(20), Some(20))
+            .await
+            .unwrap();
+        db.upsert_user(user(7)).await.unwrap();
+        let due = utc(2026, 3, 1, 8, 0);
+        let reminder = db
+            .add_reminder(7, "done".into(), due, Recurrence::Once)
+            .await
+            .unwrap();
+        let nagging = db
+            .fire_reminder(reminder.id, due, due)
+            .await
+            .unwrap()
+            .unwrap();
+        db.complete_nagging(7, nagging.id, due).await.unwrap();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(
+            db.preferences(7).await.unwrap(),
+            Preferences {
+                language: "en".into(),
+                nag_interval_minutes: 20,
+                confirmation_check_minutes: 20
+            }
+        );
+        assert!(
+            db.due_confirmations(due + ChronoDuration::minutes(19))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.due_confirmations(due + ChronoDuration::minutes(20))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        db.set_preferences(8, Some("ru".into()), Some(5), Some(20))
+            .await
+            .unwrap();
+        db.upsert_user(user(8)).await.unwrap();
+        let reminder = db
+            .add_reminder(
+                8,
+                "other user's completed task".into(),
+                due,
+                Recurrence::Once,
+            )
+            .await
+            .unwrap();
+        let nagging = db
+            .fire_reminder(reminder.id, due, due)
+            .await
+            .unwrap()
+            .unwrap();
+        db.complete_nagging(8, nagging.id, due).await.unwrap();
+        db.set_preferences(7, None, None, Some(0)).await.unwrap();
+        let remaining = db
+            .due_confirmations(due + ChronoDuration::days(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "disabling cancels only the owner's pending checks"
+        );
+        assert_eq!(remaining[0].user_id, 8);
+        db.delete_user(8).await.unwrap();
+        assert!(
+            db.due_confirmations(due + ChronoDuration::days(1))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[tokio::test]
+    async fn deleting_a_recurring_reminder_also_cancels_its_completion_check() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_user(user(1)).await.unwrap();
+        db.set_preferences(1, None, None, Some(20)).await.unwrap();
+        let due = utc(2026, 3, 1, 8, 0);
+        let reminder = db
+            .add_reminder(1, "daily".into(), due, Recurrence::Daily)
+            .await
+            .unwrap();
+        let nagging = db
+            .fire_reminder(reminder.id, due, due)
+            .await
+            .unwrap()
+            .unwrap();
+        db.complete_nagging(1, nagging.id, due).await.unwrap();
+        assert_eq!(
+            db.due_confirmations(due + ChronoDuration::minutes(20))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        db.delete_reminder(1, reminder.id).await.unwrap();
+        assert!(
+            db.due_confirmations(due + ChronoDuration::days(1))
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 }

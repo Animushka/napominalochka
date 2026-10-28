@@ -11,12 +11,10 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
 use crate::db::Db;
-use crate::model::Nagging;
+use crate::model::{Confirmation, Nagging};
 
 /// How often the database is polled for due reminders and naggings.
 const TICK_INTERVAL: StdDuration = StdDuration::from_secs(10);
-/// How long to wait before nagging again about an unacknowledged reminder.
-pub const NAG_INTERVAL: Duration = Duration::minutes(1);
 const MAINTENANCE_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 /// Drafts (reminders started but never given a time) are discarded after this long.
 const DRAFT_LIFETIME: Duration = Duration::days(1);
@@ -34,6 +32,10 @@ pub enum Delivery {
 /// Sends reminder messages to users.
 pub trait Notifier: Send + Sync + 'static {
     fn send(&self, nagging: &Nagging) -> impl Future<Output = Delivery> + Send;
+    fn send_confirmation(
+        &self,
+        confirmation: &Confirmation,
+    ) -> impl Future<Output = Delivery> + Send;
 }
 
 pub async fn run<N: Notifier>(notifier: N, db: Db, shutdown: CancellationToken) {
@@ -66,6 +68,9 @@ pub async fn tick<N: Notifier>(notifier: &N, db: &Db, now: DateTime<Utc>) {
     if let Err(error) = repeat_due_naggings(notifier, db, now).await {
         tracing::error!(?error, "failed to process due naggings");
     }
+    if let Err(error) = send_due_confirmations(notifier, db, now).await {
+        tracing::error!(?error, "failed to process completion checks");
+    }
 }
 
 async fn maintain(db: &Db, now: DateTime<Utc>) {
@@ -85,10 +90,9 @@ async fn fire_due_reminders<N: Notifier>(
 ) -> anyhow::Result<()> {
     for reminder in db.due_reminders(now).await? {
         // Record the firing before sending: a failed send is retried by the nagging itself.
-        if let Some(nagging) = db
-            .fire_reminder(reminder.id, now, now + NAG_INTERVAL)
-            .await?
-        {
+        let interval =
+            Duration::minutes(db.preferences(reminder.user_id).await?.nag_interval_minutes);
+        if let Some(nagging) = db.fire_reminder(reminder.id, now, now + interval).await? {
             tracing::info!(
                 reminder_id = reminder.id,
                 user_id = reminder.user_id,
@@ -106,9 +110,35 @@ async fn repeat_due_naggings<N: Notifier>(
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     for nagging in db.due_naggings(now).await? {
-        db.reschedule_nagging(nagging.id, now + NAG_INTERVAL)
-            .await?;
+        let interval =
+            Duration::minutes(db.preferences(nagging.user_id).await?.nag_interval_minutes);
+        db.reschedule_nagging(nagging.id, now + interval).await?;
         deliver(notifier, db, &nagging).await?;
+    }
+    Ok(())
+}
+
+/// One delivery per completion. No Done button and no path back into the nagging loop.
+async fn send_due_confirmations<N: Notifier>(
+    notifier: &N,
+    db: &Db,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    for confirmation in db.due_confirmations(now).await? {
+        match notifier.send_confirmation(&confirmation).await {
+            Delivery::Sent | Delivery::Unreachable => {
+                db.delete_confirmation(confirmation.id).await?
+            }
+            Delivery::Failed(error) => {
+                tracing::warn!(
+                    error,
+                    confirmation_id = confirmation.id,
+                    "failed to send completion check; will retry"
+                );
+                db.postpone_confirmation(confirmation.id, now + Duration::minutes(1))
+                    .await?;
+            }
+        }
     }
     Ok(())
 }
@@ -180,6 +210,23 @@ mod tests {
             }
             outcome
         }
+
+        async fn send_confirmation(&self, confirmation: &Confirmation) -> Delivery {
+            let outcome = self
+                .outcomes
+                .lock()
+                .unwrap()
+                .get(&confirmation.user_id)
+                .cloned()
+                .unwrap_or(Delivery::Sent);
+            if outcome == Delivery::Sent {
+                self.sent.lock().unwrap().push((
+                    confirmation.user_id,
+                    format!("check: {}", confirmation.description),
+                ));
+            }
+            outcome
+        }
     }
 
     fn at(h: u32, m: u32) -> DateTime<Utc> {
@@ -197,6 +244,7 @@ mod tests {
             })
             .await
             .unwrap();
+            db.set_preferences(id, None, Some(1), None).await.unwrap();
         }
         (FakeNotifier::default(), db)
     }
@@ -240,7 +288,7 @@ mod tests {
         tick(&notifier, &db, next_day).await;
         assert_eq!(notifier.take(), vec![(1, "stretch".into())]);
         assert_eq!(
-            db.due_naggings(next_day + NAG_INTERVAL)
+            db.due_naggings(next_day + Duration::minutes(1))
                 .await
                 .unwrap()
                 .len(),
@@ -308,5 +356,90 @@ mod tests {
         notifier.set_outcome(1, Delivery::Sent);
         tick(&notifier, &db, at(9, 1)).await;
         assert_eq!(notifier.take(), vec![(1, "pills".into())]);
+    }
+    #[tokio::test]
+    async fn intervals_are_per_user_and_new_default_is_ten_minutes() {
+        let (notifier, db) = setup().await;
+        db.set_preferences(1, None, Some(10), None).await.unwrap();
+        db.set_preferences(2, None, Some(30), None).await.unwrap();
+        for id in [1, 2] {
+            db.add_reminder(id, format!("user {id}"), at(9, 0), Recurrence::Once)
+                .await
+                .unwrap();
+        }
+        tick(&notifier, &db, at(9, 0)).await;
+        assert_eq!(notifier.take().len(), 2);
+        tick(&notifier, &db, at(9, 9)).await;
+        assert!(notifier.take().is_empty());
+        tick(&notifier, &db, at(9, 10)).await;
+        assert_eq!(notifier.take(), vec![(1, "user 1".into())]);
+        tick(&notifier, &db, at(9, 30)).await;
+        assert_eq!(
+            notifier.take(),
+            vec![(1, "user 1".into()), (2, "user 2".into())]
+        );
+        assert_eq!(
+            crate::model::Preferences::default().nag_interval_minutes,
+            10
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_creates_one_check_twenty_minutes_later_without_new_nagging() {
+        let (notifier, db) = setup().await;
+        db.set_preferences(1, None, None, Some(20)).await.unwrap();
+        db.add_reminder(1, "already completed".into(), at(9, 0), Recurrence::Once)
+            .await
+            .unwrap();
+        tick(&notifier, &db, at(9, 0)).await;
+        notifier.take();
+        let nagging = db.due_naggings(at(9, 1)).await.unwrap().remove(0);
+        assert!(
+            !db.complete_nagging(2, nagging.id, at(9, 1)).await.unwrap(),
+            "owner only"
+        );
+        assert!(db.complete_nagging(1, nagging.id, at(9, 1)).await.unwrap());
+        assert!(
+            !db.complete_nagging(1, nagging.id, at(9, 1)).await.unwrap(),
+            "repeated Done is idempotent"
+        );
+        tick(&notifier, &db, at(9, 20)).await;
+        assert!(notifier.take().is_empty());
+        tick(&notifier, &db, at(9, 21)).await;
+        assert_eq!(
+            notifier.take(),
+            vec![(1, "check: already completed".into())]
+        );
+        tick(&notifier, &db, at(10, 0)).await;
+        assert!(notifier.take().is_empty());
+        assert!(db.due_naggings(at(10, 0)).await.unwrap().is_empty());
+        assert!(db.due_confirmations(at(10, 0)).await.unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn failed_completion_check_is_durable_and_retried_without_nagging() {
+        let (notifier, db) = setup().await;
+        db.set_preferences(1, None, None, Some(20)).await.unwrap();
+        let reminder = db
+            .add_reminder(1, "completed".into(), at(9, 0), Recurrence::Once)
+            .await
+            .unwrap();
+        let nagging = db
+            .fire_reminder(reminder.id, at(9, 0), at(9, 1))
+            .await
+            .unwrap()
+            .unwrap();
+        db.complete_nagging(1, nagging.id, at(9, 0)).await.unwrap();
+        notifier.set_outcome(1, Delivery::Failed("temporary timeout".into()));
+        tick(&notifier, &db, at(9, 20)).await;
+        assert!(notifier.take().is_empty());
+        assert_eq!(db.due_confirmations(at(9, 21)).await.unwrap().len(), 1);
+        notifier.set_outcome(1, Delivery::Sent);
+        tick(&notifier, &db, at(9, 20) + Duration::seconds(30)).await;
+        assert!(notifier.take().is_empty());
+        tick(&notifier, &db, at(9, 21)).await;
+        assert_eq!(notifier.take(), vec![(1, "check: completed".into())]);
+        tick(&notifier, &db, at(10, 0)).await;
+        assert!(notifier.take().is_empty());
+        assert!(db.due_naggings(at(10, 0)).await.unwrap().is_empty());
     }
 }

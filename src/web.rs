@@ -12,7 +12,7 @@ use axum::extract::{FromRequestParts, Path, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use hmac::{KeyInit, Mac};
@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::calendar;
+use crate::i18n::Lang;
 use crate::model::{Recurrence, Reminder, UserTz};
 use crate::panels;
 use crate::service::{self, Profile, ReminderInput, Service};
@@ -58,8 +59,58 @@ pub async fn serve(
 pub fn router(state: Arc<WebState>) -> Router {
     Router::new()
         .route("/", get(index))
+        .route(
+            "/assets/app.js",
+            get(|| async {
+                asset(
+                    "text/javascript; charset=utf-8",
+                    include_str!("../web/app.js"),
+                )
+            }),
+        )
+        .route(
+            "/assets/i18n.js",
+            get(|| async {
+                asset(
+                    "text/javascript; charset=utf-8",
+                    include_str!("../web/i18n.js"),
+                )
+            }),
+        )
+        .route(
+            "/assets/styles.css",
+            get(|| async { asset("text/css; charset=utf-8", include_str!("../web/styles.css")) }),
+        )
+        .route(
+            "/assets/avatar.png",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "image/png")],
+                    include_bytes!("../web/avatar.png").as_slice(),
+                )
+            }),
+        )
+        .route(
+            "/locales/ru.json",
+            get(|| async {
+                asset(
+                    "application/json; charset=utf-8",
+                    include_str!("../web/locales/ru.json"),
+                )
+            }),
+        )
+        .route(
+            "/locales/en.json",
+            get(|| async {
+                asset(
+                    "application/json; charset=utf-8",
+                    include_str!("../web/locales/en.json"),
+                )
+            }),
+        )
         .route("/health", get(|| async { "ok" }))
         .route("/api/state", get(get_state))
+        .route("/api/preferences", patch(set_preferences))
         .route("/api/timezone", put(set_timezone))
         .route("/api/reminders", post(create_reminder))
         .route(
@@ -80,10 +131,24 @@ async fn index() -> Response {
     response
 }
 
+fn asset(content_type: &'static str, body: &'static str) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 // ---- API types ------------------------------------------------------------------------
 
 #[derive(Serialize)]
 struct StateView {
+    language: String,
+    nag_interval_minutes: i64,
+    confirmation_check_minutes: i64,
     /// Display name, e.g. "Asia/Singapore (UTC+08:00)"; `None` until a timezone is chosen.
     timezone: Option<String>,
     /// IANA name or offset, comparable with the device's timezone.
@@ -106,16 +171,16 @@ struct ReminderView {
 }
 
 impl ReminderView {
-    fn new(reminder: &Reminder, tz: UserTz, now: DateTime<Utc>) -> Self {
+    fn new(reminder: &Reminder, tz: UserTz, now: DateTime<Utc>, lang: Lang) -> Self {
         let local = tz.local(reminder.due_at);
         Self {
             id: reminder.id,
             description: reminder.description.clone(),
             at: local.format(LOCAL_FORMAT).to_string(),
             recurrence: reminder.recurrence.as_str(),
-            when: panels::format_when(local),
-            relative: panels::relative(now, reminder.due_at),
-            repeat: reminder.recurrence.describe(local),
+            when: lang.date(local),
+            relative: panels::relative_lang(now, reminder.due_at, lang),
+            repeat: lang.recurrence(reminder.recurrence, local),
         }
     }
 }
@@ -123,6 +188,14 @@ impl ReminderView {
 #[derive(Deserialize)]
 struct TimezoneInput {
     timezone: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreferencesInput {
+    language: Option<String>,
+    nag_interval_minutes: Option<i64>,
+    confirmation_check_minutes: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -138,6 +211,23 @@ async fn get_state(
     State(state): State<Arc<WebState>>,
     auth: AuthUser,
 ) -> Result<Json<StateView>, ApiError> {
+    Ok(Json(load_state(&state.service, auth.id, Utc::now()).await?))
+}
+
+async fn set_preferences(
+    State(state): State<Arc<WebState>>,
+    auth: AuthUser,
+    Json(input): Json<PreferencesInput>,
+) -> Result<Json<StateView>, ApiError> {
+    state
+        .service
+        .set_preferences(
+            auth.id,
+            input.language.as_deref(),
+            input.nag_interval_minutes,
+            input.confirmation_check_minutes,
+        )
+        .await?;
     Ok(Json(load_state(&state.service, auth.id, Utc::now()).await?))
 }
 
@@ -170,9 +260,10 @@ async fn create_reminder(
         recurrence,
     };
     let reminder = state.service.create(&user, input, now).await?;
+    let lang = Lang::parse(&state.service.preferences(auth.id).await?.language);
     Ok((
         StatusCode::CREATED,
-        Json(ReminderView::new(&reminder, user.tz, now)),
+        Json(ReminderView::new(&reminder, user.tz, now, lang)),
     ))
 }
 
@@ -189,7 +280,8 @@ async fn update_reminder(
         .service
         .update(&user, id, Some(&input.description), at, recurrence, now)
         .await?;
-    Ok(Json(ReminderView::new(&reminder, user.tz, now)))
+    let lang = Lang::parse(&state.service.preferences(auth.id).await?.language);
+    Ok(Json(ReminderView::new(&reminder, user.tz, now, lang)))
 }
 
 async fn delete_reminder(
@@ -254,7 +346,8 @@ async fn calendar_feed(
         .calendar_feed(token)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let body = calendar::feed(&reminders, user.tz, Utc::now());
+    let lang = Lang::parse(&state.service.preferences(user.id).await?.language);
+    let body = calendar::feed_lang(&reminders, user.tz, Utc::now(), lang);
     Ok((
         [
             (header::CONTENT_TYPE, "text/calendar; charset=utf-8"),
@@ -274,8 +367,13 @@ async fn load_state(
     user_id: i64,
     now: DateTime<Utc>,
 ) -> service::Result<StateView> {
+    let preferences = service.preferences(user_id).await?;
+    let lang = Lang::parse(&preferences.language);
     let Some(user) = service.user(user_id).await? else {
         return Ok(StateView {
+            language: preferences.language,
+            nag_interval_minutes: preferences.nag_interval_minutes,
+            confirmation_check_minutes: preferences.confirmation_check_minutes,
             timezone: None,
             timezone_id: None,
             now: None,
@@ -288,12 +386,15 @@ async fn load_state(
         UserTz::Fixed(offset) => offset.to_string(),
     };
     Ok(StateView {
+        language: preferences.language,
+        nag_interval_minutes: preferences.nag_interval_minutes,
+        confirmation_check_minutes: preferences.confirmation_check_minutes,
         timezone: Some(user.tz.to_string()),
         timezone_id: Some(timezone_id),
         now: Some(user.tz.local(now).format(LOCAL_FORMAT).to_string()),
         reminders: reminders
             .iter()
-            .map(|r| ReminderView::new(r, user.tz, now))
+            .map(|r| ReminderView::new(r, user.tz, now, lang))
             .collect(),
     })
 }
@@ -327,9 +428,9 @@ impl From<service::Error> for ApiError {
     fn from(error: service::Error) -> Self {
         match error {
             service::Error::NotFound => ApiError::NotFound,
-            service::Error::NotRegistered | service::Error::Input(_) => {
-                ApiError::BadRequest(error.to_string())
-            }
+            service::Error::NotRegistered
+            | service::Error::Input(_)
+            | service::Error::InvalidPreferences(_) => ApiError::BadRequest(error.to_string()),
             service::Error::Internal(error) => ApiError::Internal(error),
         }
     }
@@ -355,7 +456,27 @@ impl IntoResponse for ApiError {
                 )
             }
         };
-        (status, Json(serde_json::json!({ "error": message }))).into_response()
+        let code = match message.as_str() {
+            "Please open this page from Telegram." => "unauthorized",
+            "That reminder no longer exists." | "This reminder is no longer available." => {
+                "reminder_not_found"
+            }
+            "Please set your timezone first." => "invalid_timezone",
+            "Please pick a date and time." => "invalid_datetime",
+            "Please enter what to remind you about." => "empty_description",
+            "That time has already passed." => "past_time",
+            "Something went wrong. Please try again." => "internal_error",
+            "The calendar feed is not enabled." => "calendar_disabled",
+            _ if message.starts_with("Invalid preference") => "invalid_preferences",
+            _ if message.starts_with("I don't recognise that timezone") => "invalid_timezone",
+            _ if message.starts_with("Repeat must be one of") => "invalid_recurrence",
+            _ => "invalid_request",
+        };
+        (
+            status,
+            Json(serde_json::json!({ "error": message, "code": code })),
+        )
+            .into_response()
     }
 }
 
@@ -367,6 +488,7 @@ pub struct AuthUser {
     pub id: i64,
     pub first_name: String,
     pub last_name: String,
+    pub language_code: Option<String>,
 }
 
 impl FromRequestParts<Arc<WebState>> for AuthUser {
@@ -382,7 +504,13 @@ impl FromRequestParts<Arc<WebState>> for AuthUser {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("tma "))
             .ok_or(ApiError::Unauthorized)?;
-        verify_init_data(init_data, &state.bot_token, Utc::now()).ok_or(ApiError::Unauthorized)
+        let user = verify_init_data(init_data, &state.bot_token, Utc::now())
+            .ok_or(ApiError::Unauthorized)?;
+        state
+            .service
+            .initialize_language(user.id, user.language_code.as_deref())
+            .await?;
+        Ok(user)
     }
 }
 
@@ -420,7 +548,7 @@ pub fn verify_init_data(init_data: &str, bot_token: &str, now: DateTime<Utc>) ->
             .map(|(_, v)| v.as_str())
     };
     let auth_date: i64 = field("auth_date")?.parse().ok()?;
-    if now.timestamp() - auth_date > MAX_INIT_DATA_AGE_SECS {
+    if now.timestamp() - auth_date > MAX_INIT_DATA_AGE_SECS || auth_date - now.timestamp() > 30 {
         return None;
     }
 
@@ -430,12 +558,15 @@ pub fn verify_init_data(init_data: &str, bot_token: &str, now: DateTime<Utc>) ->
         first_name: String,
         #[serde(default)]
         last_name: Option<String>,
+        #[serde(default)]
+        language_code: Option<String>,
     }
     let user: TelegramUser = serde_json::from_str(field("user")?).ok()?;
     Some(AuthUser {
         id: user.id,
         first_name: user.first_name,
         last_name: user.last_name.unwrap_or_default(),
+        language_code: user.language_code,
     })
 }
 
@@ -484,6 +615,20 @@ mod tests {
         )
     }
 
+    fn init_data_with_language(user_id: i64, language: &str, now: DateTime<Utc>) -> String {
+        let user =
+            serde_json::json!({ "id": user_id, "first_name": "Ada", "language_code": language })
+                .to_string();
+        sign(
+            &[
+                ("auth_date", &now.timestamp().to_string()),
+                ("query_id", "AAH"),
+                ("user", &user),
+            ],
+            TOKEN,
+        )
+    }
+
     #[test]
     fn accepts_valid_init_data() {
         let now = Utc::now();
@@ -492,7 +637,8 @@ mod tests {
             Some(AuthUser {
                 id: 42,
                 first_name: "Ada".into(),
-                last_name: "Lovelace".into()
+                last_name: "Lovelace".into(),
+                language_code: None,
             })
         );
     }
@@ -550,7 +696,7 @@ mod tests {
             bot_token: TOKEN.into(),
             web_app_url: Some(Url::parse("https://reminders.example.com").unwrap()),
         }));
-        let ada = init_data(42, Utc::now());
+        let ada = init_data_with_language(42, "en", Utc::now());
         let eve = init_data(66, Utc::now());
 
         assert_eq!(
@@ -633,6 +779,125 @@ mod tests {
         );
         let (_, body) = call(&app, "GET", "/api/state", Some(&ada), None).await;
         assert!(body.contains(r#""reminders":[]"#), "{body}");
+    }
+
+    #[tokio::test]
+    async fn preferences_persist_before_registration_and_remain_isolated() {
+        let service = Service::new(Db::open_in_memory().unwrap());
+        let app = router(Arc::new(WebState {
+            service: service.clone(),
+            bot_token: TOKEN.into(),
+            web_app_url: None,
+        }));
+        let ada = init_data_with_language(42, "en", Utc::now());
+        let eve = init_data_with_language(66, "ru", Utc::now());
+        assert_eq!(
+            call(
+                &app,
+                "PATCH",
+                "/api/preferences",
+                None,
+                Some(r#"{"language":"ru"}"#)
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let (status, body) = call(&app, "GET", "/api/state", Some(&ada), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let state: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(state["language"], "en");
+        assert_eq!(state["nag_interval_minutes"], 10);
+        assert_eq!(state["confirmation_check_minutes"], 0);
+        assert!(state["timezone"].is_null());
+        let patch =
+            r#"{"language":"ru","nag_interval_minutes":30,"confirmation_check_minutes":20}"#;
+        let (status, body) = call(&app, "PATCH", "/api/preferences", Some(&ada), Some(patch)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let state: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(state["language"], "ru");
+        assert_eq!(state["nag_interval_minutes"], 30);
+        assert_eq!(state["confirmation_check_minutes"], 20);
+        assert!(
+            service.user(42).await.unwrap().is_none(),
+            "preferences do not register a timezone"
+        );
+        let (_, body) = call(&app, "GET", "/api/state", Some(&ada), None).await;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["language"],
+            "ru",
+            "manual selection wins over Telegram language"
+        );
+        let (_, body) = call(&app, "GET", "/api/state", Some(&eve), None).await;
+        let other: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(other["language"], "ru");
+        assert_eq!(other["nag_interval_minutes"], 10);
+        assert_eq!(other["confirmation_check_minutes"], 0);
+        call(
+            &app,
+            "PUT",
+            "/api/timezone",
+            Some(&ada),
+            Some(r#"{"timezone":"Europe/Moscow"}"#),
+        )
+        .await;
+        let (_, body) = call(&app, "GET", "/api/state", Some(&ada), None).await;
+        let registered: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            registered["nag_interval_minutes"], 30,
+            "timezone registration preserves preferences"
+        );
+    }
+
+    #[tokio::test]
+    async fn preferences_validate_whole_patch_before_mutation() {
+        let service = Service::new(Db::open_in_memory().unwrap());
+        let app = router(Arc::new(WebState {
+            service: service.clone(),
+            bot_token: TOKEN.into(),
+            web_app_url: None,
+        }));
+        let auth = init_data(42, Utc::now());
+        for invalid in [
+            r#"{"language":"fr"}"#,
+            r#"{"language":"en","nag_interval_minutes":2}"#,
+            r#"{"confirmation_check_minutes":10}"#,
+        ] {
+            let (status, body) = call(
+                &app,
+                "PATCH",
+                "/api/preferences",
+                Some(&auth),
+                Some(invalid),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{invalid}: {body}");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&body).unwrap()["code"],
+                "invalid_preferences"
+            );
+            assert_eq!(
+                service.preferences(42).await.unwrap(),
+                crate::model::Preferences::default()
+            );
+        }
+        assert!(
+            !call(
+                &app,
+                "PATCH",
+                "/api/preferences",
+                Some(&auth),
+                Some(r#"{"user_id":66,"language":"en"}"#)
+            )
+            .await
+            .0
+            .is_success(),
+            "unknown fields cannot redirect a patch"
+        );
+        assert_eq!(
+            service.preferences(66).await.unwrap(),
+            crate::model::Preferences::default()
+        );
     }
 
     #[tokio::test]

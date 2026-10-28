@@ -1,12 +1,9 @@
-# Add to your existing Caddyfile. Caddy obtains and renews the HTTPS certificate.
-# The host name must match WEB_APP_URL in .env.
-
 reminders.example.com {
-	encode zstd gzip
-
-	# Option A (Caddy in Docker, on the same network as the bot):
-	reverse_proxy extremelynaggybot:8080
-
-	# Option B (Caddy on the host, bot published on 127.0.0.1:8080):
-	# reverse_proxy 127.0.0.1:8080
+    encode zstd gzip
+    header {
+        X-Content-Type-Options nosniff
+        Referrer-Policy no-referrer
+        -Server
+    }
+    reverse_proxy 127.0.0.1:8097
 }
