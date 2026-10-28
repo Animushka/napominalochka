@@ -1,4 +1,8 @@
 reminders.example.com {
+    # Keep this hostname on its own TLS policy when sharing an existing server.
+    tls {
+        protocols tls1.2 tls1.3
+    }
     encode zstd gzip
     header {
         X-Content-Type-Options nosniff
