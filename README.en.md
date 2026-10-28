@@ -9,8 +9,8 @@ choose a schedule, snooze, and keep receiving nudges until you tap Done.
 - Full Russian and English UI with persistent language selection.
 - One-off, daily, weekday, weekly, monthly and yearly schedules.
 - Per-user nudge intervals: 1, 5, 10, 20, 30 or 60 minutes; default 10.
-- Optional one-time completion check 20 minutes after Done. It confirms an
-  already completed action; it never instructs you to take another dose.
+- Optional one-time follow-up check 20 minutes after Done. The bot asks
+  whether everything is definitely done.
 - Timezones, calendar subscription, durable reminders and completion checks.
 - One container, SQLite and signed Telegram Mini App authentication.
 

@@ -7,7 +7,7 @@
   "error.missing": "This reminder is no longer available.",
   "error.preferences": "Check the language, repeat interval and confirmation check delay.",
   "error.internal": "Sorry, something went wrong. Please try again later.",
-  "confirmation": "✅ Completion is already recorded: {description}\n\nThis is a single check 20 minutes after you tapped Done. If the reminder was about medication, you do not need to take another dose.",
+  "confirmation": "🔎 Follow-up check\n\n{description}\n\nIt's been 20 minutes since you tapped “Done”. Is everything done?",
   "done": "✅ Done",
   "snooze.ten": "💤 10 min",
   "snooze.hour": "💤 1 hour",

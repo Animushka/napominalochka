@@ -41,7 +41,7 @@
   "settings.interval": "Repeat until I tap “Done”",
   "settings.intervalHelp": "Missed the message? The bot will remind you again after this interval.",
   "settings.check": "A follow-up check",
-  "settings.checkHelp": "20 minutes after “Done”, the bot will ask whether everything was completed. This is a check, not a request to repeat the action or take another dose.",
+  "settings.checkHelp": "20 minutes after “Done”, the bot will check in once: “Is everything done?” 💛",
   "settings.saving": "Saving settings…",
   "settings.saved": "Settings saved ✓",
   "settings.languageSaved": "Language saved ✓",
