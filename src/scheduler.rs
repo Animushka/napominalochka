@@ -112,13 +112,14 @@ async fn repeat_due_naggings<N: Notifier>(
     for nagging in db.due_naggings(now).await? {
         let interval =
             Duration::minutes(db.preferences(nagging.user_id).await?.nag_interval_minutes);
-        db.reschedule_nagging(nagging.id, now + interval).await?;
-        deliver(notifier, db, &nagging).await?;
+        if db.claim_nagging(&nagging, now, now + interval).await? {
+            deliver(notifier, db, &nagging).await?;
+        }
     }
     Ok(())
 }
 
-/// One delivery per completion. No Done button and no path back into the nagging loop.
+/// One delivery per completion. Its confirmation button never reenters the nagging loop.
 async fn send_due_confirmations<N: Notifier>(
     notifier: &N,
     db: &Db,
@@ -247,6 +248,66 @@ mod tests {
             db.set_preferences(id, None, Some(1), None).await.unwrap();
         }
         (FakeNotifier::default(), db)
+    }
+
+    #[tokio::test]
+    async fn stale_repeat_snapshot_skips_snoozed_and_completed_occurrences() {
+        struct InterleavingNotifier {
+            db: Db,
+            snooze_id: i64,
+            complete_id: i64,
+            sent: Mutex<Vec<i64>>,
+        }
+        impl Notifier for InterleavingNotifier {
+            async fn send(&self, nagging: &Nagging) -> Delivery {
+                self.sent.lock().unwrap().push(nagging.id);
+                // repeat_due_naggings already loaded every due occurrence. Emulate actions
+                // arriving through the app while the first external delivery is in flight.
+                self.db
+                    .snooze_nagging(1, self.snooze_id, at(10, 0))
+                    .await
+                    .unwrap();
+                self.db
+                    .complete_nagging(1, self.complete_id, at(9, 0))
+                    .await
+                    .unwrap();
+                Delivery::Sent
+            }
+            async fn send_confirmation(&self, _: &Confirmation) -> Delivery {
+                unreachable!("only processing repeat deliveries")
+            }
+        }
+        let (_, db) = setup().await;
+        let mut naggings = Vec::new();
+        for text in ["first", "snoozed", "completed"] {
+            let reminder = db
+                .add_reminder(1, text.into(), at(9, 0), Recurrence::Once)
+                .await
+                .unwrap();
+            naggings.push(
+                db.fire_reminder(reminder.id, at(9, 0), at(9, 0))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let notifier = InterleavingNotifier {
+            db: db.clone(),
+            snooze_id: naggings[1].id,
+            complete_id: naggings[2].id,
+            sent: Mutex::new(Vec::new()),
+        };
+        repeat_due_naggings(&notifier, &db, at(9, 0)).await.unwrap();
+        assert_eq!(*notifier.sent.lock().unwrap(), vec![naggings[0].id]);
+        let pending = db.naggings_for_user(1).await.unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].next_at, at(9, 1));
+        assert_eq!(pending[1].id, naggings[1].id);
+        assert_eq!(
+            pending[1].next_at,
+            at(10, 0),
+            "stale snapshot must preserve snooze"
+        );
     }
 
     #[tokio::test]

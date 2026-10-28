@@ -106,21 +106,12 @@ textarea::placeholder { color: var(--muted); opacity: .8; }
 .yandex-guide summary { min-height: 44px; padding: 12px; color: var(--mint-strong); font-size: 12px; font-weight: 650; }
 .yandex-guide summary::after { content: "+"; margin-left: auto; font-size: 17px; font-weight: 400; }
 .yandex-guide[open] summary::after { content: "−"; }
-.yandex-steps { margin: 0; padding: 0 16px 14px 32px; font-size: 12px; color: var(--muted); line-height: 1.65; }
-.yandex-steps li + li { margin-top: 10px; }
-.yandex-steps li::marker { color: var(--mint-strong); font-weight: 650; }
-.yandex-steps blockquote { margin: 9px 0 0; padding: 9px 11px; border-radius: 10px; background: var(--mint); color: var(--text); }
-.yandex-behavior { margin-top: 13px; }
 .yandex-permissions { margin: 14px 0 12px; padding: 12px; border-radius: 12px; background: var(--surface-soft); color: var(--muted); font-size: 12px; line-height: 1.65; }
 #yandex-connect { width: 100%; }
-#yandex-connected { margin-top: 17px; }
 #yandex-scenario { text-overflow: ellipsis; }
-.yandex-actions { flex-wrap: wrap; }
-.yandex-actions > * { flex-basis: 120px; }
 .yandex-links { display: flex; flex-wrap: wrap; column-gap: 15px; }
 .yandex-links button { min-height: 44px; text-align: left; text-decoration: underline; }
 .yandex-disconnect, .yandex-panel .is-error { color: var(--danger); }
-.yandex-panel .toggle-row input:disabled + .toggle-track { opacity: .55; }
 #calendar-url { margin-top: 0; font-size: 12px; }
 .calendar-panel .field-label { margin-top: 15px; }
 .button-row { display: flex; gap: 8px; margin-top: 10px; }
@@ -155,3 +146,37 @@ legend { padding: 0; }
 @media (min-width: 500px) { .app { padding-left: 32px; padding-right: 32px; } .masthead { margin-top: 8px; } .hero { min-height: 250px; padding: 31px; } .hero-copy { width: 72%; } .hero h1 { font-size: 36px; } .hero-mascot { width: 210px; height: 210px; right: -4px; bottom: -17px; } .hero-sparkle { right: 39px; } .hero-description { max-width: 275px; } }
 @media (max-width: 350px) { .app { padding-left: 13px; padding-right: 13px; } .wordmark { font-size: 13px; gap: 4px; } .hero { padding: 23px 18px; } .hero h1 { font-size: 25px; } .hero-copy { width: 81%; } .hero-mascot { width: 113px; height: 113px; right: -7px; bottom: 1px; } .hero-description { max-width: 172px; } .language-switch button { min-width: 32px; padding: 7px; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; animation-duration: 2s !important; } }
+
+/* Keep the friendly welcome small once the list has something to do. */
+.hero.hero-compact { min-height: 96px; padding: 20px; border-radius: 22px; }
+.hero-compact .hero-copy { width: calc(100% - 70px); }
+.hero-compact .eyebrow, .hero-compact .hero-description, .hero-compact .hero-sparkle { display: none; }
+.hero.hero-compact h1 { margin: 0; font-size: 23px; line-height: 1.2; letter-spacing: -.6px; }
+.hero-compact .hero-mascot { width: 103px; height: 103px; right: -5px; bottom: -5px; }
+.hero-compact + .add-button { margin-bottom: 23px; }
+.pending-section { margin-bottom: 25px; }
+.pending-section .count { background: var(--mint); color: var(--mint-strong); }
+.pending-item { min-width: 0; padding: 16px; border: 1px solid var(--line); border-left: 3px solid var(--coral); border-radius: 18px; background: var(--surface); box-shadow: var(--shadow); }
+.pending-item h3 { margin: 0; }
+.pending-actions { margin-top: 13px; }
+.pending-actions .button { min-height: 44px; }
+.snooze-choices { padding-top: 11px; }
+.snooze-choices .chip { flex: 1 1 auto; min-height: 44px; }
+.repeat-panel { margin-top: 24px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.repeat-panel summary { display: flex; align-items: center; gap: 12px; min-height: 54px; cursor: pointer; font-size: 13px; list-style: none; }
+.repeat-panel summary::-webkit-details-marker { display: none; }
+.repeat-panel summary strong { margin-left: auto; font-size: 12px; font-weight: 500; color: var(--muted); }
+.repeat-panel .chips { padding-bottom: 15px; }
+.yandex-progress { display: flex; gap: 7px; padding: 0; margin: 0 0 18px; list-style: none; counter-reset: setup; }
+.yandex-progress li { display: flex; align-items: center; gap: 4px; min-width: 0; font-size: 11px; color: var(--muted); counter-increment: setup; }
+.yandex-progress li::before { content: counter(setup); width: 20px; height: 20px; display: inline-grid; flex: 0 0 20px; place-items: center; background: var(--surface-soft); border-radius: 50%; }
+.yandex-progress li[aria-current] { color: var(--text); font-weight: 650; }
+.yandex-progress li[aria-current]::before { background: var(--coral); color: var(--coral-dark); }
+.yandex-primary { width: 100%; margin-top: 12px; }
+.yandex-secondary { min-height: 44px; display: block; margin: 4px auto 0; text-align: center; }
+.yandex-chosen { display: flex; flex-direction: column; gap: 4px; margin-bottom: 11px; font-size: 12px; color: var(--muted); }
+.yandex-chosen strong { font-size: 15px; color: var(--text); overflow-wrap: anywhere; }
+.yandex-help-content { padding: 0 12px 12px; }
+.yandex-help-content blockquote { margin: 10px 0; padding: 10px; border-radius: 10px; background: var(--mint); font-size: 12px; }
+.yandex-help-content .yandex-links { gap: 12px; margin-top: 14px; }
+#yandex-connect-area > .field-help:last-child { margin-top: 10px; }

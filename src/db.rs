@@ -25,10 +25,12 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/004_calendar_feed.sql"),
     include_str!("../migrations/005_preferences_and_confirmations.sql"),
     include_str!("../migrations/006_yandex.sql"),
+    include_str!("../migrations/007_recurrence_anchor.sql"),
 ];
 
 const USER_COLUMNS: &str = "user_id, first_name, last_name, utc_offset_minutes, timezone";
-const REMINDER_COLUMNS: &str = "reminder_id, user_id, description, due_at, recurrence";
+const REMINDER_COLUMNS: &str =
+    "reminder_id, user_id, description, due_at, recurrence, anchor_local";
 
 /// Timestamps are stored as UTC text in the same format the .NET bot used (`DateTime.ToString("s")`).
 const TIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
@@ -230,6 +232,7 @@ impl Db {
 
     // ---- reminders ---------------------------------------------------------------------
 
+    #[cfg(test)]
     pub async fn add_reminder(
         &self,
         user_id: i64,
@@ -237,12 +240,24 @@ impl Db {
         due_at: DateTime<Utc>,
         recurrence: Recurrence,
     ) -> anyhow::Result<Reminder> {
+        self.add_reminder_with_anchor(user_id, description, due_at, recurrence, None)
+            .await
+    }
+
+    pub async fn add_reminder_with_anchor(
+        &self,
+        user_id: i64,
+        description: String,
+        due_at: DateTime<Utc>,
+        recurrence: Recurrence,
+        anchor_local: Option<NaiveDateTime>,
+    ) -> anyhow::Result<Reminder> {
         self.call(move |conn| {
             conn.execute(
-                "INSERT INTO reminders (user_id, description, due_at, recurrence) VALUES (?1, ?2, ?3, ?4)",
-                params![user_id, description, DbTime(due_at), recurrence.to_db()],
+                "INSERT INTO reminders (user_id, description, due_at, recurrence, anchor_local) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![user_id, description, DbTime(due_at), recurrence.to_db(), anchor_local.map(DbLocalTime)],
             )?;
-            Ok(Reminder { id: conn.last_insert_rowid(), user_id, description, due_at, recurrence })
+            Ok(Reminder { id: conn.last_insert_rowid(), user_id, description, due_at, recurrence, anchor_local })
         })
         .await
     }
@@ -250,7 +265,7 @@ impl Db {
     pub async fn reminders_for_user(&self, user_id: i64) -> anyhow::Result<Vec<Reminder>> {
         self.call(move |conn| {
             conn.prepare(
-                "SELECT reminder_id, user_id, description, due_at, recurrence
+                "SELECT reminder_id, user_id, description, due_at, recurrence, anchor_local
                  FROM reminders WHERE user_id = ?1 ORDER BY due_at, reminder_id",
             )?
             .query_map([user_id], reminder_from_row)?
@@ -276,6 +291,7 @@ impl Db {
     }
 
     /// Changes one of the user's reminders. The description is kept if `description` is `None`.
+    #[cfg(test)]
     pub async fn update_reminder(
         &self,
         user_id: i64,
@@ -284,11 +300,32 @@ impl Db {
         due_at: DateTime<Utc>,
         recurrence: Recurrence,
     ) -> anyhow::Result<Option<Reminder>> {
+        self.update_reminder_with_anchor(
+            user_id,
+            reminder_id,
+            description,
+            due_at,
+            recurrence,
+            None,
+        )
+        .await
+    }
+
+    pub async fn update_reminder_with_anchor(
+        &self,
+        user_id: i64,
+        reminder_id: i64,
+        description: Option<String>,
+        due_at: DateTime<Utc>,
+        recurrence: Recurrence,
+        anchor_local: Option<NaiveDateTime>,
+    ) -> anyhow::Result<Option<Reminder>> {
         self.call(move |conn| {
             conn.query_row(
                 &format!(
                     "UPDATE reminders
-                     SET description = COALESCE(?1, description), due_at = ?2, recurrence = ?3
+                     SET description = COALESCE(?1, description), due_at = ?2, recurrence = ?3,
+                         anchor_local = ?6
                      WHERE reminder_id = ?4 AND user_id = ?5
                      RETURNING {REMINDER_COLUMNS}"
                 ),
@@ -297,8 +334,31 @@ impl Db {
                     DbTime(due_at),
                     recurrence.to_db(),
                     reminder_id,
-                    user_id
+                    user_id,
+                    anchor_local.map(DbLocalTime)
                 ],
+                reminder_from_row,
+            )
+            .optional()
+        })
+        .await
+    }
+
+    /// A text-only edit must not reset the original calendar anchor or a schedule advanced
+    /// concurrently by the scheduler.
+    pub async fn update_reminder_description(
+        &self,
+        user_id: i64,
+        reminder_id: i64,
+        description: Option<String>,
+    ) -> anyhow::Result<Option<Reminder>> {
+        self.call(move |conn| {
+            conn.query_row(
+                &format!(
+                    "UPDATE reminders SET description = COALESCE(?1, description)
+                          WHERE reminder_id = ?2 AND user_id = ?3 RETURNING {REMINDER_COLUMNS}"
+                ),
+                params![description, reminder_id, user_id],
                 reminder_from_row,
             )
             .optional()
@@ -340,7 +400,7 @@ impl Db {
     pub async fn due_reminders(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<Reminder>> {
         self.call(move |conn| {
             conn.prepare(
-                "SELECT reminder_id, user_id, description, due_at, recurrence
+                "SELECT reminder_id, user_id, description, due_at, recurrence, anchor_local
                  FROM reminders WHERE due_at <= ?1 ORDER BY due_at, reminder_id",
             )?
             .query_map([DbTime(now)], reminder_from_row)?
@@ -391,10 +451,15 @@ impl Db {
             )?;
 
             let tz = user_tz(&tx, reminder.user_id)?;
-            match tz.and_then(|tz| reminder.recurrence.next_after(reminder.due_at, now, tz)) {
+            let anchor = reminder.anchor_local.or_else(|| tz.map(|tz| tz.local(reminder.due_at)));
+            let next = tz.and_then(|tz| match reminder.anchor_local {
+                Some(anchor) => reminder.recurrence.next_after_anchored(reminder.due_at, now, tz, anchor),
+                None => reminder.recurrence.next_after(reminder.due_at, now, tz),
+            });
+            match next {
                 Some(next) => tx.execute(
-                    "UPDATE reminders SET due_at = ?1 WHERE reminder_id = ?2",
-                    params![DbTime(next), reminder.id],
+                    "UPDATE reminders SET due_at = ?1, anchor_local = ?3 WHERE reminder_id = ?2",
+                    params![DbTime(next), reminder.id, anchor.map(DbLocalTime)],
                 )?,
                 None => tx.execute("DELETE FROM reminders WHERE reminder_id = ?1", [reminder.id])?,
             };
@@ -406,6 +471,20 @@ impl Db {
     }
 
     // ---- naggings ----------------------------------------------------------------------
+
+    /// Pending occurrences remain visible after their one-off reminder has been consumed
+    /// and while snoozed. Never join reminders here: one-off occurrences have no parent.
+    pub async fn naggings_for_user(&self, user_id: i64) -> anyhow::Result<Vec<Nagging>> {
+        self.call(move |conn| {
+            conn.prepare(
+                "SELECT nagging_id, reminder_id, user_id, description, next_at
+                 FROM naggings WHERE user_id = ?1 ORDER BY next_at, nagging_id",
+            )?
+            .query_map([user_id], nagging_from_row)?
+            .collect()
+        })
+        .await
+    }
 
     pub async fn due_naggings(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<Nagging>> {
         self.call(move |conn| {
@@ -419,17 +498,27 @@ impl Db {
         .await
     }
 
-    pub async fn reschedule_nagging(
+    /// Claims one due delivery only while its observed schedule is still current. A stale
+    /// scheduler snapshot must not overwrite a snooze or send a completed/deleted occurrence.
+    pub async fn claim_nagging(
         &self,
-        nagging_id: i64,
+        observed: &Nagging,
+        now: DateTime<Utc>,
         next_at: DateTime<Utc>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
+        let (nagging_id, user_id, observed_at) = (observed.id, observed.user_id, observed.next_at);
         self.call(move |conn| {
-            conn.execute(
-                "UPDATE naggings SET next_at = ?1 WHERE nagging_id = ?2",
-                params![DbTime(next_at), nagging_id],
-            )?;
-            Ok(())
+            Ok(conn.execute(
+                "UPDATE naggings SET next_at = ?1
+                 WHERE nagging_id = ?2 AND user_id = ?3 AND next_at = ?4 AND next_at <= ?5",
+                params![
+                    DbTime(next_at),
+                    nagging_id,
+                    user_id,
+                    DbTime(observed_at),
+                    DbTime(now)
+                ],
+            )? > 0)
         })
         .await
     }
@@ -499,10 +588,22 @@ impl Db {
         next_at: DateTime<Utc>,
     ) -> anyhow::Result<bool> {
         self.call(move |conn| {
-            Ok(conn.execute(
+            let tx = conn.transaction()?;
+            let changed = tx.execute(
                 "UPDATE naggings SET next_at = ?1 WHERE nagging_id = ?2 AND user_id = ?3",
                 params![DbTime(next_at), nagging_id, user_id],
-            )? > 0)
+            )? > 0;
+            if changed {
+                // A claimed worker rechecks the job immediately before its external request.
+                // Removing it cancels queued work; an already dispatched request cannot be recalled.
+                tx.execute(
+                    "DELETE FROM yandex_jobs WHERE nagging_id = ?1 AND user_id = ?2
+                     AND state IN ('pending', 'claimed')",
+                    [nagging_id, user_id],
+                )?;
+            }
+            tx.commit()?;
+            Ok(changed)
         })
         .await
     }
@@ -607,12 +708,25 @@ impl Db {
 
     /// Turns a draft into a reminder. Returns `None` if the draft no longer exists
     /// (already saved or cancelled).
+    #[cfg(test)]
     pub async fn save_draft(
         &self,
         user_id: i64,
         draft_id: i64,
         due_at: DateTime<Utc>,
         recurrence: Recurrence,
+    ) -> anyhow::Result<Option<Reminder>> {
+        self.save_draft_with_anchor(user_id, draft_id, due_at, recurrence, None)
+            .await
+    }
+
+    pub async fn save_draft_with_anchor(
+        &self,
+        user_id: i64,
+        draft_id: i64,
+        due_at: DateTime<Utc>,
+        recurrence: Recurrence,
+        anchor_local: Option<NaiveDateTime>,
     ) -> anyhow::Result<Option<Reminder>> {
         self.call(move |conn| {
             let tx = conn.transaction()?;
@@ -627,10 +741,10 @@ impl Db {
                 return Ok(None);
             };
             tx.execute(
-                "INSERT INTO reminders (user_id, description, due_at, recurrence) VALUES (?1, ?2, ?3, ?4)",
-                params![user_id, description, DbTime(due_at), recurrence.to_db()],
+                "INSERT INTO reminders (user_id, description, due_at, recurrence, anchor_local) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![user_id, description, DbTime(due_at), recurrence.to_db(), anchor_local.map(DbLocalTime)],
             )?;
-            let reminder = Reminder { id: tx.last_insert_rowid(), user_id, description, due_at, recurrence };
+            let reminder = Reminder { id: tx.last_insert_rowid(), user_id, description, due_at, recurrence, anchor_local };
             tx.commit()?;
             Ok(Some(reminder))
         })
@@ -743,6 +857,7 @@ fn reminder_from_row(row: &Row<'_>) -> rusqlite::Result<Reminder> {
         due_at: row.get::<_, DbTime>(3)?.0,
         recurrence: Recurrence::from_db(recurrence)
             .ok_or_else(|| invalid_column(4, "unknown recurrence"))?,
+        anchor_local: row.get::<_, Option<DbLocalTime>>(5)?.map(|time| time.0),
     })
 }
 
@@ -763,6 +878,23 @@ fn invalid_column(index: usize, message: &'static str) -> rusqlite::Error {
 /// A UTC timestamp stored as `TIME_FORMAT` text. That format sorts lexically, so SQL range
 /// comparisons on these columns are correct.
 struct DbTime(DateTime<Utc>);
+
+/// Local wall-clock schedule anchor; deliberately has no UTC offset.
+struct DbLocalTime(NaiveDateTime);
+
+impl ToSql for DbLocalTime {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.0.format(TIME_FORMAT).to_string()))
+    }
+}
+
+impl FromSql for DbLocalTime {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        NaiveDateTime::parse_from_str(value.as_str()?, TIME_FORMAT)
+            .map(DbLocalTime)
+            .map_err(|error| FromSqlError::Other(Box::new(error)))
+    }
+}
 
 impl ToSql for DbTime {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
@@ -796,6 +928,292 @@ mod tests {
             last_name: String::new(),
             tz: UserTz::Fixed(UtcOffset::from_minutes(480).unwrap()),
         }
+    }
+
+    #[tokio::test]
+    async fn calendar_anchors_survive_reopening_and_legacy_rows_gain_an_anchor() {
+        let path = std::env::temp_dir().join(format!(
+            "napominalochka-anchor-{}.sqlite",
+            new_token().unwrap()
+        ));
+        let db = Db::open(&path).unwrap();
+        let mut utc_user = user(1);
+        utc_user.tz = UserTz::Fixed(UtcOffset::from_minutes(0).unwrap());
+        db.upsert_user(utc_user).await.unwrap();
+        let mut london_user = user(2);
+        london_user.tz = UserTz::Named(chrono_tz::Tz::Europe__London);
+        let london = london_user.tz;
+        db.upsert_user(london_user).await.unwrap();
+
+        // An unanchored legacy row is upgraded using its current due local date.
+        let monthly = db
+            .add_reminder(
+                1,
+                "monthly".into(),
+                utc(2027, 1, 31, 9, 0),
+                Recurrence::Monthly,
+            )
+            .await
+            .unwrap();
+        assert_eq!(monthly.anchor_local, None);
+        let daily_anchor = utc(2026, 3, 28, 1, 30).naive_utc();
+        let daily = db
+            .add_reminder_with_anchor(
+                2,
+                "daily".into(),
+                london.utc(daily_anchor),
+                Recurrence::Daily,
+                Some(daily_anchor),
+            )
+            .await
+            .unwrap();
+        let leap_anchor = utc(2028, 2, 29, 9, 0).naive_utc();
+        let yearly = db
+            .add_reminder_with_anchor(
+                1,
+                "yearly".into(),
+                leap_anchor.and_utc(),
+                Recurrence::Yearly,
+                Some(leap_anchor),
+            )
+            .await
+            .unwrap();
+        for reminder in [&monthly, &daily, &yearly] {
+            db.fire_reminder(reminder.id, reminder.due_at, reminder.due_at)
+                .await
+                .unwrap();
+        }
+        drop(db);
+
+        let db = Db::open(&path).unwrap();
+        let monthly = db.reminder(1, monthly.id).await.unwrap().unwrap();
+        assert_eq!(monthly.due_at, utc(2027, 2, 28, 9, 0));
+        assert_eq!(
+            monthly.anchor_local,
+            Some(utc(2027, 1, 31, 9, 0).naive_utc())
+        );
+        db.fire_reminder(monthly.id, monthly.due_at, monthly.due_at)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.reminder(1, monthly.id).await.unwrap().unwrap().due_at,
+            utc(2027, 3, 31, 9, 0)
+        );
+
+        let daily = db.reminder(2, daily.id).await.unwrap().unwrap();
+        assert_eq!(
+            london.local(daily.due_at),
+            utc(2026, 3, 29, 2, 30).naive_utc()
+        );
+        assert_eq!(daily.anchor_local, Some(daily_anchor));
+        db.fire_reminder(daily.id, daily.due_at, daily.due_at)
+            .await
+            .unwrap();
+        assert_eq!(
+            london.local(db.reminder(2, daily.id).await.unwrap().unwrap().due_at),
+            utc(2026, 3, 30, 1, 30).naive_utc()
+        );
+
+        let mut yearly = db.reminder(1, yearly.id).await.unwrap().unwrap();
+        for year in 2029..=2032 {
+            assert_eq!(yearly.anchor_local, Some(leap_anchor));
+            assert_eq!(
+                yearly.due_at,
+                utc(year, 2, if year == 2032 { 29 } else { 28 }, 9, 0)
+            );
+            db.fire_reminder(yearly.id, yearly.due_at, yearly.due_at)
+                .await
+                .unwrap();
+            yearly = db.reminder(1, yearly.id).await.unwrap().unwrap();
+        }
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_one_offs_and_snoozes_survive_reopening_and_stay_private() {
+        let path = std::env::temp_dir().join(format!(
+            "napominalochka-pending-{}.sqlite",
+            new_token().unwrap()
+        ));
+        let db = Db::open(&path).unwrap();
+        db.upsert_user(user(1)).await.unwrap();
+        db.upsert_user(user(2)).await.unwrap();
+        let due = utc(2026, 3, 1, 8, 0);
+        let later = due + ChronoDuration::minutes(10);
+        let mut nags = Vec::new();
+        for (owner, text) in [(1, "first"), (1, "second"), (2, "private")] {
+            let reminder = db
+                .add_reminder(owner, text.into(), due, Recurrence::Once)
+                .await
+                .unwrap();
+            nags.push(
+                db.fire_reminder(reminder.id, due, later)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert!(db.reminders_for_user(1).await.unwrap().is_empty());
+        assert!(db.due_naggings(due).await.unwrap().is_empty());
+        assert_eq!(
+            db.naggings_for_user(1)
+                .await
+                .unwrap()
+                .iter()
+                .map(|n| n.id)
+                .collect::<Vec<_>>(),
+            vec![nags[0].id, nags[1].id]
+        );
+        let snoozed_until = due + ChronoDuration::hours(1);
+        db.snooze_nagging(1, nags[0].id, snoozed_until)
+            .await
+            .unwrap();
+        drop(db);
+
+        let db = Db::open(&path).unwrap();
+        let pending = db.naggings_for_user(1).await.unwrap();
+        assert_eq!(
+            pending.iter().map(|n| n.id).collect::<Vec<_>>(),
+            vec![nags[1].id, nags[0].id]
+        );
+        assert!(
+            pending
+                .iter()
+                .all(|n| n.user_id == 1 && n.reminder_id.is_none())
+        );
+        assert_eq!(pending[1].next_at, snoozed_until);
+        assert_eq!(db.naggings_for_user(2).await.unwrap()[0].id, nags[2].id);
+        assert!(db.naggings_for_user(3).await.unwrap().is_empty());
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn nagging_claim_requires_a_current_due_snapshot_and_only_one_worker_wins() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_user(user(1)).await.unwrap();
+        let due = utc(2026, 3, 1, 8, 0);
+        let reminder = db
+            .add_reminder(1, "task".into(), due, Recurrence::Once)
+            .await
+            .unwrap();
+        db.fire_reminder(reminder.id, due, due).await.unwrap();
+        let observed = db.due_naggings(due).await.unwrap().remove(0);
+        let next = due + ChronoDuration::minutes(10);
+        let mut wrong_owner = observed.clone();
+        wrong_owner.user_id = 2;
+        assert!(!db.claim_nagging(&wrong_owner, due, next).await.unwrap());
+        let (first, second) = tokio::join!(
+            db.claim_nagging(&observed, due, next),
+            db.claim_nagging(&observed, due, next),
+        );
+        assert_ne!(first.unwrap(), second.unwrap());
+        let rescheduled = db.naggings_for_user(1).await.unwrap().remove(0);
+        assert!(
+            !db.claim_nagging(&rescheduled, due, next).await.unwrap(),
+            "future occurrence cannot be claimed"
+        );
+
+        let until = due + ChronoDuration::hours(1);
+        db.snooze_nagging(1, observed.id, until).await.unwrap();
+        assert!(
+            !db.claim_nagging(&rescheduled, next, next + ChronoDuration::minutes(10))
+                .await
+                .unwrap()
+        );
+        assert_eq!(db.naggings_for_user(1).await.unwrap()[0].next_at, until);
+        let snoozed = db.naggings_for_user(1).await.unwrap().remove(0);
+        db.complete_nagging(1, observed.id, next).await.unwrap();
+        assert!(
+            !db.claim_nagging(&snoozed, until, until + ChronoDuration::minutes(10))
+                .await
+                .unwrap()
+        );
+        assert!(db.naggings_for_user(1).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn snoozing_cancels_only_its_owners_undispatched_yandex_job() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_user(user(1)).await.unwrap();
+        db.upsert_user(user(2)).await.unwrap();
+        db.call(|conn| conn.execute_batch(
+            "INSERT INTO yandex_connections (user_id, generation, encrypted_tokens, enabled, scenario_id)
+             VALUES (1, 'g1', X'01', 1, 'scenario-1'), (2, 'g2', X'02', 1, 'scenario-2');"
+        )).await.unwrap();
+        let due = utc(2026, 3, 1, 8, 0);
+        let later = due + ChronoDuration::hours(1);
+        let mut nags = Vec::new();
+        for owner in [1, 1, 1, 2] {
+            let reminder = db
+                .add_reminder(owner, "task".into(), due, Recurrence::Once)
+                .await
+                .unwrap();
+            nags.push(
+                db.fire_reminder(reminder.id, due, due)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let claimed_id = nags[1].id;
+        let delivered_id = nags[2].id;
+        db.call(move |conn| {
+            conn.execute(
+                "UPDATE yandex_jobs SET state = 'claimed' WHERE nagging_id = ?1",
+                [claimed_id],
+            )?;
+            conn.execute(
+                "UPDATE yandex_jobs SET state = 'delivered' WHERE nagging_id = ?1",
+                [delivered_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(!db.snooze_nagging(2, nags[0].id, later).await.unwrap());
+        let count = || {
+            db.call(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM yandex_jobs", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+            })
+        };
+        assert_eq!(count().await.unwrap(), 4);
+        for nagging in &nags[..3] {
+            assert!(db.snooze_nagging(1, nagging.id, later).await.unwrap());
+        }
+        let remaining = db
+            .call(|conn| {
+                conn.prepare("SELECT nagging_id, state FROM yandex_jobs ORDER BY job_id")?
+                    .query_map([], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining,
+            vec![
+                (nags[2].id, "delivered".into()),
+                (nags[3].id, "pending".into())
+            ]
+        );
+        assert_eq!(db.naggings_for_user(1).await.unwrap().len(), 3);
+        assert_eq!(db.naggings_for_user(2).await.unwrap()[0].next_at, due);
+        let snoozed = db.naggings_for_user(1).await.unwrap().remove(0);
+        assert!(
+            db.claim_nagging(&snoozed, later, later + ChronoDuration::minutes(10))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            count().await.unwrap(),
+            2,
+            "repeating never creates a new voice job"
+        );
     }
 
     #[tokio::test]

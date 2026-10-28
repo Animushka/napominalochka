@@ -8,6 +8,7 @@ choose a schedule, snooze, and keep receiving nudges until you tap Done.
 
 - Full Russian and English UI with persistent language selection.
 - One-off, daily, weekday, weekly, monthly and yearly schedules.
+- A pending section keeps fired reminders visible until Done, with snooze actions in the Mini App.
 - Per-user nudge intervals: 1, 5, 10, 20, 30 or 60 minutes; default 10.
 - Optional one-time follow-up check 20 minutes after Done. The bot asks
   whether everything is definitely done.
@@ -80,3 +81,17 @@ in Yandex ID settings. Tokens are AES-256-GCM encrypted; securely back up the se
 key with the database. One-use state, PKCE and a Telegram-bound callback receipt protect
 account linking. Mock HTTP tests cover these flows; verify actual speech with a real
 account and speaker after configuration.
+
+## Scheduling reliability
+
+Recurring reminders retain their original local date/time independently of the next
+UTC occurrence. Short months clamp only that occurrence, and DST gaps do not permanently
+shift future reminders. Additive migration 007 preserves existing data; legacy records
+use their current saved date as the initial anchor on first firing. Description-only
+edits preserve the latest schedule, including when it advances while an editor is open.
+Calendar rules use the same anchors and include DST-gap exceptions for the next two
+years while ordinary recurrence remains unbounded.
+
+The Alice UI lives in `web/yandex.js`; chat and Mini App share the completion/snooze
+service. API errors have stable codes and personal responses use no-store caching.
+Create a consistent SQLite backup before upgrading production.

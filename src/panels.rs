@@ -346,7 +346,7 @@ fn summary(reminder: &Reminder, user: &User, now: DateTime<Utc>, lang: Lang) -> 
         reminder.description,
         lang.date(local),
         relative_lang(now, reminder.due_at, lang),
-        lang.recurrence(reminder.recurrence, local)
+        lang.recurrence(reminder.recurrence, reminder.anchor_local.unwrap_or(local))
     )
 }
 
@@ -404,7 +404,7 @@ pub fn list_lang(reminders: &[Reminder], user: &User, lang: Lang) -> Panel {
             index + 1,
             reminder.description,
             lang.date(local),
-            lang.recurrence(reminder.recurrence, local)
+            lang.recurrence(reminder.recurrence, reminder.anchor_local.unwrap_or(local))
         ));
         rows.push(vec![button(
             format!("{}. {}", index + 1, truncate(&reminder.description, 40)),

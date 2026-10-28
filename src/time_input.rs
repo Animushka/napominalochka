@@ -22,12 +22,32 @@ pub fn parse(text: &str, tz: UserTz, now: DateTime<Utc>) -> Option<NaiveDateTime
         Regex::new(r"(?i)\d{1,2}[:.]\d{2}|\d\s*(am|pm)\b|\bnoon\b|\bmidnight\b|\btonight\b")
             .expect("valid regex")
     });
+    static BARE_CLOCK: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?i)^(?:(?:[01]?\d|2[0-3])[:.][0-5]\d|(?:0?[1-9]|1[0-2])(?:[:.][0-5]\d)?\s*(?:am|pm))$",
+        )
+        .expect("valid regex")
+    });
 
     let text = text.trim();
     if text.is_empty() || text.chars().count() > MAX_LEN {
         return None;
     }
-    let normalised = normalise(text);
+    let now_local = tz.local(now);
+    let mut normalised = normalise(text);
+    if let Some(suffix) = normalised
+        .strip_prefix("послезавтра")
+        .filter(|suffix| suffix.is_empty() || suffix.starts_with(' '))
+    {
+        let clock = normalise(suffix.trim());
+        if !clock.is_empty() && !BARE_CLOCK.is_match(&clock) {
+            return None;
+        }
+        // This names a local calendar day, not a duration of 48 hours. Give the parser
+        // an explicit date so the usual default time and optional clock both apply.
+        let date = now_local.date().checked_add_signed(Duration::days(2))?;
+        normalised = format!("{} {clock}", date.format("%d/%m/%Y"));
+    }
     // "2 hours" and "30 min" keep the current minute; "tomorrow" is not a duration here.
     let is_duration =
         normalised.chars().any(|c| c.is_ascii_digit()) && parse_duration(&normalised).is_ok();
@@ -40,10 +60,13 @@ pub fn parse(text: &str, tz: UserTz, now: DateTime<Utc>) -> Option<NaiveDateTime
         at = at.date().and_time(DEFAULT_TIME);
     }
 
-    let now_local = tz.local(now);
     if at <= now_local {
         // A bare time that has passed today ("9am" at 10:30) means tomorrow.
-        at += Duration::days(1);
+        // Explicit dates and nonpositive durations must never take this shortcut.
+        if !BARE_CLOCK.is_match(&normalised) {
+            return None;
+        }
+        at = at.checked_add_signed(Duration::days(1))?;
         if at <= now_local {
             return None;
         }
@@ -62,6 +85,7 @@ fn normalise(text: &str) -> String {
     let lower = text.to_lowercase();
     let lower = lower
         .replace("сегодня вечером", "today 20:00")
+        .replace("послезавтра утром", "послезавтра 09:00")
         .replace("завтра утром", "tomorrow 09:00");
     let lower = lower
         .strip_prefix("через ")
@@ -75,7 +99,6 @@ fn normalise(text: &str) -> String {
         .map(|word| match word {
             "сегодня" => "today",
             "завтра" => "tomorrow",
-            "послезавтра" => "in 2 days",
             "пн" | "понедельник" => "monday",
             "вт" | "вторник" => "tuesday",
             "ср" | "среду" | "среда" => "wednesday",
@@ -87,9 +110,9 @@ fn normalise(text: &str) -> String {
             "ч" | "час" | "часа" | "часов" => "hours",
             "день" | "дня" | "дней" => "days",
             "полдень" => "12:00",
-            "полночь" => "23:59",
+            "полночь" => "00:00",
             "noon" | "midday" => "12:00",
-            "midnight" => "23:59",
+            "midnight" => "00:00",
             "tonight" => "today 20:00",
             "tmr" | "tmrw" => "tomorrow",
             other => other,
@@ -154,6 +177,77 @@ mod tests {
     }
 
     #[test]
+    fn only_bare_clocks_roll_forward_to_tomorrow() {
+        for input in ["9am", "9 am", "09:00", "в 09:00", "at 9am"] {
+            assert_eq!(
+                parse(input, SGT, now()),
+                Some(local(2026, 10, 14, 9, 0)),
+                "{input}"
+            );
+        }
+        assert_eq!(
+            parse("10:30", SGT, now()),
+            Some(local(2026, 10, 14, 10, 30))
+        );
+        for input in [
+            "today 09:00",
+            "сегодня 09:00",
+            "13/10/2026 09:00",
+            "12/10/2026 11:00",
+            "yesterday 11:00",
+            "today",
+        ] {
+            assert_eq!(parse(input, SGT, now()), None, "{input}");
+        }
+    }
+
+    #[test]
+    fn rejects_nonpositive_durations() {
+        for input in [
+            "0 minutes",
+            "in 0 hours",
+            "in -1 hours",
+            "-30 minutes",
+            "через 0 минут",
+            "через -1 час",
+        ] {
+            assert_eq!(parse(input, SGT, now()), None, "{input}");
+        }
+    }
+
+    #[test]
+    fn day_after_tomorrow_accepts_an_optional_clock() {
+        for (input, expected) in [
+            ("послезавтра", local(2026, 10, 15, 9, 0)),
+            ("Послезавтра 18:30", local(2026, 10, 15, 18, 30)),
+            ("послезавтра в 18:30", local(2026, 10, 15, 18, 30)),
+            ("послезавтра 7am", local(2026, 10, 15, 7, 0)),
+            ("послезавтра утром", local(2026, 10, 15, 9, 0)),
+        ] {
+            assert_eq!(parse(input, SGT, now()), Some(expected), "{input}");
+        }
+        for input in ["послезавтра купить молоко", "послезавтра 25:00"]
+        {
+            assert_eq!(parse(input, SGT, now()), None, "{input}");
+        }
+    }
+
+    #[test]
+    fn day_after_tomorrow_uses_the_users_local_calendar() {
+        let near_midnight = SGT.utc(local(2026, 10, 14, 0, 30));
+        assert_eq!(
+            parse("послезавтра", SGT, near_midnight),
+            Some(local(2026, 10, 16, 9, 0))
+        );
+        let london = UserTz::Named(Tz::Europe__London);
+        let before_dst = london.utc(local(2026, 3, 28, 10, 30));
+        assert_eq!(
+            parse("послезавтра 10:30", london, before_dst),
+            Some(local(2026, 3, 30, 10, 30))
+        );
+    }
+
+    #[test]
     fn rejects_non_times() {
         for input in [
             "call mum",
@@ -162,6 +256,17 @@ mod tests {
             "1/1/2020 08:00",
         ] {
             assert_eq!(parse(input, SGT, now()), None, "{input}");
+        }
+    }
+
+    #[test]
+    fn midnight_means_zero_hours_on_the_next_day() {
+        for text in ["midnight", "полночь", "в полночь"] {
+            assert_eq!(
+                parse(text, SGT, now()),
+                Some(local(2026, 10, 14, 0, 0)),
+                "{text}"
+            );
         }
     }
 }

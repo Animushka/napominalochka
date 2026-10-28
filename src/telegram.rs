@@ -152,6 +152,34 @@ pub async fn handle_callback(
         .initialize_language(user_id, query.from.language_code.as_deref())
         .await?;
     let lang = conversation::language(&state.service, user_id).await?;
+    if data == "check:ok" {
+        // This acknowledges the check's UI, not the already-recorded completion.
+        if let Some(message) = message {
+            if matches!(message.chat.kind, ChatKind::Private(_))
+                && message.chat.id.0 != query.from.id.0 as i64
+            {
+                bot.answer_callback_query(query.id.clone())
+                    .text(lang.text("button.invalid"))
+                    .await?;
+                return Ok(());
+            }
+            bot.answer_callback_query(query.id.clone())
+                .text(lang.text("check.confirmed"))
+                .await?;
+            if let Err(error) = bot
+                .edit_message_reply_markup(message.chat.id, message.id)
+                .reply_markup(teloxide::types::InlineKeyboardMarkup::default())
+                .await
+            {
+                tracing::debug!(?error, "could not clear completion-check button");
+            }
+        } else {
+            bot.answer_callback_query(query.id.clone())
+                .text(lang.text("button.invalid"))
+                .await?;
+        }
+        return Ok(());
+    }
     if let Some(code) = data
         .strip_prefix("lang:")
         .filter(|code| matches!(*code, "ru" | "en"))
@@ -286,6 +314,9 @@ impl Notifier for TelegramNotifier {
         match self
             .0
             .send_message(ChatId(confirmation.user_id), text)
+            .reply_markup(teloxide::types::InlineKeyboardMarkup::new([[
+                teloxide::types::InlineKeyboardButton::callback(lang.text("check.ack"), "check:ok"),
+            ]]))
             .await
         {
             Ok(_) => Delivery::Sent,

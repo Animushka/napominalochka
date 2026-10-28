@@ -1,7 +1,9 @@
 //! iCalendar (RFC 5545) feed of a user's reminders, for subscribing in a phone's calendar
 //! app. Alarms then fire from the phone itself, even without a connection.
 
-use chrono::{DateTime, Utc};
+use std::collections::BTreeSet;
+
+use chrono::{DateTime, Datelike, Duration, Months, NaiveDateTime, TimeZone, Utc};
 use url::Url;
 
 use crate::i18n::Lang;
@@ -52,24 +54,66 @@ pub fn feed_lang(reminders: &[Reminder], tz: UserTz, now: DateTime<Utc>, lang: L
     }
     ics.line(&format!("REFRESH-INTERVAL;VALUE=DURATION:{REFRESH}"));
     ics.line(&format!("X-PUBLISHED-TTL:{REFRESH}"));
+    // A UTC RRULE would apply BYDAY/BYMONTHDAY to the UTC date, which may differ from
+    // the user's local date. Give fixed-offset recurrences a constant local timezone.
+    let fixed_timezone = match tz {
+        UserTz::Fixed(offset) if reminders.iter().any(|r| r.recurrence != Recurrence::Once) => {
+            let offset = offset.fixed().to_string().replace(':', "");
+            let id = format!("FixedUTC{offset}");
+            ics.line("BEGIN:VTIMEZONE");
+            ics.line(&format!("TZID:{id}"));
+            ics.line("BEGIN:STANDARD");
+            ics.line("DTSTART:19700101T000000");
+            ics.line(&format!("TZOFFSETFROM:{offset}"));
+            ics.line(&format!("TZOFFSETTO:{offset}"));
+            ics.line("END:STANDARD");
+            ics.line("END:VTIMEZONE");
+            Some(id)
+        }
+        _ => None,
+    };
 
     for reminder in reminders {
         let summary = escape(&reminder.description);
         ics.line("BEGIN:VEVENT");
         ics.line(&format!("UID:reminder-{}@extremelynaggybot", reminder.id));
         ics.line(&format!("DTSTAMP:{}", utc(now)));
-        // Recurring events use the user's zone so they keep their local time across
-        // daylight saving changes. Calendar apps resolve IANA names without VTIMEZONE data.
-        match tz.name() {
-            Some(name) => ics.line(&format!(
-                "DTSTART;TZID={name}:{}",
-                tz.local(reminder.due_at).format("%Y%m%dT%H%M%S")
-            )),
-            None => ics.line(&format!("DTSTART:{}", utc(reminder.due_at))),
-        }
+        let local_due = tz.local(reminder.due_at);
+        let anchor = reminder.anchor_local.unwrap_or(local_due);
+        let recurring = reminder.recurrence != Recurrence::Once;
+        let start = if recurring {
+            intended_local(reminder.due_at, tz, anchor)
+        } else {
+            local_due
+        };
+        let timezone = tz.name().or(if recurring {
+            fixed_timezone.as_deref()
+        } else {
+            None
+        });
+        date_property(&mut ics, "DTSTART", start, tz, timezone);
         ics.line("DURATION:PT15M");
-        if let Some(rule) = rrule(reminder.recurrence) {
+        if let Some(rule) = rrule(reminder.recurrence, anchor) {
             ics.line(&format!("RRULE:{rule}"));
+            let mut additional = BTreeSet::new();
+            let mut excluded = BTreeSet::new();
+            // Keep the recurring wall-clock anchor even when the first real occurrence
+            // was shifted by a DST gap or retained across a timezone change.
+            if start != local_due || tz.utc(start) != reminder.due_at {
+                // EXDATE wins over RDATE. A gap-adjusted DTSTART already represents
+                // the real instant, so excluding it would also remove that RDATE.
+                if tz.utc(start) != reminder.due_at {
+                    excluded.insert(start);
+                }
+                additional.insert(reminder.due_at);
+            }
+            add_gap_occurrences(&mut additional, &mut excluded, reminder, tz, anchor, now);
+            for date in excluded {
+                date_property(&mut ics, "EXDATE", date, tz, timezone);
+            }
+            for date in additional {
+                ics.line(&format!("RDATE:{}", utc(date)));
+            }
         }
         ics.line(&format!("SUMMARY:{summary}"));
         ics.line("TRANSP:TRANSPARENT");
@@ -87,14 +131,103 @@ pub fn feed_lang(reminders: &[Reminder], tz: UserTz, now: DateTime<Utc>, lang: L
     ics.0
 }
 
-fn rrule(recurrence: Recurrence) -> Option<&'static str> {
-    match recurrence {
-        Recurrence::Once => None,
-        Recurrence::Daily => Some("FREQ=DAILY"),
-        Recurrence::Weekdays => Some("FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"),
-        Recurrence::Weekly => Some("FREQ=WEEKLY"),
-        Recurrence::Monthly => Some("FREQ=MONTHLY"),
-        Recurrence::Yearly => Some("FREQ=YEARLY"),
+fn rrule(recurrence: Recurrence, anchor: NaiveDateTime) -> Option<String> {
+    Some(match recurrence {
+        Recurrence::Once => return None,
+        Recurrence::Daily => "FREQ=DAILY".into(),
+        Recurrence::Weekdays => "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR".into(),
+        Recurrence::Weekly => format!(
+            "FREQ=WEEKLY;BYDAY={}",
+            ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
+                [anchor.weekday().num_days_from_monday() as usize]
+        ),
+        Recurrence::Monthly if anchor.day() > 28 => format!(
+            "FREQ=MONTHLY;BYMONTHDAY={};BYSETPOS=-1",
+            (28..=anchor.day())
+                .map(|day| day.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Recurrence::Monthly => format!("FREQ=MONTHLY;BYMONTHDAY={}", anchor.day()),
+        Recurrence::Yearly if anchor.month() == 2 && anchor.day() == 29 => {
+            "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=28,29;BYSETPOS=-1".into()
+        }
+        Recurrence::Yearly => format!(
+            "FREQ=YEARLY;BYMONTH={};BYMONTHDAY={}",
+            anchor.month(),
+            anchor.day()
+        ),
+    })
+}
+
+fn date_property(ics: &mut Ics, name: &str, local: NaiveDateTime, tz: UserTz, id: Option<&str>) {
+    match id {
+        Some(id) => ics.line(&format!(
+            "{name};TZID={id}:{}",
+            local.format("%Y%m%dT%H%M%S")
+        )),
+        None => ics.line(&format!("{name}:{}", utc(tz.utc(local)))),
+    }
+}
+
+fn intended_local(due: DateTime<Utc>, tz: UserTz, anchor: NaiveDateTime) -> NaiveDateTime {
+    let local = tz.local(due).date().and_time(anchor.time());
+    if tz.utc(local) != due
+        && let Some(previous) = local.checked_sub_signed(Duration::days(1))
+        && tz.utc(previous) == due
+    {
+        // Some zones jump forward at 23:00, moving an occurrence into the next date.
+        return previous;
+    }
+    local
+}
+
+/// RFC 5545 skips nonexistent times generated by RRULE, while our scheduler shifts them
+/// forward. Supply those exceptional instants for two years; ordinary repeats stay unbounded.
+fn add_gap_occurrences(
+    dates: &mut BTreeSet<DateTime<Utc>>,
+    excluded: &mut BTreeSet<NaiveDateTime>,
+    reminder: &Reminder,
+    tz: UserTz,
+    anchor: NaiveDateTime,
+    now: DateTime<Utc>,
+) {
+    let UserTz::Named(zone) = tz else {
+        return;
+    };
+    let Some(until) = now.checked_add_months(Months::new(24)) else {
+        return;
+    };
+    let mut occurrence = reminder
+        .recurrence
+        .next_after_anchored(reminder.due_at, now, tz, anchor);
+    for _ in 0..750 {
+        let Some(due) = occurrence.filter(|due| *due <= until) else {
+            break;
+        };
+        let intended = intended_local(due, tz, anchor);
+        if zone.from_local_datetime(&intended).earliest().is_none() {
+            dates.insert(due);
+            let uses_setpos = (reminder.recurrence == Recurrence::Monthly && anchor.day() > 28)
+                || (reminder.recurrence == Recurrence::Yearly
+                    && anchor.month() == 2
+                    && anchor.day() == 29);
+            if uses_setpos {
+                // After a nonexistent final candidate is removed, BYSETPOS=-1 may
+                // select the previous candidate day. It is not a real occurrence.
+                if let Some(previous) = (28..intended.day()).rev().find_map(|day| {
+                    let candidate = intended.with_day(day)?;
+                    zone.from_local_datetime(&candidate)
+                        .earliest()
+                        .map(|_| candidate)
+                }) {
+                    excluded.insert(previous);
+                }
+            }
+        }
+        occurrence = reminder
+            .recurrence
+            .next_after_anchored(due, due, tz, anchor);
     }
 }
 
@@ -160,6 +293,7 @@ mod tests {
             description: description.into(),
             due_at,
             recurrence,
+            anchor_local: None,
         }
     }
 
@@ -222,12 +356,127 @@ mod tests {
     }
 
     #[test]
-    fn fixed_offset_users_get_utc_times() {
+    fn fixed_offset_one_off_reminders_get_utc_times() {
         let tz = UserTz::Fixed(UtcOffset::from_minutes(480).unwrap());
         let due = Utc.with_ymd_and_hms(2026, 10, 14, 1, 0, 0).unwrap();
-        let ics = feed(&[reminder(1, "x", due, Recurrence::Daily)], tz, due);
+        let ics = feed(&[reminder(1, "x", due, Recurrence::Once)], tz, due);
         assert!(ics.contains("DTSTART:20261014T010000Z\r\n"));
         assert!(!ics.contains("X-WR-TIMEZONE"));
+        assert!(!ics.contains("VTIMEZONE"));
+    }
+
+    fn local(y: i32, m: u32, d: u32, h: u32, min: u32) -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(h, min, 0)
+            .unwrap()
+    }
+
+    #[test]
+    fn monthly_rules_recover_the_original_day_after_a_short_month() {
+        let tz = UserTz::Named(Tz::Europe__London);
+        for (day, days) in [(29, "28,29"), (30, "28,29,30"), (31, "28,29,30,31")] {
+            let due = tz.utc(local(2027, 2, 28, 9, 0));
+            let mut r = reminder(1, "monthly", due, Recurrence::Monthly);
+            r.anchor_local = Some(local(2027, 1, day, 9, 0));
+            let ics = unfold(&feed(&[r], tz, due));
+            assert!(ics.contains("DTSTART;TZID=Europe/London:20270228T090000\r\n"));
+            assert!(ics.contains(&format!(
+                "RRULE:FREQ=MONTHLY;BYMONTHDAY={days};BYSETPOS=-1\r\n"
+            )));
+            assert!(!ics.contains("UNTIL="));
+            assert!(!ics.contains("COUNT="));
+        }
+        let due = tz.utc(local(2027, 2, 15, 9, 0));
+        let ics = feed(&[reminder(1, "monthly", due, Recurrence::Monthly)], tz, due);
+        assert!(ics.contains("RRULE:FREQ=MONTHLY;BYMONTHDAY=15\r\n"));
+    }
+
+    #[test]
+    fn leap_day_rule_clamps_only_nonleap_years() {
+        let tz = UserTz::Named(Tz::Europe__London);
+        let due = tz.utc(local(2029, 2, 28, 9, 0));
+        let mut r = reminder(1, "birthday", due, Recurrence::Yearly);
+        r.anchor_local = Some(local(2028, 2, 29, 9, 0));
+        let ics = feed(&[r], tz, due);
+        assert!(ics.contains("DTSTART;TZID=Europe/London:20290228T090000\r\n"));
+        assert!(ics.contains("RRULE:FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=28,29;BYSETPOS=-1\r\n"));
+    }
+
+    #[test]
+    fn shifted_first_occurrence_does_not_change_the_recurring_clock() {
+        let tz = UserTz::Named(Tz::Europe__London);
+        let due = tz.utc(local(2026, 3, 29, 1, 30));
+        assert_eq!(tz.local(due), local(2026, 3, 29, 2, 30));
+        let mut r = reminder(1, "daily", due, Recurrence::Daily);
+        r.anchor_local = Some(local(2026, 3, 28, 1, 30));
+        let ics = feed(&[r], tz, due);
+        assert!(ics.contains("DTSTART;TZID=Europe/London:20260329T013000\r\n"));
+        assert!(!ics.contains("EXDATE;TZID=Europe/London:20260329T013000\r\n"));
+        assert_eq!(ics.matches("RDATE:20260329T013000Z\r\n").count(), 1);
+        assert!(ics.contains("RRULE:FREQ=DAILY\r\n"));
+    }
+
+    #[test]
+    fn future_dst_gaps_are_added_without_bounding_normal_recurrence() {
+        let tz = UserTz::Named(Tz::Europe__London);
+        let due = tz.utc(local(2026, 10, 28, 1, 30));
+        let mut r = reminder(1, "daily", due, Recurrence::Daily);
+        r.anchor_local = Some(local(2026, 10, 28, 1, 30));
+        let ics = feed(&[r], tz, due);
+        assert!(ics.contains("DTSTART;TZID=Europe/London:20261028T013000\r\n"));
+        assert!(ics.contains("RDATE:20270328T013000Z\r\n"));
+        assert!(ics.contains("RDATE:20280326T013000Z\r\n"));
+        assert_eq!(ics.matches("RDATE:").count(), 2);
+        assert!(!ics.contains("EXDATE"));
+        assert!(!ics.contains("UNTIL="));
+        assert!(!ics.contains("COUNT="));
+
+        // London's gaps are Sundays, so a weekday schedule must not gain Sunday alarms.
+        let weekdays = feed(&[reminder(2, "work", due, Recurrence::Weekdays)], tz, due);
+        assert!(!weekdays.contains("RDATE:"));
+    }
+
+    #[test]
+    fn fixed_offset_recurrences_keep_local_calendar_dates() {
+        let tz = UserTz::Fixed(UtcOffset::from_minutes(480).unwrap());
+        // Monday locally, but still Sunday in UTC: BYDAY must use the local date.
+        let due = tz.utc(local(2026, 1, 5, 2, 30));
+        let ics = feed(&[reminder(1, "work", due, Recurrence::Weekdays)], tz, due);
+        assert!(ics.contains("TZID:FixedUTC+0800\r\n"));
+        assert!(ics.contains("TZOFFSETFROM:+0800\r\n"));
+        assert!(ics.contains("TZOFFSETTO:+0800\r\n"));
+        assert!(ics.contains("DTSTART;TZID=FixedUTC+0800:20260105T023000\r\n"));
+        assert!(ics.contains("RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR\r\n"));
+        assert!(!ics.contains("RDATE:"));
+    }
+
+    #[test]
+    fn a_month_end_dst_gap_does_not_create_an_alarm_on_the_previous_day() {
+        let tz = UserTz::Named(Tz::Europe__London);
+        let due = tz.utc(local(2024, 2, 29, 1, 30));
+        let mut r = reminder(1, "monthly", due, Recurrence::Monthly);
+        r.anchor_local = Some(local(2024, 1, 31, 1, 30));
+        let ics = feed(&[r], tz, due);
+        assert!(ics.contains("RRULE:FREQ=MONTHLY;BYMONTHDAY=28,29,30,31;BYSETPOS=-1\r\n"));
+        assert!(ics.contains("RDATE:20240331T013000Z\r\n"));
+        assert!(ics.contains("EXDATE;TZID=Europe/London:20240330T013000\r\n"));
+        assert!(!ics.contains("RDATE:20240330"));
+    }
+
+    #[test]
+    fn a_gap_crossing_midnight_keeps_the_original_local_date_and_clock() {
+        let tz = UserTz::Named(Tz::America__Nuuk);
+        let anchor = local(2026, 3, 28, 23, 30);
+        let due = tz.utc(anchor);
+        assert_eq!(tz.local(due), local(2026, 3, 29, 0, 30));
+        let mut r = reminder(1, "daily", due, Recurrence::Daily);
+        r.anchor_local = Some(anchor);
+        let ics = feed(&[r], tz, due);
+        assert!(ics.contains("DTSTART;TZID=America/Nuuk:20260328T233000\r\n"));
+        assert!(!ics.contains("EXDATE;TZID=America/Nuuk:20260328T233000\r\n"));
+        assert!(ics.contains(&format!("RDATE:{}\r\n", utc(due))));
+        assert!(ics.contains("RDATE:20270328T013000Z\r\n"));
     }
 
     #[test]
@@ -243,5 +492,18 @@ mod tests {
             );
         }
         assert_eq!(unfold(&ics.0), format!("SUMMARY:{long}\r\n"));
+    }
+
+    #[test]
+    fn a_changed_timezone_preserves_the_real_first_instant_without_excluding_it() {
+        let tz = UserTz::Fixed(UtcOffset::from_minutes(180).unwrap());
+        let due = tz.utc(local(2026, 10, 28, 12, 0));
+        let mut r = reminder(1, "daily", due, Recurrence::Daily);
+        r.anchor_local = Some(local(2026, 10, 27, 9, 0));
+        let ics = feed(&[r], tz, due);
+        assert!(ics.contains("DTSTART;TZID=FixedUTC+0300:20261028T090000\r\n"));
+        assert!(ics.contains("EXDATE;TZID=FixedUTC+0300:20261028T090000\r\n"));
+        assert!(ics.contains("RDATE:20261028T090000Z\r\n"));
+        assert_ne!(tz.utc(local(2026, 10, 28, 9, 0)), due);
     }
 }

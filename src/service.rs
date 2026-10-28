@@ -5,7 +5,9 @@ use chrono::{DateTime, Duration, NaiveDateTime, NaiveTime, Utc};
 use thiserror::Error;
 
 use crate::db::{Db, Registration};
-use crate::model::{Draft, InputError, Preferences, Recurrence, Reminder, Snooze, User, UserTz};
+use crate::model::{
+    Draft, InputError, Nagging, Preferences, Recurrence, Reminder, Snooze, User, UserTz,
+};
 
 pub const MAX_DESCRIPTION_CHARS: usize = 1000;
 /// "Snooze until tomorrow" means this local time.
@@ -152,7 +154,13 @@ impl Service {
         let due_at = first_due(input.at, input.recurrence, user.tz, now)?;
         Ok(self
             .db
-            .add_reminder(user.id, description, due_at, input.recurrence)
+            .add_reminder_with_anchor(
+                user.id,
+                description,
+                due_at,
+                input.recurrence,
+                Some(input.at),
+            )
             .await?)
     }
 
@@ -168,9 +176,33 @@ impl Service {
         now: DateTime<Utc>,
     ) -> Result<Reminder> {
         let description = description.map(self::description).transpose()?;
+        let current = self.reminder(user.id, reminder_id).await?;
+        if at == user.tz.local(current.due_at) && recurrence == current.recurrence {
+            return self
+                .db
+                .update_reminder_description(user.id, reminder_id, description)
+                .await?
+                .ok_or(Error::NotFound);
+        }
         let due_at = first_due(at, recurrence, user.tz, now)?;
         self.db
-            .update_reminder(user.id, reminder_id, description, due_at, recurrence)
+            .update_reminder_with_anchor(
+                user.id,
+                reminder_id,
+                description,
+                due_at,
+                recurrence,
+                Some(at),
+            )
+            .await?
+            .ok_or(Error::NotFound)
+    }
+
+    /// Explicit text-only edits preserve the schedule even if a reminder fired while its
+    /// edit form was open. The presentation layer knows whether schedule fields changed.
+    pub async fn rename(&self, user_id: i64, reminder_id: i64, text: &str) -> Result<Reminder> {
+        self.db
+            .update_reminder_description(user_id, reminder_id, Some(description(text)?))
             .await?
             .ok_or(Error::NotFound)
     }
@@ -228,12 +260,17 @@ impl Service {
     ) -> Result<Reminder> {
         let due_at = first_due(at, recurrence, user.tz, now)?;
         self.db
-            .save_draft(user.id, draft_id, due_at, recurrence)
+            .save_draft_with_anchor(user.id, draft_id, due_at, recurrence, Some(at))
             .await?
             .ok_or(Error::NotFound)
     }
 
     // ---- naggings ------------------------------------------------------------------------
+
+    /// All unfinished occurrences, including those explicitly snoozed into the future.
+    pub async fn pending(&self, user_id: i64) -> Result<Vec<Nagging>> {
+        Ok(self.db.naggings_for_user(user_id).await?)
+    }
 
     /// Records completion and optionally schedules one check. Returns `false` if already done.
     #[cfg(test)]
@@ -295,7 +332,10 @@ fn description(text: &str) -> Result<String> {
     if text.is_empty() {
         return Err(InputError::EmptyDescription.into());
     }
-    Ok(text.chars().take(MAX_DESCRIPTION_CHARS).collect())
+    if text.chars().count() > MAX_DESCRIPTION_CHARS {
+        return Err(InputError::DescriptionTooLong.into());
+    }
+    Ok(text.to_owned())
 }
 
 /// A time that has passed moves to the next occurrence; for one-off reminders it is an error.
@@ -379,11 +419,141 @@ mod tests {
         );
 
         let long = "a".repeat(MAX_DESCRIPTION_CHARS + 50);
-        let clamped = service
-            .create(&user, input(&long, tomorrow, Recurrence::Once), now())
+        assert!(matches!(
+            service
+                .create(&user, input(&long, tomorrow, Recurrence::Once), now())
+                .await,
+            Err(Error::Input(InputError::DescriptionTooLong))
+        ));
+        assert_eq!(service.list(user.id).await.unwrap(), vec![daily]);
+    }
+
+    #[tokio::test]
+    async fn unicode_description_limit_preserves_valid_text_and_rejects_edits_atomically() {
+        let (service, user) = setup().await;
+        let at = local(2026, 10, 14, 9, 0);
+        let boundary = "💛".repeat(MAX_DESCRIPTION_CHARS);
+        let reminder = service
+            .create(
+                &user,
+                input(&format!("  {boundary}  "), at, Recurrence::Once),
+                now(),
+            )
             .await
             .unwrap();
-        assert_eq!(clamped.description.chars().count(), MAX_DESCRIPTION_CHARS);
+        assert_eq!(reminder.description, boundary);
+        let draft = service
+            .start_draft(user.id, &boundary, now())
+            .await
+            .unwrap();
+        assert_eq!(draft.text, boundary);
+
+        let too_long = format!("{boundary}я");
+        assert!(matches!(
+            service
+                .update(
+                    &user,
+                    reminder.id,
+                    Some(&too_long),
+                    at,
+                    Recurrence::Daily,
+                    now()
+                )
+                .await,
+            Err(Error::Input(InputError::DescriptionTooLong))
+        ));
+        assert!(matches!(
+            service.start_draft(user.id, &too_long, now()).await,
+            Err(Error::Input(InputError::DescriptionTooLong))
+        ));
+        assert_eq!(
+            service.reminder(user.id, reminder.id).await.unwrap(),
+            reminder
+        );
+        assert_eq!(service.draft(user.id, draft.id).await.unwrap(), draft);
+    }
+
+    #[tokio::test]
+    async fn pending_actions_are_private_and_done_creates_exactly_one_followup() {
+        let (service, user) = setup().await;
+        let (other, _) = service
+            .set_timezone(
+                Profile {
+                    id: 2,
+                    first_name: "Eve".into(),
+                    last_name: String::new(),
+                },
+                SGT,
+            )
+            .await
+            .unwrap();
+        service
+            .set_preferences(user.id, None, None, Some(20))
+            .await
+            .unwrap();
+        let reminder = service
+            .create(
+                &user,
+                input("unfinished", local(2026, 10, 13, 11, 0), Recurrence::Once),
+                now(),
+            )
+            .await
+            .unwrap();
+        let due = reminder.due_at;
+        let nagging = service
+            .db
+            .fire_reminder(reminder.id, due, due)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(service.list(user.id).await.unwrap().is_empty());
+        assert!(service.pending(other.id).await.unwrap().is_empty());
+        assert!(!service.done_at(other.id, nagging.id, due).await.unwrap());
+        assert_eq!(
+            service
+                .snooze(&other, nagging.id, Snooze::OneHour, due)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(service.pending(user.id).await.unwrap()[0].next_at, due);
+
+        for (snooze, until) in [
+            (Snooze::TenMinutes, due + Duration::minutes(10)),
+            (Snooze::OneHour, due + Duration::hours(1)),
+        ] {
+            assert_eq!(
+                service
+                    .snooze(&user, nagging.id, snooze, due)
+                    .await
+                    .unwrap(),
+                Some(until)
+            );
+            let pending = service.pending(user.id).await.unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].id, nagging.id);
+            assert_eq!(pending[0].reminder_id, None);
+            assert_eq!(pending[0].description, "unfinished");
+            assert_eq!(pending[0].next_at, until);
+        }
+
+        assert!(service.done_at(user.id, nagging.id, due).await.unwrap());
+        assert!(!service.done_at(user.id, nagging.id, due).await.unwrap());
+        assert!(service.pending(user.id).await.unwrap().is_empty());
+        assert_eq!(
+            service
+                .snooze(&user, nagging.id, Snooze::OneHour, due)
+                .await
+                .unwrap(),
+            None
+        );
+        let checks = service
+            .db
+            .due_confirmations(due + Duration::minutes(20))
+            .await
+            .unwrap();
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].user_id, user.id);
     }
 
     #[tokio::test]
@@ -448,6 +618,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schedule_anchor_survives_text_edits_and_resets_for_schedule_changes() {
+        let (service, user) = setup().await;
+        let anchor = local(2027, 1, 31, 9, 0);
+        let reminder = service
+            .create(
+                &user,
+                input("month end", anchor, Recurrence::Monthly),
+                now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reminder.anchor_local, Some(anchor));
+        service
+            .db
+            .fire_reminder(reminder.id, reminder.due_at, reminder.due_at)
+            .await
+            .unwrap();
+        let february = local(2027, 2, 28, 9, 0);
+        let renamed = service
+            .update(
+                &user,
+                reminder.id,
+                Some("renamed"),
+                february,
+                Recurrence::Monthly,
+                reminder.due_at,
+            )
+            .await
+            .unwrap();
+        assert_eq!(renamed.anchor_local, Some(anchor));
+        assert_eq!(user.tz.local(renamed.due_at), february);
+        service
+            .db
+            .fire_reminder(reminder.id, renamed.due_at, renamed.due_at)
+            .await
+            .unwrap();
+        let march = service.reminder(user.id, reminder.id).await.unwrap();
+        assert_eq!(user.tz.local(march.due_at), local(2027, 3, 31, 9, 0));
+        // The edit form may still display February, but explicit rename cannot reset it.
+        let stale_form_save = service
+            .rename(user.id, reminder.id, "edited after firing")
+            .await
+            .unwrap();
+        assert_eq!(stale_form_save.due_at, march.due_at);
+        assert_eq!(stale_form_save.anchor_local, Some(anchor));
+        assert!(matches!(
+            service.rename(2, reminder.id, "other user").await,
+            Err(Error::NotFound)
+        ));
+
+        let chosen = local(2027, 4, 30, 10, 0);
+        let moved = service
+            .update(
+                &user,
+                reminder.id,
+                None,
+                chosen,
+                Recurrence::Monthly,
+                renamed.due_at,
+            )
+            .await
+            .unwrap();
+        assert_eq!(moved.anchor_local, Some(chosen));
+        let repeated = service
+            .update(
+                &user,
+                reminder.id,
+                None,
+                chosen,
+                Recurrence::Weekly,
+                renamed.due_at,
+            )
+            .await
+            .unwrap();
+        assert_eq!(repeated.anchor_local, Some(chosen));
+        assert_eq!(repeated.recurrence, Recurrence::Weekly);
+    }
+
+    #[tokio::test]
+    async fn creating_inside_a_dst_gap_preserves_the_requested_clock() {
+        let (service, _) = setup().await;
+        let (user, _) = service
+            .set_timezone(
+                Profile {
+                    id: 1,
+                    first_name: "Ada".into(),
+                    last_name: String::new(),
+                },
+                UserTz::Named(Tz::Europe__London),
+            )
+            .await
+            .unwrap();
+        let anchor = local(2026, 3, 29, 1, 30);
+        let before = user.tz.utc(local(2026, 3, 28, 12, 0));
+        let reminder = service
+            .create(&user, input("early", anchor, Recurrence::Daily), before)
+            .await
+            .unwrap();
+        assert_eq!(reminder.anchor_local, Some(anchor));
+        assert_eq!(user.tz.local(reminder.due_at), local(2026, 3, 29, 2, 30));
+        service
+            .db
+            .fire_reminder(reminder.id, reminder.due_at, reminder.due_at)
+            .await
+            .unwrap();
+        let next = service.reminder(user.id, reminder.id).await.unwrap();
+        assert_eq!(user.tz.local(next.due_at), local(2026, 3, 30, 1, 30));
+    }
+
+    #[tokio::test]
     async fn drafts_are_saved_once() {
         let (service, user) = setup().await;
         let draft = service
@@ -463,6 +743,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(saved.description, "call mum");
+        assert_eq!(saved.anchor_local, Some(at));
         assert!(matches!(
             service
                 .save_draft(&user, draft.id, at, Recurrence::Daily, now())

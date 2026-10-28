@@ -1422,9 +1422,16 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        f.db.reschedule_nagging(nag.id, now).await.unwrap();
-        f.db.snooze_nagging(1, nag.id, now).await.unwrap();
+        assert!(
+            f.db.claim_nagging(&nag, now, now + chrono::Duration::minutes(1))
+                .await
+                .unwrap()
+        );
         assert_eq!(f.count("yandex_jobs").await, 1);
+        f.db.snooze_nagging(1, nag.id, now).await.unwrap();
+        assert_eq!(f.count("yandex_jobs").await, 0);
+        f.yandex.worker_tick().await.unwrap();
+        assert_eq!(f.mock.actions.load(Ordering::SeqCst), 0);
         f.db.set_preferences(1, None, None, Some(20)).await.unwrap();
         f.db.complete_nagging(1, nag.id, now).await.unwrap();
         assert_eq!(f.count("yandex_jobs").await, 0);
@@ -1539,6 +1546,28 @@ mod tests {
             .unwrap();
         f.fire(1).await;
         assert_eq!(f.count("yandex_jobs").await, 0);
+    }
+
+    #[tokio::test]
+    async fn snoozing_a_claimed_job_cancels_its_action_before_dispatch() {
+        let f = Fixture::new().await;
+        f.ready(1, "alice").await;
+        let nagging = f.fire(1).await;
+        let job = f.yandex.next_job().await.unwrap().unwrap();
+        assert!(f.yandex.claim_job(job.clone()).await.unwrap());
+        let connection = f.yandex.require_connection(1).await.unwrap();
+        assert!(
+            f.db.snooze_nagging(1, nagging.id, Utc::now() + chrono::Duration::hours(1))
+                .await
+                .unwrap()
+        );
+        f.yandex
+            .execute(1, &connection, &job.scenario_id, Some(&job))
+            .await
+            .unwrap();
+        assert_eq!(f.mock.actions.load(Ordering::SeqCst), 0);
+        assert_eq!(f.count("yandex_jobs").await, 0);
+        assert!(f.yandex.status(1).await.unwrap().enabled);
     }
 
     #[tokio::test]

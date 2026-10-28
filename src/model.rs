@@ -60,39 +60,71 @@ impl Recurrence {
         Recurrence::Yearly,
     ];
 
-    /// The occurrence following `at` in local time, or `None` for one-off reminders.
-    pub fn step(self, at: NaiveDateTime) -> Option<NaiveDateTime> {
-        match self {
-            Recurrence::Once => None,
-            Recurrence::Daily => Some(at + Duration::days(1)),
-            Recurrence::Weekdays => {
-                let mut next = at + Duration::days(1);
-                while matches!(next.weekday(), Weekday::Sat | Weekday::Sun) {
-                    next += Duration::days(1);
-                }
-                Some(next)
-            }
-            Recurrence::Weekly => Some(at + Duration::weeks(1)),
-            Recurrence::Monthly => at.checked_add_months(Months::new(1)),
-            Recurrence::Yearly => at.checked_add_months(Months::new(12)),
-        }
-    }
-
-    /// The first occurrence strictly after `now`. Steps are taken in the user's local time,
-    /// so a daily 08:00 reminder stays at 08:00 across daylight saving changes.
+    /// Legacy schedules use their current local due date as the best available anchor.
     pub fn next_after(
         self,
         due_at: DateTime<Utc>,
         now: DateTime<Utc>,
         tz: UserTz,
     ) -> Option<DateTime<Utc>> {
-        let mut local = tz.local(due_at);
-        let mut next = due_at;
-        while next <= now {
-            local = self.step(local)?;
-            next = tz.utc(local);
+        self.next_after_anchored(due_at, now, tz, tz.local(due_at))
+    }
+
+    /// The first occurrence strictly after `now`, calculated from the original local
+    /// calendar date/time. A short month or DST gap changes only that occurrence.
+    pub fn next_after_anchored(
+        self,
+        due_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+        tz: UserTz,
+        anchor_local: NaiveDateTime,
+    ) -> Option<DateTime<Utc>> {
+        if due_at > now {
+            return Some(due_at);
         }
-        Some(next)
+        if self == Recurrence::Once {
+            return None;
+        }
+        let local_now = tz.local(now);
+        let days = (local_now.date() - anchor_local.date()).num_days();
+        // Jump directly to the current calendar period instead of replaying every missed
+        // occurrence. Always calculate from the anchor, never from a previously clamped date.
+        let index = match self {
+            Recurrence::Once => unreachable!(),
+            Recurrence::Daily | Recurrence::Weekdays => days,
+            Recurrence::Weekly => days.div_euclid(7),
+            Recurrence::Monthly => {
+                i64::from(local_now.year() - anchor_local.year()) * 12
+                    + i64::from(local_now.month())
+                    - i64::from(anchor_local.month())
+            }
+            Recurrence::Yearly => i64::from(local_now.year() - anchor_local.year()),
+        };
+        let mut index = u32::try_from(index.max(0)).ok()?;
+        loop {
+            let local = match self {
+                Recurrence::Once => unreachable!(),
+                Recurrence::Daily | Recurrence::Weekdays => {
+                    anchor_local.checked_add_signed(Duration::days(i64::from(index)))?
+                }
+                Recurrence::Weekly => {
+                    anchor_local.checked_add_signed(Duration::weeks(i64::from(index)))?
+                }
+                Recurrence::Monthly => anchor_local.checked_add_months(Months::new(index))?,
+                Recurrence::Yearly => {
+                    anchor_local.checked_add_months(Months::new(index.checked_mul(12)?))?
+                }
+            };
+            if !(self == Recurrence::Weekdays
+                && matches!(local.weekday(), Weekday::Sat | Weekday::Sun))
+            {
+                let next = tz.utc(local);
+                if next > now {
+                    return Some(next);
+                }
+            }
+            index = index.checked_add(1)?;
+        }
     }
 
     /// When a reminder set for local time `at` first fires: `at` itself, or the next
@@ -103,11 +135,17 @@ impl Recurrence {
         tz: UserTz,
         now: DateTime<Utc>,
     ) -> Option<DateTime<Utc>> {
-        let due = tz.utc(at);
+        let mut first = at;
+        if self == Recurrence::Weekdays {
+            while matches!(first.weekday(), Weekday::Sat | Weekday::Sun) {
+                first = first.checked_add_signed(Duration::days(1))?;
+            }
+        }
+        let due = tz.utc(first);
         if due > now {
             Some(due)
         } else {
-            self.next_after(due, now, tz)
+            self.next_after_anchored(due, now, tz, at)
         }
     }
 
@@ -361,6 +399,8 @@ pub struct Reminder {
     pub description: String,
     pub due_at: DateTime<Utc>,
     pub recurrence: Recurrence,
+    /// Original local schedule; NULL in migrated rows until their next firing.
+    pub anchor_local: Option<NaiveDateTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -400,6 +440,8 @@ pub enum InputError {
     InvalidRecurrence,
     #[error("Please enter what to remind you about.")]
     EmptyDescription,
+    #[error("Reminder text must be 1000 characters or fewer.")]
+    DescriptionTooLong,
     #[error("That time has already passed.")]
     InPast,
 }
@@ -533,6 +575,66 @@ mod tests {
             london.utc(local(2026, 3, 29, 1, 30)),
             utc(2026, 3, 29, 1, 30)
         );
+    }
+
+    #[test]
+    fn monthly_and_yearly_recurrences_restore_the_original_calendar_day() {
+        let month_anchor = local(2027, 1, 31, 9, 0);
+        let january = UTC.utc(month_anchor);
+        let february = Recurrence::Monthly
+            .next_after_anchored(january, january, UTC, month_anchor)
+            .unwrap();
+        assert_eq!(february, utc(2027, 2, 28, 9, 0));
+        assert_eq!(
+            Recurrence::Monthly.next_after_anchored(february, february, UTC, month_anchor),
+            Some(utc(2027, 3, 31, 9, 0))
+        );
+
+        let leap_anchor = local(2028, 2, 29, 9, 0);
+        let mut due = UTC.utc(leap_anchor);
+        for year in 2029..=2032 {
+            due = Recurrence::Yearly
+                .next_after_anchored(due, due, UTC, leap_anchor)
+                .unwrap();
+            assert_eq!(due, utc(year, 2, if year == 2032 { 29 } else { 28 }, 9, 0));
+        }
+    }
+
+    #[test]
+    fn weekday_first_occurrences_skip_future_weekends() {
+        let now = utc(2026, 10, 16, 12, 0); // Friday
+        for day in [17, 18] {
+            assert_eq!(
+                Recurrence::Weekdays.first_due(local(2026, 10, day, 9, 0), UTC, now),
+                Some(utc(2026, 10, 19, 9, 0))
+            );
+        }
+    }
+
+    #[test]
+    fn dst_gap_shifts_only_that_occurrence_and_keeps_the_next_original_clock() {
+        let london = UserTz::Named(Tz::Europe__London);
+        let anchor = local(2026, 3, 28, 1, 30);
+        let before = london.utc(anchor);
+        let gap = Recurrence::Daily
+            .next_after_anchored(before, before, london, anchor)
+            .unwrap();
+        assert_eq!(london.local(gap), local(2026, 3, 29, 2, 30));
+        let after = Recurrence::Daily
+            .next_after_anchored(gap, gap, london, anchor)
+            .unwrap();
+        assert_eq!(london.local(after), local(2026, 3, 30, 1, 30));
+
+        let weekly_anchor = local(2026, 3, 22, 1, 30);
+        let before = london.utc(weekly_anchor);
+        let gap = Recurrence::Weekly
+            .next_after_anchored(before, before, london, weekly_anchor)
+            .unwrap();
+        assert_eq!(london.local(gap), local(2026, 3, 29, 2, 30));
+        let after = Recurrence::Weekly
+            .next_after_anchored(gap, gap, london, weekly_anchor)
+            .unwrap();
+        assert_eq!(london.local(after), local(2026, 4, 5, 1, 30));
     }
 
     #[test]

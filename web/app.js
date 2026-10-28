@@ -1,4 +1,5 @@
 import { detectLanguage, getLanguage, getLocale, loadDictionaries, setLanguage, supportedLanguage, t } from "/assets/i18n.js";
+import { createYandexController } from "/assets/yandex.js";
 
 const tg = window.Telegram?.WebApp;
 const $ = (id) => document.getElementById(id);
@@ -6,6 +7,7 @@ const REPEATS = ["once", "daily", "weekdays", "weekly", "monthly", "yearly"];
 const INTERVALS = [1, 5, 10, 20, 30, 60];
 let state = null;
 let editing = null;
+let loadedSchedule = null;
 let repeat = "once";
 let view = "loading";
 let saving = false;
@@ -13,8 +15,11 @@ let preferencesSaving = false;
 let fatalKey = "errors.generic";
 let formErrorKey = null;
 let toastTimer;
-const yandex = { status: null, scenarios: null, loading: false, busy: null, draftId: "", draftEnabled: false, dirty: false, feedback: null, feedbackError: false, oauthUrl: null, refreshedAt: 0, cooldownUntil: 0 };
-let yandexCooldownTimer;
+let refreshing = false;
+let refreshedAt = 0;
+let stateGeneration = 0;
+let pendingBusy = null;
+let snoozeId = null;
 const nativeSave = Boolean(tg?.MainButton?.setParams);
 
 const pad = (value) => String(value).padStart(2, "0");
@@ -88,6 +93,7 @@ async function api(method, path, body) {
   } finally { window.clearTimeout(timeout); }
 }
 const errorKey = (error) => error instanceof ApiError ? error.key : "errors.generic";
+const yandex = createYandexController({ api, t, tg, errorKey, errorKeys: ERROR_KEYS, confirmAction, haptic });
 
 function syncNativeButtons() {
   telegramCall(() => {
@@ -140,7 +146,7 @@ function applyLanguage(language) {
     if (view === "form-view") renderFormControls();
     renderPreferences();
   }
-  renderYandex();
+  yandex.render();
   if (view === "fatal") $("fatal-message").textContent = t(fatalKey);
   if (formErrorKey) $("form-error").textContent = t(formErrorKey);
   $("toast").hidden = true;
@@ -167,8 +173,14 @@ function formatRelative(value) {
   return new Intl.RelativeTimeFormat(getLocale(), { numeric: "always" }).format(amount, unit);
 }
 function renderList() {
+  const focusedReminder = document.activeElement?.dataset.reminderId;
   $("tz-name").textContent = state.timezone || "";
   $("form-tz-name").textContent = state.timezone || "";
+  const compact = Boolean(state.reminders.length || state.pending?.length);
+  $("home-hero").classList.toggle("hero-compact", compact);
+  $("home-title").dataset.i18n = compact ? "home.compactTitle" : "home.title";
+  $("home-title").textContent = t($("home-title").dataset.i18n);
+  renderPending();
   $("reminder-count").textContent = new Intl.NumberFormat(getLocale()).format(state.reminders.length);
   const list = $("list");
   list.replaceChildren();
@@ -176,12 +188,13 @@ function renderList() {
     const empty = node("div", "empty-state");
     const illustration = node("span", "empty-illustration", "✧");
     illustration.setAttribute("aria-hidden", "true");
-    empty.append(illustration, node("p", "empty-title", t("empty.title")), node("p", "empty-description", t("empty.description")));
+    empty.append(illustration, node("p", "empty-title", t(state.pending?.length ? "empty.scheduledTitle" : "empty.title")), node("p", "empty-description", t(state.pending?.length ? "empty.scheduledDescription" : "empty.description")));
     list.append(empty);
   }
   for (const reminder of state.reminders) {
     const item = node("button", "reminder-item");
     item.type = "button";
+    item.dataset.reminderId = String(reminder.id);
     item.dataset.overdue = String(reminder.at < state.now);
     item.setAttribute("aria-label", t("reminder.edit", { description: reminder.description }));
     const marker = node("span", "reminder-marker", reminder.recurrence === "once" ? "◷" : "↻");
@@ -193,7 +206,7 @@ function renderList() {
     when.dateTime = reminder.at;
     meta.append(when, document.createTextNode(` · ${formatRelative(reminder.at)}`));
     const recurrence = REPEATS.includes(reminder.recurrence) ? reminder.recurrence : "once";
-    if (recurrence !== "once") meta.append(node("div", "reminder-recurrence", `↻ ${t(`repeat.${recurrence}`)}`));
+    if (recurrence !== "once") meta.append(node("div", "reminder-recurrence", `↻ ${reminder.repeat || t(`repeat.${recurrence}`)}`));
     content.append(title, meta);
     const arrow = node("span", "reminder-arrow", "›");
     arrow.setAttribute("aria-hidden", "true");
@@ -202,6 +215,89 @@ function renderList() {
     list.append(item);
   }
   renderTimezoneBanner();
+  if (focusedReminder) Array.from(list.children).find((item) => item.dataset.reminderId === focusedReminder)?.focus({ preventScroll: true });
+}
+function renderPending() {
+  const pending = Array.isArray(state.pending) ? state.pending : [];
+  const focusKey = document.activeElement?.dataset.pendingFocus;
+  $("pending-section").hidden = !pending.length;
+  $("pending-count").textContent = new Intl.NumberFormat(getLocale()).format(pending.length);
+  const list = $("pending-list");
+  list.replaceChildren();
+  if (!pending.some((item) => item.id === snoozeId)) snoozeId = null;
+  for (const pendingItem of pending) {
+    const item = node("article", "pending-item");
+    item.dataset.pendingId = String(pendingItem.id);
+    const title = node("h3", "reminder-title", pendingItem.description);
+    const meta = node("p", "reminder-meta");
+    meta.append(document.createTextNode(t("pending.nextMessage") + " "));
+    const next = node("time", "", pendingItem.next_at ? formatWhen(pendingItem.next_at) : pendingItem.next_when || t("date.now"));
+    if (pendingItem.next_at) next.dateTime = pendingItem.next_at;
+    meta.append(next);
+    const actions = node("div", "button-row pending-actions");
+    const done = node("button", "button button-secondary", t(pendingBusy === pendingItem.id ? "pending.saving" : "pending.done"));
+    done.type = "button";
+    done.dataset.pendingFocus = `done-${pendingItem.id}`;
+    done.disabled = pendingBusy !== null;
+    done.setAttribute("aria-label", t("pending.doneLabel", { description: pendingItem.description }));
+    done.addEventListener("click", () => { void actOnPending(pendingItem.id, "done"); });
+    const snooze = node("button", "button button-quiet", t("pending.snooze"));
+    snooze.type = "button";
+    snooze.dataset.pendingFocus = `snooze-${pendingItem.id}`;
+    snooze.disabled = pendingBusy !== null;
+    snooze.setAttribute("aria-expanded", String(snoozeId === pendingItem.id));
+    snooze.setAttribute("aria-controls", `snooze-${pendingItem.id}`);
+    snooze.addEventListener("click", () => { snoozeId = snoozeId === pendingItem.id ? null : pendingItem.id; renderPending(); });
+    actions.append(done, snooze);
+    item.append(title, meta, actions);
+    const choices = node("div", "chips snooze-choices");
+    choices.id = `snooze-${pendingItem.id}`;
+    choices.hidden = snoozeId !== pendingItem.id;
+    choices.setAttribute("role", "group");
+    choices.setAttribute("aria-label", t("pending.snooze"));
+    for (const duration of ["10m", "1h", "tomorrow"]) {
+      const choice = node("button", "chip", t(`pending.${duration}`));
+      choice.type = "button";
+      choice.disabled = pendingBusy !== null;
+      choice.dataset.pendingFocus = `${duration}-${pendingItem.id}`;
+      choice.addEventListener("click", () => { void actOnPending(pendingItem.id, "snooze", duration); });
+      choices.append(choice);
+    }
+    item.append(choices);
+    list.append(item);
+  }
+  if (focusKey) Array.from(list.querySelectorAll("[data-pending-focus]")).find((button) => button.dataset.pendingFocus === focusKey)?.focus({ preventScroll: true });
+}
+async function actOnPending(id, action, duration) {
+  if (pendingBusy !== null) return;
+  pendingBusy = id;
+  stateGeneration++;
+  renderPending();
+  try {
+    state = await api("POST", `/api/pending/${id}/${action}`, action === "snooze" ? { duration } : undefined);
+    snoozeId = null;
+    renderList();
+    haptic("success");
+    toast(action === "done" ? "pending.completed" : "pending.snoozed");
+  } catch (error) {
+    if (["not_found", "pending_not_found", "already_completed"].includes(error.code) || errorKey(error) === "errors.notFound") {
+      try { state = await api("GET", "/api/state"); renderList(); toast("pending.alreadyCompleted"); }
+      catch (refreshError) { toast(errorKey(refreshError)); }
+    } else toast(errorKey(error));
+  } finally { pendingBusy = null; renderPending(); }
+}
+// A background refresh updates only the list; form values and open settings keep their state.
+async function refreshVisibleState({ force = false } = {}) {
+  if (!state || document.hidden || view !== "list-view" || refreshing || saving || preferencesSaving || pendingBusy !== null || (!force && Date.now() - refreshedAt < 3000)) return;
+  refreshing = true;
+  const generation = stateGeneration;
+  try {
+    const fresh = await api("GET", "/api/state");
+    if (generation !== stateGeneration) return;
+    state = fresh;
+    renderList();
+  } catch { /* Keep the last usable list; mutations still surface their own errors. */ }
+  finally { refreshing = false; refreshedAt = Date.now(); }
 }
 function deviceTimezone() { return Intl.DateTimeFormat().resolvedOptions().timeZone; }
 function renderTimezoneBanner() {
@@ -215,6 +311,7 @@ function renderTimezoneBanner() {
   button.type = "button";
   button.addEventListener("click", async () => {
     button.disabled = true;
+    stateGeneration++;
     try {
       state = await api("PUT", "/api/timezone", { timezone: device });
       renderList();
@@ -246,6 +343,7 @@ function highlightQuick() {
 }
 function setRepeat(value) {
   repeat = REPEATS.includes(value) ? value : "once";
+  $("repeat-summary").textContent = t(`repeat.${repeat}`);
   for (const chip of $("repeat").children) chip.setAttribute("aria-pressed", String(chip.dataset.value === repeat));
 }
 function renderFormControls() {
@@ -273,12 +371,14 @@ function renderFormControls() {
 function openForm(reminder) {
   editing = reminder;
   repeat = reminder?.recurrence || "once";
+  $("repeat-panel").open = repeat !== "once";
   $("description").value = reminder?.description || "";
   $("delete").hidden = !reminder;
   $("date").min = state.now.slice(0, 10);
   clearFormError();
   renderFormControls();
   setWhen(reminder?.at || fmt(atTime(parse(state.now), 9, 0, 1)));
+  loadedSchedule = reminder ? { at: `${$("date").value}T${$("time").value}`, recurrence: repeat } : null;
   show("form-view");
   window.scrollTo({ top: 0 });
 }
@@ -287,6 +387,7 @@ function backToList() {
   editing = null;
   renderList();
   show("list-view");
+  void refreshVisibleState({ force: true });
   window.scrollTo({ top: 0 });
 }
 async function save(event) {
@@ -296,8 +397,11 @@ async function save(event) {
   if (!body.description) return formError("errors.descriptionRequired");
   if (Array.from(body.description).length > 1000) return formError("errors.descriptionTooLong");
   if (!$("date").value || !$("time").value) return formError("errors.dateRequired");
+  // A description edit must not rewind a recurring schedule advanced while this form was open.
+  if (editing && body.at === loadedSchedule?.at && body.recurrence === loadedSchedule.recurrence) body.preserve_schedule = true;
   clearFormError();
   saving = true;
+  stateGeneration++;
   syncNativeButtons();
   telegramCall(() => tg?.MainButton?.showProgress());
   $("delete").disabled = true;
@@ -326,6 +430,7 @@ function confirmAction(key, confirmKey = key === "reminder.deleteConfirm" ? "act
 async function deleteReminder() {
   if (!editing || saving || !await confirmAction("reminder.deleteConfirm")) return;
   saving = true;
+  stateGeneration++;
   $("delete").disabled = true;
   syncNativeButtons();
   try {
@@ -353,6 +458,7 @@ function lockPreferences(locked) {
 async function updatePreferences(patch) {
   if (preferencesSaving || !state) return;
   lockPreferences(true);
+  stateGeneration++;
   $("preferences-status").classList.remove("is-error");
   $("preferences-status").textContent = t("settings.saving");
   const previousLanguage = getLanguage();
@@ -373,7 +479,9 @@ async function updatePreferences(patch) {
   } finally { lockPreferences(false); }
 }
 async function reload() {
+  stateGeneration++;
   state = await api("GET", "/api/state");
+  refreshedAt = Date.now();
   if (!state.timezone) state = await api("PUT", "/api/timezone", { timezone: deviceTimezone() || offsetString() });
   editing = null;
   if (supportedLanguage(state.language)) applyLanguage(state.language);
@@ -382,186 +490,7 @@ async function reload() {
   renderPreferences();
   lockPreferences(false);
   show("list-view");
-  void refreshYandex();
-}
-function yandexFeedback(key, isError = false) {
-  yandex.feedback = key;
-  yandex.feedbackError = isError;
-}
-function setYandexStatus(status, resetDraft = false) {
-  const connectionChanged = Boolean(yandex.status?.connected) !== Boolean(status.connected);
-  const reconnected = yandex.status?.requires_reconnect && !status.requires_reconnect;
-  yandex.status = status;
-  if (resetDraft || connectionChanged || !yandex.dirty) {
-    yandex.draftId = typeof status.scenario_id === "string" ? status.scenario_id : "";
-    yandex.draftEnabled = status.enabled === true;
-    yandex.dirty = false;
-  }
-  if (!status.connected || connectionChanged) yandex.scenarios = null;
-  if (status.connected && !status.requires_reconnect) {
-    yandex.oauthUrl = null;
-    if (connectionChanged || reconnected) yandexFeedback(null);
-  }
-}
-function yandexSelectedScenario() {
-  return yandex.scenarios?.find((scenario) => scenario.id === yandex.draftId && scenario.is_active === true);
-}
-function yandexCanDisable() {
-  return yandex.status?.enabled === true && !yandex.draftEnabled && (!yandex.draftId || yandex.draftId === yandex.status.scenario_id);
-}
-function renderYandexTestButton() {
-  const remaining = Math.max(0, Math.ceil((yandex.cooldownUntil - Date.now()) / 1000));
-  $("yandex-test").disabled = Boolean(yandex.loading || yandex.busy || remaining || yandex.dirty || !yandexSelectedScenario() || yandex.status?.requires_reconnect);
-  $("yandex-test").textContent = t(yandex.busy === "test" ? "yandex.testing" : remaining ? "yandex.testCooldown" : "yandex.test", { seconds: remaining });
-  window.clearTimeout(yandexCooldownTimer);
-  if (remaining) yandexCooldownTimer = window.setTimeout(renderYandexTestButton, 1000);
-}
-function renderYandex() {
-  const status = yandex.status;
-  $("yandex-panel").hidden = status?.available !== true;
-  if (!status?.available) return;
-  const connected = status.connected === true && !status.requires_reconnect;
-  const locked = Boolean(yandex.loading || yandex.busy);
-  document.querySelector('[data-i18n="yandex.description"]').hidden = connected;
-  document.querySelector('[data-i18n="yandex.returnHelp"]').hidden = connected;
-  $("yandex-summary").textContent = t(status.requires_reconnect ? "yandex.summaryReconnect" : status.enabled && connected ? "yandex.summaryEnabled" : connected ? "yandex.summaryConnected" : "yandex.subtitle");
-  $("yandex-connect-area").hidden = connected;
-  $("yandex-connected").hidden = !connected;
-  $("yandex-connect").disabled = locked;
-  $("yandex-connect").textContent = t(yandex.busy === "connect" ? "yandex.connecting" : yandex.oauthUrl ? "yandex.continue" : status.requires_reconnect ? "yandex.reconnect" : "yandex.connect");
-  $("yandex-refresh").disabled = locked;
-  $("yandex-disconnect").hidden = !status.connected && !status.requires_reconnect;
-  $("yandex-disconnect").disabled = locked;
-  $("yandex-connected").setAttribute("aria-busy", String(locked));
-  const select = $("yandex-scenario");
-  const placeholder = node("option", "", t("yandex.chooseScenario"));
-  placeholder.value = "";
-  select.replaceChildren(placeholder);
-  for (const scenario of yandex.scenarios || []) {
-    const option = node("option", "", scenario.is_active ? scenario.name : t("yandex.inactiveScenario", { name: scenario.name }));
-    option.value = scenario.id;
-    option.disabled = !scenario.is_active;
-    select.append(option);
-  }
-  if (yandex.draftId && !yandex.scenarios?.some((scenario) => scenario.id === yandex.draftId)) {
-    const option = node("option", "", yandex.scenarios ? t("yandex.savedScenarioMissing") : status.scenario_name || t("yandex.savedScenario"));
-    option.value = yandex.draftId;
-    option.disabled = true;
-    select.append(option);
-  }
-  select.value = yandex.draftId;
-  select.disabled = locked || !yandex.scenarios?.length;
-  $("yandex-scenario-help").textContent = t(yandex.loading ? "yandex.loading" : yandex.scenarios === null ? "yandex.loadScenarios" : !yandex.scenarios.some((scenario) => scenario.is_active) ? "yandex.noScenarios" : "yandex.scenarioHelp");
-  $("yandex-enabled").checked = yandex.draftEnabled;
-  $("yandex-enabled").disabled = locked || (!yandexSelectedScenario() && !(status.enabled && yandex.draftId === status.scenario_id));
-  $("yandex-save").disabled = locked || !yandex.dirty || (!yandexSelectedScenario() && !yandexCanDisable());
-  $("yandex-save").textContent = t(yandex.busy === "save" ? "action.saving" : "yandex.save");
-  renderYandexTestButton();
-  const lastError = status.requires_reconnect ? "yandex.errors.reconnect" : status.last_error ? ERROR_KEYS[status.last_error] || "yandex.errors.delivery" : null;
-  $("yandex-last-error").hidden = !lastError;
-  $("yandex-last-error").textContent = lastError ? t(lastError) : "";
-  $("yandex-status").classList.toggle("is-error", yandex.feedbackError);
-  $("yandex-status").textContent = t(yandex.loading ? "yandex.loading" : yandex.feedback || (yandex.dirty ? "yandex.unsaved" : connected ? "yandex.connected" : "yandex.notConnected"));
-}
-async function refreshYandex({ force = false } = {}) {
-  if (!state || yandex.loading || yandex.busy || (!force && Date.now() - yandex.refreshedAt < 3000)) return;
-  yandex.loading = true;
-  if (force) { yandex.oauthUrl = null; yandexFeedback(null); }
-  renderYandex();
-  try {
-    const previousStatus = yandex.status;
-    const status = await api("GET", "/api/yandex");
-    setYandexStatus(status);
-    if (!previousStatus && status.connected && status.scenario_id) $("yandex-guide").open = false;
-    if (status.available && status.connected && !status.requires_reconnect && ($("yandex-panel").open || force)) {
-      const data = await api("GET", "/api/yandex/scenarios");
-      yandex.scenarios = Array.isArray(data.scenarios) ? data.scenarios.filter((scenario) => typeof scenario.id === "string" && typeof scenario.name === "string" && typeof scenario.is_active === "boolean") : [];
-    }
-  } catch (error) { handleYandexError(error); }
-  finally { yandex.loading = false; yandex.refreshedAt = Date.now(); renderYandex(); }
-}
-function openYandexOAuth(url) {
-  const target = new URL(url);
-  if (target.protocol !== "https:" || target.hostname !== "oauth.yandex.ru" || target.username || target.password || (target.port && target.port !== "443")) throw new ApiError("yandex.errors.connect");
-  if (typeof tg?.openLink === "function") {
-    try { tg.openLink(target.href); return; } catch { /* A user-initiated browser link also works in older clients. */ }
-  }
-  window.open(target.href, "_blank", "noopener,noreferrer");
-}
-async function connectYandex() {
-  if (yandex.loading || yandex.busy) return;
-  if (yandex.oauthUrl) {
-    try { openYandexOAuth(yandex.oauthUrl); } catch { yandexFeedback("yandex.errors.connect", true); renderYandex(); }
-    return;
-  }
-  yandex.busy = "connect";
-  yandexFeedback(null);
-  renderYandex();
-  try {
-    const data = await api("POST", "/api/yandex/connect");
-    openYandexOAuth(data.url);
-    yandex.oauthUrl = data.url;
-    yandexFeedback("yandex.awaitingReturn");
-  } catch (error) { yandexFeedback(error instanceof TypeError ? "yandex.errors.connect" : errorKey(error), true); }
-  finally { yandex.busy = null; renderYandex(); }
-}
-function changeYandexDraft() {
-  const changedScenario = yandex.draftId !== $("yandex-scenario").value;
-  yandex.draftId = $("yandex-scenario").value;
-  // A newly selected scenario remains off until the user explicitly enables it.
-  yandex.draftEnabled = changedScenario ? false : $("yandex-enabled").checked;
-  yandex.dirty = yandex.draftId !== (yandex.status?.scenario_id || "") || yandex.draftEnabled !== Boolean(yandex.status?.enabled);
-  yandexFeedback(null);
-  renderYandex();
-}
-async function saveYandex() {
-  if (yandex.loading || yandex.busy || !yandex.dirty || (!yandexSelectedScenario() && !yandexCanDisable())) return;
-  yandex.busy = "save";
-  yandexFeedback(null);
-  renderYandex();
-  try {
-    setYandexStatus(await api("PUT", "/api/yandex", { scenario_id: yandex.draftId, enabled: yandex.draftEnabled }), true);
-    yandexFeedback("yandex.saved");
-    haptic("success");
-  } catch (error) { handleYandexError(error); }
-  finally { yandex.busy = null; renderYandex(); }
-}
-function handleYandexError(error) {
-  yandexFeedback(errorKey(error), true);
-  if (["yandex_reconnect_required", "yandex_not_connected"].includes(error.code) && yandex.status) yandex.status.requires_reconnect = true;
-}
-async function testYandex() {
-  if (yandex.loading || yandex.busy || yandex.dirty || !yandexSelectedScenario() || Date.now() < yandex.cooldownUntil) return;
-  yandex.busy = "test";
-  yandexFeedback(null);
-  renderYandex();
-  try {
-    await api("POST", "/api/yandex/test");
-    yandex.cooldownUntil = Date.now() + 60000;
-    yandexFeedback("yandex.testSent");
-    if (yandex.status) yandex.status.last_error = null;
-    haptic("success");
-  } catch (error) {
-    if (["yandex_rate_limited", "rate_limited", "yandex_delivery_uncertain"].includes(error.code)) yandex.cooldownUntil = Date.now() + 60000;
-    handleYandexError(error);
-  } finally { yandex.busy = null; renderYandex(); }
-}
-async function disconnectYandex() {
-  if (yandex.loading || yandex.busy) return;
-  yandex.busy = "confirmDisconnect";
-  renderYandex();
-  try {
-    if (!await confirmAction("yandex.disconnectConfirm", "yandex.disconnect")) return;
-    yandex.busy = "disconnect";
-    renderYandex();
-    await api("DELETE", "/api/yandex");
-    setYandexStatus({ available: true, connected: false, enabled: false, requires_reconnect: false, scenario_id: null, scenario_name: null, last_error: null }, true);
-    yandex.oauthUrl = null;
-    yandex.cooldownUntil = 0;
-    yandexFeedback("yandex.disconnected");
-    $("yandex-guide").open = true;
-  } catch (error) { handleYandexError(error); }
-  finally { yandex.busy = null; renderYandex(); }
+  void yandex.refresh();
 }
 async function showCalendar(reset = false) {
   const button = $(reset ? "calendar-reset" : "calendar-toggle");
@@ -600,16 +529,14 @@ $("reminder-form").addEventListener("submit", save);
 $("delete").addEventListener("click", deleteReminder);
 $("nag-interval").addEventListener("change", () => updatePreferences({ nag_interval_minutes: Number($("nag-interval").value) }));
 $("confirmation-check").addEventListener("change", () => updatePreferences({ confirmation_check_minutes: $("confirmation-check").checked ? 20 : 0 }));
-$("yandex-panel").addEventListener("toggle", () => { if ($("yandex-panel").open && yandex.scenarios === null) void refreshYandex({ force: true }); });
-$("yandex-connect").addEventListener("click", connectYandex);
-$("yandex-refresh").addEventListener("click", () => { void refreshYandex({ force: true }); });
-$("yandex-scenario").addEventListener("change", changeYandexDraft);
-$("yandex-enabled").addEventListener("change", changeYandexDraft);
-$("yandex-save").addEventListener("click", saveYandex);
-$("yandex-test").addEventListener("click", testYandex);
-$("yandex-disconnect").addEventListener("click", disconnectYandex);
-window.addEventListener("focus", () => { if (!document.hidden) void refreshYandex(); });
-document.addEventListener("visibilitychange", () => { if (!document.hidden) void refreshYandex(); });
+function refreshOnReturn() {
+  if (document.hidden || !state) return;
+  void refreshVisibleState({ force: true });
+  void yandex.refresh();
+}
+window.addEventListener("focus", refreshOnReturn);
+document.addEventListener("visibilitychange", refreshOnReturn);
+window.setInterval(() => { void refreshVisibleState(); }, 30000);
 $("calendar-toggle").addEventListener("click", () => {
   if ($("calendar").hidden) showCalendar();
   else { $("calendar").hidden = true; $("calendar-toggle").setAttribute("aria-expanded", "false"); }
@@ -649,6 +576,7 @@ async function start() {
   telegramCall(() => tg.MainButton?.onClick(save));
   telegramCall(() => tg.BackButton?.onClick(backToList));
   telegramCall(() => tg.onEvent?.("themeChanged", syncTheme));
+  telegramCall(() => tg.onEvent?.("activated", refreshOnReturn));
   await reload().catch((error) => fatal(errorKey(error)));
 }
 start();

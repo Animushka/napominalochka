@@ -12,7 +12,6 @@ pub use crate::yandex::YandexConfig;
 const DEFAULT_DATABASE_PATH: &str = "data/extremelynaggybot.db";
 const DEFAULT_WEB_LISTEN: &str = "0.0.0.0:8080";
 
-#[derive(Debug)]
 pub struct Config {
     /// `TELEGRAM_BOT_TOKEN` (required).
     pub telegram_token: String,

@@ -58,6 +58,7 @@ impl Lang {
             InputError::InvalidTimezone => "error.timezone",
             InputError::InvalidRecurrence => "error.recurrence",
             InputError::EmptyDescription => "error.empty",
+            InputError::DescriptionTooLong => "error.description_too_long",
             InputError::InPast => "error.past",
         })
     }

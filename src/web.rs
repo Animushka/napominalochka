@@ -8,9 +8,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
-use axum::extract::{FromRequestParts, Path, State};
+use axum::extract::{FromRequestParts, Path, Request, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderValue, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
@@ -23,7 +24,7 @@ use url::Url;
 
 use crate::calendar;
 use crate::i18n::Lang;
-use crate::model::{Recurrence, Reminder, UserTz};
+use crate::model::{InputError, Nagging, Recurrence, Reminder, Snooze, UserTz};
 use crate::panels;
 use crate::service::{self, Profile, ReminderInput, Service};
 
@@ -109,11 +110,22 @@ pub fn router(state: Arc<WebState>) -> Router {
                 )
             }),
         )
+        .route(
+            "/assets/yandex.js",
+            get(|| async {
+                asset(
+                    "text/javascript; charset=utf-8",
+                    include_str!("../web/yandex.js"),
+                )
+            }),
+        )
         .route("/health", get(|| async { "ok" }))
         .route("/api/state", get(get_state))
         .route("/api/preferences", patch(set_preferences))
         .route("/api/timezone", put(set_timezone))
         .route("/api/reminders", post(create_reminder))
+        .route("/api/pending/{id}/done", post(complete_pending))
+        .route("/api/pending/{id}/snooze", post(snooze_pending))
         .route(
             "/api/reminders/{id}",
             put(update_reminder).delete(delete_reminder),
@@ -122,7 +134,19 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/calendar/reset", post(reset_calendar_link))
         .route("/calendar/{file}", get(calendar_feed))
         .merge(crate::yandex_web::routes())
+        .layer(middleware::from_fn(protect_api_cache))
         .with_state(state)
+}
+
+async fn protect_api_cache(request: Request, next: Next) -> Response {
+    let sensitive = request.uri().path().starts_with("/api/");
+    let mut response = next.run(request).await;
+    if sensitive {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    response
 }
 
 async fn index() -> Response {
@@ -158,6 +182,30 @@ struct StateView {
     /// Current local time in the user's timezone, `YYYY-MM-DDTHH:MM`.
     now: Option<String>,
     reminders: Vec<ReminderView>,
+    pending: Vec<PendingView>,
+}
+
+#[derive(Serialize)]
+struct PendingView {
+    id: i64,
+    reminder_id: Option<i64>,
+    description: String,
+    next_at: String,
+    next_when: String,
+    relative: String,
+}
+impl PendingView {
+    fn new(pending: Nagging, tz: UserTz, now: DateTime<Utc>, lang: Lang) -> Self {
+        let local = tz.local(pending.next_at);
+        Self {
+            id: pending.id,
+            reminder_id: pending.reminder_id,
+            description: pending.description,
+            next_at: local.format(LOCAL_FORMAT).to_string(),
+            next_when: lang.date(local),
+            relative: panels::relative_lang(now, pending.next_at, lang),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -182,7 +230,7 @@ impl ReminderView {
             recurrence: reminder.recurrence.as_str(),
             when: lang.date(local),
             relative: panels::relative_lang(now, reminder.due_at, lang),
-            repeat: lang.recurrence(reminder.recurrence, local),
+            repeat: lang.recurrence(reminder.recurrence, reminder.anchor_local.unwrap_or(local)),
         }
     }
 }
@@ -201,10 +249,13 @@ struct PreferencesInput {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReminderBody {
     description: String,
     at: String,
     recurrence: String,
+    #[serde(default)]
+    preserve_schedule: bool,
 }
 
 // ---- handlers -------------------------------------------------------------------------
@@ -213,6 +264,48 @@ async fn get_state(
     State(state): State<Arc<WebState>>,
     auth: AuthUser,
 ) -> Result<Json<StateView>, ApiError> {
+    Ok(Json(load_state(&state.service, auth.id, Utc::now()).await?))
+}
+
+async fn complete_pending(
+    State(state): State<Arc<WebState>>,
+    auth: AuthUser,
+    Path(id): Path<i64>,
+) -> Result<Json<StateView>, ApiError> {
+    state.service.done_at(auth.id, id, Utc::now()).await?;
+    Ok(Json(load_state(&state.service, auth.id, Utc::now()).await?))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnoozeInput {
+    duration: String,
+}
+async fn snooze_pending(
+    State(state): State<Arc<WebState>>,
+    auth: AuthUser,
+    Path(id): Path<i64>,
+    Json(input): Json<SnoozeInput>,
+) -> Result<Json<StateView>, ApiError> {
+    let duration = match input.duration.as_str() {
+        "10m" => Snooze::TenMinutes,
+        "1h" => Snooze::OneHour,
+        "tomorrow" => Snooze::TomorrowMorning,
+        _ => {
+            return Err(ApiError::bad_request(
+                "invalid_request",
+                "Choose a snooze duration.",
+            ));
+        }
+    };
+    let user = state.service.registered(auth.id).await?;
+    if state
+        .service
+        .snooze(&user, id, duration, Utc::now())
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::NotFound);
+    }
     Ok(Json(load_state(&state.service, auth.id, Utc::now()).await?))
 }
 
@@ -277,11 +370,18 @@ async fn update_reminder(
 ) -> Result<Json<ReminderView>, ApiError> {
     let now = Utc::now();
     let user = state.service.registered(auth.id).await?;
-    let (at, recurrence) = input.schedule()?;
-    let reminder = state
-        .service
-        .update(&user, id, Some(&input.description), at, recurrence, now)
-        .await?;
+    let reminder = if input.preserve_schedule {
+        state
+            .service
+            .rename(auth.id, id, &input.description)
+            .await?
+    } else {
+        let (at, recurrence) = input.schedule()?;
+        state
+            .service
+            .update(&user, id, Some(&input.description), at, recurrence, now)
+            .await?
+    };
     let lang = Lang::parse(&state.service.preferences(auth.id).await?.language);
     Ok(Json(ReminderView::new(&reminder, user.tz, now, lang)))
 }
@@ -320,10 +420,9 @@ async fn calendar_link(
     user_id: i64,
     reset: bool,
 ) -> Result<CalendarLink, ApiError> {
-    let base = state
-        .web_app_url
-        .as_ref()
-        .ok_or_else(|| ApiError::BadRequest("The calendar feed is not enabled.".into()))?;
+    let base = state.web_app_url.as_ref().ok_or_else(|| {
+        ApiError::bad_request("calendar_disabled", "The calendar feed is not enabled.")
+    })?;
     let token = state.service.calendar_token(user_id, reset).await?;
     let url =
         calendar::feed_url(base, &token).ok_or_else(|| anyhow::anyhow!("invalid WEB_APP_URL"))?;
@@ -380,9 +479,11 @@ async fn load_state(
             timezone_id: None,
             now: None,
             reminders: Vec::new(),
+            pending: Vec::new(),
         });
     };
     let reminders = service.list(user_id).await?;
+    let pending = service.pending(user_id).await?;
     let timezone_id = match user.tz {
         UserTz::Named(tz) => tz.name().to_owned(),
         UserTz::Fixed(offset) => offset.to_string(),
@@ -398,14 +499,19 @@ async fn load_state(
             .iter()
             .map(|r| ReminderView::new(r, user.tz, now, lang))
             .collect(),
+        pending: pending
+            .into_iter()
+            .map(|item| PendingView::new(item, user.tz, now, lang))
+            .collect(),
     })
 }
 
 impl ReminderBody {
     /// Parses the wire format; everything else is validated by the service.
     fn schedule(&self) -> Result<(NaiveDateTime, Recurrence), ApiError> {
-        let at = NaiveDateTime::parse_from_str(&self.at, LOCAL_FORMAT)
-            .map_err(|_| ApiError::BadRequest("Please pick a date and time.".into()))?;
+        let at = NaiveDateTime::parse_from_str(&self.at, LOCAL_FORMAT).map_err(|_| {
+            ApiError::bad_request("invalid_datetime", "Please pick a date and time.")
+        })?;
         let recurrence = self.recurrence.parse().map_err(service::Error::from)?;
         Ok((at, recurrence))
     }
@@ -416,7 +522,7 @@ impl ReminderBody {
 pub enum ApiError {
     Unauthorized,
     NotFound,
-    BadRequest(String),
+    BadRequest { code: &'static str, message: String },
     Internal(anyhow::Error),
 }
 
@@ -426,53 +532,60 @@ impl From<anyhow::Error> for ApiError {
     }
 }
 
+impl ApiError {
+    fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
+        Self::BadRequest {
+            code,
+            message: message.into(),
+        }
+    }
+}
 impl From<service::Error> for ApiError {
     fn from(error: service::Error) -> Self {
         match error {
             service::Error::NotFound => ApiError::NotFound,
-            service::Error::NotRegistered
-            | service::Error::Input(_)
-            | service::Error::InvalidPreferences(_) => ApiError::BadRequest(error.to_string()),
+            service::Error::NotRegistered => {
+                ApiError::bad_request("invalid_timezone", "Please set your timezone first.")
+            }
+            service::Error::InvalidPreferences(_) => {
+                ApiError::bad_request("invalid_preferences", "Check your reminder preferences.")
+            }
+            service::Error::Input(error) => {
+                let code = match error {
+                    InputError::InvalidTimezone => "invalid_timezone",
+                    InputError::InvalidRecurrence => "invalid_recurrence",
+                    InputError::EmptyDescription => "empty_description",
+                    InputError::DescriptionTooLong => "description_too_long",
+                    InputError::InPast => "past_time",
+                };
+                ApiError::bad_request(code, error.to_string())
+            }
             service::Error::Internal(error) => ApiError::Internal(error),
         }
     }
 }
-
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, message) = match self {
+        let (status, code, message) = match self {
             ApiError::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
+                "unauthorized",
                 "Please open this page from Telegram.".to_owned(),
             ),
             ApiError::NotFound => (
                 StatusCode::NOT_FOUND,
+                "reminder_not_found",
                 "That reminder no longer exists.".to_owned(),
             ),
-            ApiError::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
+            ApiError::BadRequest { code, message } => (StatusCode::BAD_REQUEST, code, message),
             ApiError::Internal(error) => {
                 tracing::error!(?error, "web request failed");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
                     "Something went wrong. Please try again.".to_owned(),
                 )
             }
-        };
-        let code = match message.as_str() {
-            "Please open this page from Telegram." => "unauthorized",
-            "That reminder no longer exists." | "This reminder is no longer available." => {
-                "reminder_not_found"
-            }
-            "Please set your timezone first." => "invalid_timezone",
-            "Please pick a date and time." => "invalid_datetime",
-            "Please enter what to remind you about." => "empty_description",
-            "That time has already passed." => "past_time",
-            "Something went wrong. Please try again." => "internal_error",
-            "The calendar feed is not enabled." => "calendar_disabled",
-            _ if message.starts_with("Invalid preference") => "invalid_preferences",
-            _ if message.starts_with("I don't recognise that timezone") => "invalid_timezone",
-            _ if message.starts_with("Repeat must be one of") => "invalid_recurrence",
-            _ => "invalid_request",
         };
         (
             status,
@@ -982,6 +1095,247 @@ mod tests {
         assert_eq!(
             call(&app, "GET", "/calendar/nope.ics", None, None).await.0,
             StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_api_keeps_fired_items_isolated_and_completes_once() {
+        let db = Db::open_in_memory().unwrap();
+        let service = Service::new(db.clone());
+        for id in [42, 66] {
+            service
+                .set_timezone(
+                    Profile {
+                        id,
+                        first_name: "Test".into(),
+                        last_name: String::new(),
+                    },
+                    UserTz::parse("+3").unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        service
+            .set_preferences(42, None, None, Some(20))
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let reminder = db
+            .add_reminder(
+                42,
+                "Water plants".into(),
+                now - chrono::Duration::minutes(1),
+                Recurrence::Once,
+            )
+            .await
+            .unwrap();
+        let nag = db
+            .fire_reminder(reminder.id, now, now + chrono::Duration::minutes(10))
+            .await
+            .unwrap()
+            .unwrap();
+        let app = router(Arc::new(WebState {
+            service: service.clone(),
+            bot_token: TOKEN.into(),
+            web_app_url: None,
+            yandex: None,
+        }));
+        let owner = init_data(42, now);
+        let other = init_data(66, now);
+        let (_, body) = call(&app, "GET", "/api/state", Some(&owner), None).await;
+        let state: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(state["reminders"].as_array().unwrap().len(), 0);
+        assert_eq!(state["pending"].as_array().unwrap().len(), 1);
+        assert_eq!(state["pending"][0]["id"], nag.id);
+        assert!(state["pending"][0]["reminder_id"].is_null());
+        let (_, body) = call(&app, "GET", "/api/state", Some(&other), None).await;
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["pending"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let done = format!("/api/pending/{}/done", nag.id);
+        let snooze = format!("/api/pending/{}/snooze", nag.id);
+        assert_eq!(
+            call(&app, "POST", &done, None, None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call(&app, "POST", &done, Some(&other), None).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(service.pending(42).await.unwrap().len(), 1);
+        assert_eq!(
+            call(
+                &app,
+                "POST",
+                &snooze,
+                Some(&other),
+                Some(r#"{"duration":"10m"}"#)
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            call(
+                &app,
+                "POST",
+                &snooze,
+                Some(&owner),
+                Some(r#"{"duration":"bad"}"#)
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            call(
+                &app,
+                "POST",
+                &snooze,
+                Some(&owner),
+                Some(r#"{"duration":"10m"}"#)
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let pending = service.pending(42).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].next_at >= now + chrono::Duration::minutes(9));
+        assert!(pending[0].next_at <= Utc::now() + chrono::Duration::minutes(10));
+        for _ in 0..2 {
+            let (status, body) = call(&app, "POST", &done, Some(&owner), None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&body).unwrap()["pending"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            db.due_confirmations(now + chrono::Duration::minutes(25))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            call(
+                &app,
+                "POST",
+                &snooze,
+                Some(&owner),
+                Some(r#"{"duration":"1h"}"#)
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn text_only_http_edit_preserves_advanced_recurrence_and_anchor() {
+        let db = Db::open_in_memory().unwrap();
+        let service = Service::new(db.clone());
+        let (user, _) = service
+            .set_timezone(
+                Profile {
+                    id: 42,
+                    first_name: "Test".into(),
+                    last_name: String::new(),
+                },
+                UserTz::parse("UTC").unwrap(),
+            )
+            .await
+            .unwrap();
+        let initial: DateTime<Utc> = "2027-01-31T09:00:00Z".parse().unwrap();
+        let reminder = service
+            .create(
+                &user,
+                ReminderInput {
+                    description: "Monthly",
+                    at: initial.naive_utc(),
+                    recurrence: Recurrence::Monthly,
+                },
+                initial - chrono::Duration::days(1),
+            )
+            .await
+            .unwrap();
+        db.fire_reminder(reminder.id, initial, initial)
+            .await
+            .unwrap();
+        let app = router(Arc::new(WebState {
+            service: service.clone(),
+            bot_token: TOKEN.into(),
+            web_app_url: None,
+            yandex: None,
+        }));
+        let owner = init_data_with_language(42, "en", Utc::now());
+        let other = init_data(66, Utc::now());
+        let uri = format!("/api/reminders/{}", reminder.id);
+        let body = r#"{"description":"Renamed","at":"2027-01-31T09:00","recurrence":"monthly","preserve_schedule":true}"#;
+        let (status, response) = call(&app, "PUT", &uri, Some(&owner), Some(body)).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let changed = service.reminder(42, reminder.id).await.unwrap();
+        assert_eq!(
+            changed.due_at,
+            "2027-02-28T09:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+        assert_eq!(changed.anchor_local, Some(initial.naive_utc()));
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&response).unwrap()["repeat"]
+                .as_str()
+                .unwrap()
+                .contains("31")
+        );
+        assert_ne!(
+            call(&app, "PUT", &uri, Some(&other), Some(body)).await.0,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn too_long_descriptions_have_stable_code_and_private_api_is_not_cached() {
+        let app = router(Arc::new(WebState {
+            service: Service::new(Db::open_in_memory().unwrap()),
+            bot_token: TOKEN.into(),
+            web_app_url: None,
+            yandex: None,
+        }));
+        let owner = init_data(42, Utc::now());
+        call(
+            &app,
+            "PUT",
+            "/api/timezone",
+            Some(&owner),
+            Some(r#"{"timezone":"UTC"}"#),
+        )
+        .await;
+        let body = serde_json::json!({ "description": "🌿".repeat(1001), "at": "2099-01-01T09:00", "recurrence": "once" }).to_string();
+        let (status, response) =
+            call(&app, "POST", "/api/reminders", Some(&owner), Some(&body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response).unwrap()["code"],
+            "description_too_long"
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/state")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
         );
     }
 }
