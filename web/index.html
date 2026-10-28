@@ -44,6 +44,39 @@
           <p id="preferences-status" class="preferences-status" role="status" aria-live="polite"></p>
         </div>
       </details>
+      <details class="panel yandex-panel" id="yandex-panel" hidden>
+        <summary><span class="panel-icon mint" aria-hidden="true">◖</span><span><strong data-i18n="yandex.title">Алиса</strong><span id="yandex-summary" class="summary-description" data-i18n="yandex.subtitle">Тёплое напоминание вслух</span></span><span class="chevron" aria-hidden="true">⌄</span></summary>
+        <div class="panel-content">
+          <p class="field-help" data-i18n="yandex.description">Подключите свой аккаунт Яндекса, чтобы ваша колонка напоминала вместе с ботом.</p>
+          <details class="yandex-guide" id="yandex-guide" open>
+            <summary data-i18n="yandex.guide">Три шага до первого напоминания</summary>
+            <ol class="yandex-steps">
+              <li><span data-i18n="yandex.step1">В приложении «Дом с Алисой» создайте сценарий для своей колонки с действием «Прочитать текст вслух».</span><blockquote data-i18n="yandex.phrase">У тебя новое напоминание. Загляни в Telegram.</blockquote></li>
+              <li data-i18n="yandex.step2">Подключите свой аккаунт Яндекса, затем подтвердите подключение кнопкой возврата в Telegram.</li>
+              <li data-i18n="yandex.step3">Выберите и сохраните сценарий, проверьте его кнопкой ниже. Затем включите напоминания вслух и сохраните ещё раз.</li>
+            </ol>
+          </details>
+          <p class="field-help yandex-behavior" data-i18n="yandex.behavior">Запускается весь выбранный сценарий со всеми его действиями. Фраза всегда та, которую вы задали в сценарии. Алиса говорит один раз в назначенное время; повторы и контрольные сообщения остаются в Telegram.</p>
+          <div id="yandex-connect-area">
+            <p id="yandex-permissions" class="yandex-permissions" data-i18n="yandex.permissions">Яндекс запрашивает доступ к просмотру и управлению умным домом — он шире выбранного сценария. Напоминалочка использует его для списка сценариев и запуска выбранного вами сценария.</p>
+            <button id="yandex-connect" class="button button-secondary" type="button" aria-describedby="yandex-permissions" data-i18n="yandex.connect">Подключить Яндекс ↗</button>
+          </div>
+          <div id="yandex-connected" hidden>
+            <label for="yandex-scenario" class="field-label" data-i18n="yandex.scenario">Ваш сценарий</label>
+            <select id="yandex-scenario" aria-describedby="yandex-scenario-help"></select>
+            <p id="yandex-scenario-help" class="field-help"></p>
+            <label class="toggle-row" for="yandex-enabled"><span><strong data-i18n="yandex.enabled">Напоминать вслух</strong><span class="field-help" data-i18n="yandex.enabledHelp">После проверки включите и сохраните. Выключено по умолчанию.</span></span><input id="yandex-enabled" type="checkbox" role="switch"><span class="toggle-track" aria-hidden="true"></span></label>
+            <div class="button-row yandex-actions"><button id="yandex-save" class="button button-secondary" type="button" data-i18n="yandex.save">Сохранить</button><button id="yandex-test" class="button button-quiet" type="button" data-i18n="yandex.test">Проверить на колонке</button></div>
+            <p class="field-help" data-i18n="yandex.testHelp">Проверка запускает сохранённый сценарий сразу, даже если напоминания вслух выключены.</p>
+          </div>
+          <p id="yandex-last-error" class="field-help is-error" role="status" hidden></p>
+          <p id="yandex-status" class="preferences-status" role="status" aria-live="polite"></p>
+          <div class="yandex-links"><button id="yandex-refresh" class="text-link" type="button" data-i18n="yandex.refresh">Обновить подключение и сценарии</button><button id="yandex-disconnect" class="text-link yandex-disconnect" type="button" hidden data-i18n="yandex.disconnect">Отключить Яндекс</button></div>
+          <p class="field-help" data-i18n="yandex.returnHelp">После входа в Яндекс нажмите «Подтвердить в Telegram», затем снова откройте Mini App. Если связь ещё не появилась, обновите подключение здесь.</p>
+          <p class="field-help"><a class="text-link" href="/privacy" target="_blank" rel="noopener noreferrer" data-i18n="yandex.privacy">Какие данные хранит подключение</a></p>
+          <p class="field-help"><a class="text-link" href="https://id.yandex.ru/personal/data-access" target="_blank" rel="noopener noreferrer" data-i18n="yandex.revoke">Отозвать доступ в настройках Яндекса ↗</a></p>
+        </div>
+      </details>
       <section class="panel calendar-panel">
         <button id="calendar-toggle" class="panel-toggle" type="button" aria-expanded="false" aria-controls="calendar"><span class="panel-icon peach" aria-hidden="true">▦</span><span><strong data-i18n="calendar.title">И в календарь тоже</strong><span class="summary-description" data-i18n="calendar.subtitle">Планы всегда под рукой</span></span><span class="chevron" aria-hidden="true">⌄</span></button>
         <div id="calendar" class="panel-content" hidden>

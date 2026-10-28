@@ -12,6 +12,8 @@ mod service;
 mod telegram;
 mod time_input;
 mod web;
+mod yandex;
+mod yandex_web;
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -96,6 +98,15 @@ async fn run(config: Config) -> anyhow::Result<()> {
 
     let shutdown = CancellationToken::new();
     let service = Service::new(db.clone());
+    let yandex = config
+        .yandex
+        .map(|settings| yandex::Yandex::new(settings, db.clone()))
+        .transpose()
+        .context("configuring Yandex integration")?;
+    let yandex_worker = yandex.clone().map(|integration| {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move { integration.run_worker(shutdown).await })
+    });
     let scheduler = tokio::spawn(scheduler::run(
         telegram::TelegramNotifier(bot.clone(), service.clone()),
         db,
@@ -105,6 +116,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         service: service.clone(),
         bot_token: config.telegram_token.clone(),
         web_app_url: config.web_app_url.clone(),
+        yandex: yandex.clone(),
     });
     let web_server = tokio::spawn(web::serve(config.web_listen, web_state, shutdown.clone()));
 
@@ -113,7 +125,11 @@ async fn run(config: Config) -> anyhow::Result<()> {
         .branch(Update::filter_callback_query().endpoint(telegram::handle_callback));
 
     let mut dispatcher = Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![Arc::new(AppState { service, bot_info })])
+        .dependencies(dptree::deps![Arc::new(AppState {
+            service,
+            bot_info,
+            yandex
+        })])
         .default_handler(|_| async {})
         .error_handler(LoggingErrorHandler::with_custom_text(
             "error while handling an update",
@@ -134,6 +150,9 @@ async fn run(config: Config) -> anyhow::Result<()> {
     dispatcher.dispatch().await;
     shutdown.cancel();
     scheduler.await.context("scheduler task panicked")?;
+    if let Some(worker) = yandex_worker {
+        worker.await.context("Yandex worker task panicked")?;
+    }
     web_server.await.context("web server task panicked")??;
     Ok(())
 }

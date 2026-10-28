@@ -39,6 +39,7 @@ pub struct WebState {
     pub bot_token: String,
     /// Public address; calendar feed links are built from it.
     pub web_app_url: Option<Url>,
+    pub yandex: Option<crate::yandex::Yandex>,
 }
 
 pub async fn serve(
@@ -120,6 +121,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/calendar", get(get_calendar_link))
         .route("/api/calendar/reset", post(reset_calendar_link))
         .route("/calendar/{file}", get(calendar_feed))
+        .merge(crate::yandex_web::routes())
         .with_state(state)
 }
 
@@ -695,6 +697,7 @@ mod tests {
             service: Service::new(Db::open_in_memory().unwrap()),
             bot_token: TOKEN.into(),
             web_app_url: Some(Url::parse("https://reminders.example.com").unwrap()),
+            yandex: None,
         }));
         let ada = init_data_with_language(42, "en", Utc::now());
         let eve = init_data(66, Utc::now());
@@ -788,6 +791,7 @@ mod tests {
             service: service.clone(),
             bot_token: TOKEN.into(),
             web_app_url: None,
+            yandex: None,
         }));
         let ada = init_data_with_language(42, "en", Utc::now());
         let eve = init_data_with_language(66, "ru", Utc::now());
@@ -856,6 +860,7 @@ mod tests {
             service: service.clone(),
             bot_token: TOKEN.into(),
             web_app_url: None,
+            yandex: None,
         }));
         let auth = init_data(42, Utc::now());
         for invalid in [
@@ -906,6 +911,7 @@ mod tests {
             service: Service::new(Db::open_in_memory().unwrap()),
             bot_token: TOKEN.into(),
             web_app_url: Some(Url::parse("https://reminders.example.com").unwrap()),
+            yandex: None,
         }));
         let (status, body) = call(&app, "GET", "/", None, None).await;
         assert_eq!(status, StatusCode::OK);
@@ -922,6 +928,7 @@ mod tests {
             service: Service::new(Db::open_in_memory().unwrap()),
             bot_token: TOKEN.into(),
             web_app_url: Some(Url::parse("https://reminders.example.com").unwrap()),
+            yandex: None,
         }));
         let ada = init_data(42, Utc::now());
 

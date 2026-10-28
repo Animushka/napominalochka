@@ -51,3 +51,32 @@ Based on **[ExtremelyNaggyBot](https://dev.decryptology.net/decryp7/ExtremelyNag
 by **decryp7 (Kok Yong)**, with original history preserved. See [UPSTREAM.md](UPSTREAM.md)
 for provenance and license status, and [README.upstream.md](README.upstream.md)
 for the original documentation.
+
+## Alice: individual scenario connections
+
+The optional integration uses the official Yandex Smart Home API. Each Telegram user
+links their own account and chooses one scenario. The speaker reads the fixed phrase
+configured in Home with Alice; reminder text is not sent to Yandex. The entire selected
+scenario runs, including every configured action.
+
+Register a Yandex OAuth app **for user authorization**, request `iot:view` and
+`iot:control`, and register `https://YOUR-DOMAIN/integrations/yandex/callback` as its web
+Redirect URI. Configure `YANDEX_CLIENT_ID`, `YANDEX_CLIENT_SECRET` and a persistent
+`YANDEX_TOKEN_KEY` (32 random bytes encoded as hex) in the private `.env`, then recreate
+the container. The panel is hidden when unconfigured. Secrets never reach the Mini App;
+`/privacy` describes data handling.
+
+Users create a read-aloud scenario, connect Yandex from the Mini App, and confirm using
+the callback page's return-to-Telegram button. Only the Telegram identity that started
+the connection can redeem it. They then save a scenario, test it, and separately enable
+announcements. Announcements default to off and run only at the first due occurrence;
+Telegram handles repeats, snooze and completion checks.
+
+Delivery runs independently with a durable queue, one action per user per minute and a
+five-minute job lifetime. Ambiguous launch responses are never retried and disable
+announcements until reviewed. Disconnect and `/unregister` remove tokens and queued
+commands; dispatched actions cannot be recalled. Full provider revocation is available
+in Yandex ID settings. Tokens are AES-256-GCM encrypted; securely back up the separate
+key with the database. One-use state, PKCE and a Telegram-bound callback receipt protect
+account linking. Mock HTTP tests cover these flows; verify actual speech with a real
+account and speaker after configuration.

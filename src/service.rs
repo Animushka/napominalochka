@@ -484,7 +484,7 @@ mod tests {
             .unwrap();
         let db = &service.db;
         let nagging = db
-            .fire_reminder(reminder.id, now(), now())
+            .fire_reminder(reminder.id, reminder.due_at, reminder.due_at)
             .await
             .unwrap()
             .unwrap();

@@ -24,6 +24,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/003_timezones_and_drafts.sql"),
     include_str!("../migrations/004_calendar_feed.sql"),
     include_str!("../migrations/005_preferences_and_confirmations.sql"),
+    include_str!("../migrations/006_yandex.sql"),
 ];
 
 const USER_COLUMNS: &str = "user_id, first_name, last_name, utc_offset_minutes, timezone";
@@ -70,7 +71,7 @@ impl Db {
         })
     }
 
-    async fn call<T, F>(&self, f: F) -> anyhow::Result<T>
+    pub(crate) async fn call<T, F>(&self, f: F) -> anyhow::Result<T>
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> rusqlite::Result<T> + Send + 'static,
@@ -216,6 +217,10 @@ impl Db {
             let tx = conn.transaction()?;
             tx.execute("DELETE FROM preferences WHERE user_id = ?1", [user_id])?;
             tx.execute("DELETE FROM drafts WHERE user_id = ?1", [user_id])?;
+            tx.execute(
+                "DELETE FROM yandex_connections WHERE user_id = ?1",
+                [user_id],
+            )?;
             let removed = tx.execute("DELETE FROM users WHERE user_id = ?1", [user_id])? > 0;
             tx.commit()?;
             Ok(removed)
@@ -347,7 +352,7 @@ impl Db {
     /// Consumes a due reminder: starts a nagging for it (replacing one left over from the
     /// previous occurrence) and either reschedules the reminder or, if it is one-off, deletes it.
     ///
-    /// Returns `None` if the reminder no longer exists.
+    /// Returns `None` if the reminder no longer exists or is no longer due.
     pub async fn fire_reminder(
         &self,
         reminder_id: i64,
@@ -359,6 +364,10 @@ impl Db {
             let Some(reminder) = reminder_by_id(&tx, reminder_id)? else {
                 return Ok(None);
             };
+            // Another scheduler pass may already have rescheduled this occurrence.
+            if reminder.due_at > now {
+                return Ok(None);
+            }
 
             tx.execute("DELETE FROM naggings WHERE reminder_id = ?1", [reminder.id])?;
             tx.execute(
@@ -372,6 +381,14 @@ impl Db {
                 description: reminder.description.clone(),
                 next_at: first_nag_at,
             };
+
+            tx.execute(
+                "INSERT INTO yandex_jobs (nagging_id, user_id, generation, scenario_id, created_at)
+                 SELECT ?1, user_id, generation, scenario_id, ?2 FROM yandex_connections
+                 WHERE user_id = ?3 AND encrypted_tokens IS NOT NULL AND enabled = 1
+                 AND requires_reconnect = 0 AND scenario_id IS NOT NULL",
+                params![nagging.id, now.timestamp(), reminder.user_id],
+            )?;
 
             let tz = user_tz(&tx, reminder.user_id)?;
             match tz.and_then(|tz| reminder.recurrence.next_after(reminder.due_at, now, tz)) {

@@ -8,7 +8,9 @@ publish = false
 
 [dependencies]
 anyhow = "1"
+aes-gcm = "0.10.3"
 axum = "0.8.9"
+base64 = "0.22.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 chrono-tz = { version = "0.10", features = ["case-insensitive"] }
 form_urlencoded = "1.2.2"
@@ -17,6 +19,7 @@ hex = "0.4.3"
 hmac = "0.13.0"
 interim = { version = "0.2.1", features = ["chrono_0_4"] }
 regex = "1"
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
 sentry = { version = "0.49", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
 sentry-tracing = "0.49"

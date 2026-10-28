@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use anyhow::{Context, bail};
 use url::Url;
 
+pub use crate::yandex::YandexConfig;
+
 const DEFAULT_DATABASE_PATH: &str = "data/extremelynaggybot.db";
 const DEFAULT_WEB_LISTEN: &str = "0.0.0.0:8080";
 
@@ -24,6 +26,8 @@ pub struct Config {
     pub web_app_url: Option<Url>,
     /// `WEB_LISTEN`: address the web server binds to, default `0.0.0.0:8080`.
     pub web_listen: SocketAddr,
+    /// Official Yandex OAuth integration; absent unless all credentials are configured.
+    pub yandex: Option<YandexConfig>,
 }
 
 impl Config {
@@ -53,11 +57,39 @@ impl Config {
             .unwrap_or(DEFAULT_WEB_LISTEN)
             .parse()
             .context("WEB_LISTEN must be an address like 0.0.0.0:8080")?;
+        let yandex = match (
+            var("YANDEX_CLIENT_ID"),
+            var("YANDEX_CLIENT_SECRET"),
+            var("YANDEX_TOKEN_KEY"),
+        ) {
+            (None, None, None) => None,
+            (Some(client_id), Some(client_secret), Some(key)) => {
+                let key = hex::decode(key)
+                    .context("YANDEX_TOKEN_KEY must be 64 hexadecimal characters")?;
+                let token_key: [u8; 32] = key
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("YANDEX_TOKEN_KEY must contain 32 bytes"))?;
+                let callback_url = web_app_url
+                    .as_ref()
+                    .context("WEB_APP_URL is required for Yandex OAuth")?
+                    .join("/integrations/yandex/callback")?;
+                Some(YandexConfig {
+                    client_id,
+                    client_secret,
+                    token_key,
+                    callback_url,
+                })
+            }
+            _ => bail!(
+                "YANDEX_CLIENT_ID, YANDEX_CLIENT_SECRET and YANDEX_TOKEN_KEY must be configured together"
+            ),
+        };
 
         Ok(Self {
             telegram_token,
             web_app_url,
             web_listen,
+            yandex,
             admin_chat_id,
             sentry_dsn: var("SENTRY_DSN"),
             database_path: var("DATABASE_PATH")

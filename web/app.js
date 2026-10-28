@@ -13,6 +13,8 @@ let preferencesSaving = false;
 let fatalKey = "errors.generic";
 let formErrorKey = null;
 let toastTimer;
+const yandex = { status: null, scenarios: null, loading: false, busy: null, draftId: "", draftEnabled: false, dirty: false, feedback: null, feedbackError: false, oauthUrl: null, refreshedAt: 0, cooldownUntil: 0 };
+let yandexCooldownTimer;
 const nativeSave = Boolean(tg?.MainButton?.setParams);
 
 const pad = (value) => String(value).padStart(2, "0");
@@ -38,7 +40,7 @@ function haptic(type = "selection") {
 }
 
 class ApiError extends Error {
-  constructor(key) { super(key); this.key = key; }
+  constructor(key, code) { super(key); this.key = key; this.code = code; }
 }
 const ERROR_KEYS = {
   unauthorized: "errors.auth", authentication_required: "errors.auth", invalid_auth: "errors.auth", auth_expired: "errors.auth",
@@ -49,6 +51,11 @@ const ERROR_KEYS = {
   empty_description: "errors.descriptionRequired", description_required: "errors.descriptionRequired", description_too_long: "errors.descriptionTooLong",
   invalid_timezone: "errors.timezone", timezone_required: "errors.timezone",
   invalid_preferences: "errors.preferences", calendar_disabled: "errors.calendarDisabled", rate_limited: "errors.rateLimited",
+  yandex_not_connected: "yandex.errors.notConnected", yandex_reconnect_required: "yandex.errors.reconnect",
+  yandex_scenario_missing: "yandex.errors.scenarioMissing", yandex_rate_limited: "yandex.errors.rateLimited",
+  yandex_unavailable: "yandex.errors.unavailable", yandex_invalid_state: "yandex.errors.invalidState",
+  yandex_invalid_selection: "yandex.errors.invalidSelection", yandex_internal: "yandex.errors.generic",
+  yandex_delivery_uncertain: "yandex.errors.deliveryUncertain",
 };
 // Compatibility with older servers; never expose arbitrary server text or internal errors.
 const LEGACY_ERRORS = {
@@ -72,7 +79,7 @@ async function api(method, path, body) {
       const key = ERROR_KEYS[data.code] || LEGACY_ERRORS[data.error]
         || ([401, 403].includes(response.status) ? "errors.auth" : response.status === 404 ? "errors.notFound"
           : response.status === 429 ? "errors.rateLimited" : response.status === 400 ? "errors.invalidRequest" : "errors.generic");
-      throw new ApiError(key);
+      throw new ApiError(key, data.code);
     }
     return data;
   } catch (error) {
@@ -133,6 +140,7 @@ function applyLanguage(language) {
     if (view === "form-view") renderFormControls();
     renderPreferences();
   }
+  renderYandex();
   if (view === "fatal") $("fatal-message").textContent = t(fatalKey);
   if (formErrorKey) $("form-error").textContent = t(formErrorKey);
   $("toast").hidden = true;
@@ -307,10 +315,10 @@ async function save(event) {
     syncNativeButtons();
   }
 }
-function confirmAction(key) {
+function confirmAction(key, confirmKey = key === "reminder.deleteConfirm" ? "action.delete" : "calendar.reset") {
   return new Promise((resolve) => {
     if (tg?.showPopup && tg.isVersionAtLeast?.("6.2")) {
-      tg.showPopup({ message: t(key), buttons: [{ id: "cancel", type: "cancel", text: t("action.cancel") }, { id: "confirm", type: "destructive", text: t(key === "reminder.deleteConfirm" ? "action.delete" : "calendar.reset") }] }, (id) => resolve(id === "confirm"));
+      tg.showPopup({ message: t(key), buttons: [{ id: "cancel", type: "cancel", text: t("action.cancel") }, { id: "confirm", type: "destructive", text: t(confirmKey) }] }, (id) => resolve(id === "confirm"));
     } else if (tg?.showConfirm) tg.showConfirm(t(key), resolve);
     else resolve(window.confirm(t(key)));
   });
@@ -374,6 +382,186 @@ async function reload() {
   renderPreferences();
   lockPreferences(false);
   show("list-view");
+  void refreshYandex();
+}
+function yandexFeedback(key, isError = false) {
+  yandex.feedback = key;
+  yandex.feedbackError = isError;
+}
+function setYandexStatus(status, resetDraft = false) {
+  const connectionChanged = Boolean(yandex.status?.connected) !== Boolean(status.connected);
+  const reconnected = yandex.status?.requires_reconnect && !status.requires_reconnect;
+  yandex.status = status;
+  if (resetDraft || connectionChanged || !yandex.dirty) {
+    yandex.draftId = typeof status.scenario_id === "string" ? status.scenario_id : "";
+    yandex.draftEnabled = status.enabled === true;
+    yandex.dirty = false;
+  }
+  if (!status.connected || connectionChanged) yandex.scenarios = null;
+  if (status.connected && !status.requires_reconnect) {
+    yandex.oauthUrl = null;
+    if (connectionChanged || reconnected) yandexFeedback(null);
+  }
+}
+function yandexSelectedScenario() {
+  return yandex.scenarios?.find((scenario) => scenario.id === yandex.draftId && scenario.is_active === true);
+}
+function yandexCanDisable() {
+  return yandex.status?.enabled === true && !yandex.draftEnabled && (!yandex.draftId || yandex.draftId === yandex.status.scenario_id);
+}
+function renderYandexTestButton() {
+  const remaining = Math.max(0, Math.ceil((yandex.cooldownUntil - Date.now()) / 1000));
+  $("yandex-test").disabled = Boolean(yandex.loading || yandex.busy || remaining || yandex.dirty || !yandexSelectedScenario() || yandex.status?.requires_reconnect);
+  $("yandex-test").textContent = t(yandex.busy === "test" ? "yandex.testing" : remaining ? "yandex.testCooldown" : "yandex.test", { seconds: remaining });
+  window.clearTimeout(yandexCooldownTimer);
+  if (remaining) yandexCooldownTimer = window.setTimeout(renderYandexTestButton, 1000);
+}
+function renderYandex() {
+  const status = yandex.status;
+  $("yandex-panel").hidden = status?.available !== true;
+  if (!status?.available) return;
+  const connected = status.connected === true && !status.requires_reconnect;
+  const locked = Boolean(yandex.loading || yandex.busy);
+  document.querySelector('[data-i18n="yandex.description"]').hidden = connected;
+  document.querySelector('[data-i18n="yandex.returnHelp"]').hidden = connected;
+  $("yandex-summary").textContent = t(status.requires_reconnect ? "yandex.summaryReconnect" : status.enabled && connected ? "yandex.summaryEnabled" : connected ? "yandex.summaryConnected" : "yandex.subtitle");
+  $("yandex-connect-area").hidden = connected;
+  $("yandex-connected").hidden = !connected;
+  $("yandex-connect").disabled = locked;
+  $("yandex-connect").textContent = t(yandex.busy === "connect" ? "yandex.connecting" : yandex.oauthUrl ? "yandex.continue" : status.requires_reconnect ? "yandex.reconnect" : "yandex.connect");
+  $("yandex-refresh").disabled = locked;
+  $("yandex-disconnect").hidden = !status.connected && !status.requires_reconnect;
+  $("yandex-disconnect").disabled = locked;
+  $("yandex-connected").setAttribute("aria-busy", String(locked));
+  const select = $("yandex-scenario");
+  const placeholder = node("option", "", t("yandex.chooseScenario"));
+  placeholder.value = "";
+  select.replaceChildren(placeholder);
+  for (const scenario of yandex.scenarios || []) {
+    const option = node("option", "", scenario.is_active ? scenario.name : t("yandex.inactiveScenario", { name: scenario.name }));
+    option.value = scenario.id;
+    option.disabled = !scenario.is_active;
+    select.append(option);
+  }
+  if (yandex.draftId && !yandex.scenarios?.some((scenario) => scenario.id === yandex.draftId)) {
+    const option = node("option", "", yandex.scenarios ? t("yandex.savedScenarioMissing") : status.scenario_name || t("yandex.savedScenario"));
+    option.value = yandex.draftId;
+    option.disabled = true;
+    select.append(option);
+  }
+  select.value = yandex.draftId;
+  select.disabled = locked || !yandex.scenarios?.length;
+  $("yandex-scenario-help").textContent = t(yandex.loading ? "yandex.loading" : yandex.scenarios === null ? "yandex.loadScenarios" : !yandex.scenarios.some((scenario) => scenario.is_active) ? "yandex.noScenarios" : "yandex.scenarioHelp");
+  $("yandex-enabled").checked = yandex.draftEnabled;
+  $("yandex-enabled").disabled = locked || (!yandexSelectedScenario() && !(status.enabled && yandex.draftId === status.scenario_id));
+  $("yandex-save").disabled = locked || !yandex.dirty || (!yandexSelectedScenario() && !yandexCanDisable());
+  $("yandex-save").textContent = t(yandex.busy === "save" ? "action.saving" : "yandex.save");
+  renderYandexTestButton();
+  const lastError = status.requires_reconnect ? "yandex.errors.reconnect" : status.last_error ? ERROR_KEYS[status.last_error] || "yandex.errors.delivery" : null;
+  $("yandex-last-error").hidden = !lastError;
+  $("yandex-last-error").textContent = lastError ? t(lastError) : "";
+  $("yandex-status").classList.toggle("is-error", yandex.feedbackError);
+  $("yandex-status").textContent = t(yandex.loading ? "yandex.loading" : yandex.feedback || (yandex.dirty ? "yandex.unsaved" : connected ? "yandex.connected" : "yandex.notConnected"));
+}
+async function refreshYandex({ force = false } = {}) {
+  if (!state || yandex.loading || yandex.busy || (!force && Date.now() - yandex.refreshedAt < 3000)) return;
+  yandex.loading = true;
+  if (force) { yandex.oauthUrl = null; yandexFeedback(null); }
+  renderYandex();
+  try {
+    const previousStatus = yandex.status;
+    const status = await api("GET", "/api/yandex");
+    setYandexStatus(status);
+    if (!previousStatus && status.connected && status.scenario_id) $("yandex-guide").open = false;
+    if (status.available && status.connected && !status.requires_reconnect && ($("yandex-panel").open || force)) {
+      const data = await api("GET", "/api/yandex/scenarios");
+      yandex.scenarios = Array.isArray(data.scenarios) ? data.scenarios.filter((scenario) => typeof scenario.id === "string" && typeof scenario.name === "string" && typeof scenario.is_active === "boolean") : [];
+    }
+  } catch (error) { handleYandexError(error); }
+  finally { yandex.loading = false; yandex.refreshedAt = Date.now(); renderYandex(); }
+}
+function openYandexOAuth(url) {
+  const target = new URL(url);
+  if (target.protocol !== "https:" || target.hostname !== "oauth.yandex.ru" || target.username || target.password || (target.port && target.port !== "443")) throw new ApiError("yandex.errors.connect");
+  if (typeof tg?.openLink === "function") {
+    try { tg.openLink(target.href); return; } catch { /* A user-initiated browser link also works in older clients. */ }
+  }
+  window.open(target.href, "_blank", "noopener,noreferrer");
+}
+async function connectYandex() {
+  if (yandex.loading || yandex.busy) return;
+  if (yandex.oauthUrl) {
+    try { openYandexOAuth(yandex.oauthUrl); } catch { yandexFeedback("yandex.errors.connect", true); renderYandex(); }
+    return;
+  }
+  yandex.busy = "connect";
+  yandexFeedback(null);
+  renderYandex();
+  try {
+    const data = await api("POST", "/api/yandex/connect");
+    openYandexOAuth(data.url);
+    yandex.oauthUrl = data.url;
+    yandexFeedback("yandex.awaitingReturn");
+  } catch (error) { yandexFeedback(error instanceof TypeError ? "yandex.errors.connect" : errorKey(error), true); }
+  finally { yandex.busy = null; renderYandex(); }
+}
+function changeYandexDraft() {
+  const changedScenario = yandex.draftId !== $("yandex-scenario").value;
+  yandex.draftId = $("yandex-scenario").value;
+  // A newly selected scenario remains off until the user explicitly enables it.
+  yandex.draftEnabled = changedScenario ? false : $("yandex-enabled").checked;
+  yandex.dirty = yandex.draftId !== (yandex.status?.scenario_id || "") || yandex.draftEnabled !== Boolean(yandex.status?.enabled);
+  yandexFeedback(null);
+  renderYandex();
+}
+async function saveYandex() {
+  if (yandex.loading || yandex.busy || !yandex.dirty || (!yandexSelectedScenario() && !yandexCanDisable())) return;
+  yandex.busy = "save";
+  yandexFeedback(null);
+  renderYandex();
+  try {
+    setYandexStatus(await api("PUT", "/api/yandex", { scenario_id: yandex.draftId, enabled: yandex.draftEnabled }), true);
+    yandexFeedback("yandex.saved");
+    haptic("success");
+  } catch (error) { handleYandexError(error); }
+  finally { yandex.busy = null; renderYandex(); }
+}
+function handleYandexError(error) {
+  yandexFeedback(errorKey(error), true);
+  if (["yandex_reconnect_required", "yandex_not_connected"].includes(error.code) && yandex.status) yandex.status.requires_reconnect = true;
+}
+async function testYandex() {
+  if (yandex.loading || yandex.busy || yandex.dirty || !yandexSelectedScenario() || Date.now() < yandex.cooldownUntil) return;
+  yandex.busy = "test";
+  yandexFeedback(null);
+  renderYandex();
+  try {
+    await api("POST", "/api/yandex/test");
+    yandex.cooldownUntil = Date.now() + 60000;
+    yandexFeedback("yandex.testSent");
+    if (yandex.status) yandex.status.last_error = null;
+    haptic("success");
+  } catch (error) {
+    if (["yandex_rate_limited", "rate_limited", "yandex_delivery_uncertain"].includes(error.code)) yandex.cooldownUntil = Date.now() + 60000;
+    handleYandexError(error);
+  } finally { yandex.busy = null; renderYandex(); }
+}
+async function disconnectYandex() {
+  if (yandex.loading || yandex.busy) return;
+  yandex.busy = "confirmDisconnect";
+  renderYandex();
+  try {
+    if (!await confirmAction("yandex.disconnectConfirm", "yandex.disconnect")) return;
+    yandex.busy = "disconnect";
+    renderYandex();
+    await api("DELETE", "/api/yandex");
+    setYandexStatus({ available: true, connected: false, enabled: false, requires_reconnect: false, scenario_id: null, scenario_name: null, last_error: null }, true);
+    yandex.oauthUrl = null;
+    yandex.cooldownUntil = 0;
+    yandexFeedback("yandex.disconnected");
+    $("yandex-guide").open = true;
+  } catch (error) { handleYandexError(error); }
+  finally { yandex.busy = null; renderYandex(); }
 }
 async function showCalendar(reset = false) {
   const button = $(reset ? "calendar-reset" : "calendar-toggle");
@@ -412,6 +600,16 @@ $("reminder-form").addEventListener("submit", save);
 $("delete").addEventListener("click", deleteReminder);
 $("nag-interval").addEventListener("change", () => updatePreferences({ nag_interval_minutes: Number($("nag-interval").value) }));
 $("confirmation-check").addEventListener("change", () => updatePreferences({ confirmation_check_minutes: $("confirmation-check").checked ? 20 : 0 }));
+$("yandex-panel").addEventListener("toggle", () => { if ($("yandex-panel").open && yandex.scenarios === null) void refreshYandex({ force: true }); });
+$("yandex-connect").addEventListener("click", connectYandex);
+$("yandex-refresh").addEventListener("click", () => { void refreshYandex({ force: true }); });
+$("yandex-scenario").addEventListener("change", changeYandexDraft);
+$("yandex-enabled").addEventListener("change", changeYandexDraft);
+$("yandex-save").addEventListener("click", saveYandex);
+$("yandex-test").addEventListener("click", testYandex);
+$("yandex-disconnect").addEventListener("click", disconnectYandex);
+window.addEventListener("focus", () => { if (!document.hidden) void refreshYandex(); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) void refreshYandex(); });
 $("calendar-toggle").addEventListener("click", () => {
   if ($("calendar").hidden) showCalendar();
   else { $("calendar").hidden = true; $("calendar-toggle").setAttribute("aria-expanded", "false"); }

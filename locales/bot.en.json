@@ -125,5 +125,8 @@
   "month.10": "October",
   "month.11": "November",
   "month.12": "December",
-  "calendar.instructions": "📅 Your private calendar link:\n{webcal}\n\nSubscribe once to see reminders in your phone’s calendar, with offline alarms at the scheduled time, then after 5 and 10 minutes. Changes normally appear within about 15 minutes.\n\niPhone: Settings → Calendar (Apps → Calendar on iOS 18) → Accounts → Add Account → Other → Add Subscribed Calendar. Turn OFF “Remove Alerts”.\n\nGoogle Calendar (web): Other calendars → + → From URL:\n{url}\nGoogle refreshes only every few hours and may not alert you.\n\nKeep the link private: anyone with it can see your reminders. Tap “New link” to revoke it."
+  "calendar.instructions": "📅 Your private calendar link:\n{webcal}\n\nSubscribe once to see reminders in your phone’s calendar, with offline alarms at the scheduled time, then after 5 and 10 minutes. Changes normally appear within about 15 minutes.\n\niPhone: Settings → Calendar (Apps → Calendar on iOS 18) → Accounts → Add Account → Other → Add Subscribed Calendar. Turn OFF “Remove Alerts”.\n\nGoogle Calendar (web): Other calendars → + → From URL:\n{url}\nGoogle refreshes only every few hours and may not alert you.\n\nKeep the link private: anyone with it can see your reminders. Tap “New link” to revoke it.",
+  "yandex.connected": "💛 Yandex is connected. Open reminders, choose a scenario in the Alice section and test it. Announcements are enabled separately.",
+  "yandex.confirm_failed": "Could not confirm the connection. Return to the Mini App and start signing in again from your own Telegram account.",
+  "yandex.unavailable": "Connecting Alice is not available yet. Please try again later."
 }

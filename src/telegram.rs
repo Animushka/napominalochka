@@ -26,6 +26,7 @@ pub type HandlerResult = anyhow::Result<()>;
 pub struct AppState {
     pub service: Service,
     pub bot_info: BotInfo,
+    pub yandex: Option<crate::yandex::Yandex>,
 }
 
 pub async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> HandlerResult {
@@ -41,6 +42,38 @@ pub async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Han
         )
         .await?;
     let lang = conversation::language(service, sender.chat_id).await?;
+    if let Some(receipt) = msg
+        .text()
+        .and_then(|text| yandex_receipt(text, &state.bot_info.username))
+    {
+        if !sender.private
+            || msg.forward_origin().is_some()
+            || msg
+                .from
+                .as_ref()
+                .is_none_or(|user| user.id.0 as i64 != sender.chat_id)
+        {
+            return Ok(());
+        }
+        let key = match &state.yandex {
+            Some(integration) => match integration.confirm_auth(sender.chat_id, receipt).await {
+                Ok(_) => "yandex.connected",
+                Err(_) => "yandex.confirm_failed",
+            },
+            None => "yandex.unavailable",
+        };
+        let mut reply = Reply::text(lang.text(key));
+        if let Some(url) = state.bot_info.web_app.as_ref() {
+            reply.markup = Markup::Inline(teloxide::types::InlineKeyboardMarkup::new([[
+                teloxide::types::InlineKeyboardButton::web_app(
+                    lang.text("app.open"),
+                    WebAppInfo { url: url.clone() },
+                ),
+            ]]));
+        }
+        send(&bot, msg.chat.id, reply, lang).await?;
+        return Ok(());
+    }
     let refresh_menu = sender.private
         && msg
             .text()
@@ -88,6 +121,22 @@ pub async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Han
             .await;
     }
     Ok(())
+}
+
+fn yandex_receipt<'a>(text: &'a str, username: &str) -> Option<&'a str> {
+    let mut parts = text.split_whitespace();
+    let command = parts.next()?;
+    if command != "/start" && command != format!("/start@{username}") {
+        return None;
+    }
+    let receipt = parts.next()?.strip_prefix("yandex_")?;
+    if parts.next().is_some()
+        || receipt.len() != 48
+        || !receipt.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(receipt)
 }
 
 pub async fn handle_callback(
@@ -327,6 +376,32 @@ pub async fn publish_commands(bot: &Bot) {
             .await
         {
             tracing::warn!(?error, "failed to publish a localized command list");
+        }
+    }
+}
+
+#[cfg(test)]
+mod yandex_link_tests {
+    use super::yandex_receipt;
+
+    #[test]
+    fn accepts_only_exact_bot_start_receipts() {
+        let receipt = "a".repeat(48);
+        assert_eq!(
+            yandex_receipt(&format!("/start yandex_{receipt}"), "our_bot"),
+            Some(receipt.as_str())
+        );
+        assert_eq!(
+            yandex_receipt(&format!("/start@our_bot yandex_{receipt}"), "our_bot"),
+            Some(receipt.as_str())
+        );
+        for text in [
+            format!("/start@other_bot yandex_{receipt}"),
+            format!("/start yandex_{receipt} extra"),
+            "/start yandex_nothex".into(),
+            "/start".into(),
+        ] {
+            assert_eq!(yandex_receipt(&text, "our_bot"), None);
         }
     }
 }
