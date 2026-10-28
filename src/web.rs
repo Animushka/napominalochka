@@ -12,7 +12,7 @@ use axum::extract::{FromRequestParts, Path, Request, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -28,7 +28,6 @@ use crate::model::{InputError, Nagging, Recurrence, Reminder, Snooze, UserTz};
 use crate::panels;
 use crate::service::{self, Profile, ReminderInput, Service};
 
-const INDEX_HTML: &str = include_str!("../web/index.html");
 /// `initData` older than this is rejected, limiting how long a leaked copy is useful.
 const MAX_INIT_DATA_AGE_SECS: i64 = 24 * 60 * 60;
 const LOCAL_FORMAT: &str = "%Y-%m-%dT%H:%M";
@@ -60,65 +59,12 @@ pub async fn serve(
 
 pub fn router(state: Arc<WebState>) -> Router {
     Router::new()
-        .route("/", get(index))
-        .route(
-            "/assets/app.js",
-            get(|| async {
-                asset(
-                    "text/javascript; charset=utf-8",
-                    include_str!("../web/app.js"),
-                )
-            }),
-        )
-        .route(
-            "/assets/i18n.js",
-            get(|| async {
-                asset(
-                    "text/javascript; charset=utf-8",
-                    include_str!("../web/i18n.js"),
-                )
-            }),
-        )
-        .route(
-            "/assets/styles.css",
-            get(|| async { asset("text/css; charset=utf-8", include_str!("../web/styles.css")) }),
-        )
-        .route(
-            "/assets/avatar.png",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "image/png")],
-                    include_bytes!("../web/avatar.png").as_slice(),
-                )
-            }),
-        )
-        .route(
-            "/locales/ru.json",
-            get(|| async {
-                asset(
-                    "application/json; charset=utf-8",
-                    include_str!("../web/locales/ru.json"),
-                )
-            }),
-        )
-        .route(
-            "/locales/en.json",
-            get(|| async {
-                asset(
-                    "application/json; charset=utf-8",
-                    include_str!("../web/locales/en.json"),
-                )
-            }),
-        )
-        .route(
-            "/assets/yandex.js",
-            get(|| async {
-                asset(
-                    "text/javascript; charset=utf-8",
-                    include_str!("../web/yandex.js"),
-                )
-            }),
-        )
+        .route("/", get(crate::frontend::index))
+        .route("/assets/{*path}", get(crate::frontend::asset))
+        .route("/avatar.jpg", get(crate::frontend::avatar))
+        .route("/avatar.png", get(crate::frontend::avatar))
+        .route("/appearance.js", get(crate::frontend::appearance))
+        .fallback(crate::frontend::not_found)
         .route("/health", get(|| async { "ok" }))
         .route("/api/state", get(get_state))
         .route("/api/preferences", patch(set_preferences))
@@ -147,25 +93,6 @@ async fn protect_api_cache(request: Request, next: Next) -> Response {
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
     response
-}
-
-async fn index() -> Response {
-    let mut response = Html(INDEX_HTML).into_response();
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-    response
-}
-
-fn asset(content_type: &'static str, body: &'static str) -> Response {
-    (
-        [
-            (header::CONTENT_TYPE, content_type),
-            (header::CACHE_CONTROL, "no-cache"),
-        ],
-        body,
-    )
-        .into_response()
 }
 
 // ---- API types ------------------------------------------------------------------------

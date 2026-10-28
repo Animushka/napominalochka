@@ -1,5 +1,14 @@
 # syntax=docker/dockerfile:1
 
+FROM node:24-alpine AS frontend
+WORKDIR /src/frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY frontend ./
+# Tailwind scans the public OAuth/privacy pages as well as the React application.
+COPY src/yandex_web.rs src/privacy.html /src/src/
+RUN npm run build
+
 FROM rust:1-alpine AS dependencies
 RUN apk add --no-cache musl-dev
 WORKDIR /src
@@ -13,8 +22,9 @@ RUN mkdir src && echo 'fn main() {}' > src/main.rs \
 FROM dependencies AS build
 COPY migrations ./migrations
 COPY locales ./locales
-COPY web ./web
 COPY src ./src
+COPY build.rs ./
+COPY --from=frontend /src/frontend/dist ./frontend/dist
 RUN touch src/main.rs && cargo build --release --locked
 
 FROM alpine:3

@@ -12,6 +12,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+const PUBLIC_BUTTON: &str = "inline-flex min-h-10 items-center justify-center rounded-4xl bg-primary px-5 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/80 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring";
+
 pub fn routes() -> Router<Arc<WebState>> {
     Router::new()
         .route("/api/yandex", get(status).put(configure).delete(disconnect))
@@ -252,7 +254,7 @@ async fn callback(
                     lang,
                     title,
                     &format!(
-                        "<p>{text}</p><a class=button href=\"https://t.me/napominalozhka_bot?start=yandex_{}\">{button}</a>",
+                        "<p class=\"text-sm leading-relaxed text-muted-foreground\">{text}</p><a class=\"{PUBLIC_BUTTON}\" href=\"https://t.me/napominalozhka_bot?start=yandex_{}\">{button}</a>",
                         pending.completion_token
                     ),
                 );
@@ -299,24 +301,21 @@ async fn result_page(Query(query): Query<PageQuery>) -> Response {
         language,
         title,
         &format!(
-            "<p>{text}</p><a class=button href=\"https://t.me/napominalozhka_bot\">{button}</a>"
+            "<p class=\"text-sm leading-relaxed text-muted-foreground\">{text}</p><a class=\"{PUBLIC_BUTTON}\" href=\"https://t.me/napominalozhka_bot\">{button}</a>"
         ),
     )
 }
 async fn privacy_page() -> Response {
-    public_page(
-        Lang::Ru,
-        "Данные / Your data",
-        include_str!("../web/privacy.html"),
-    )
+    public_page(Lang::Ru, "Данные / Your data", include_str!("privacy.html"))
 }
 fn public_page(language: Lang, title: &str, body: &str) -> Response {
+    let stylesheets = crate::frontend::stylesheet_links();
     let html = format!(
-        "<!doctype html><html lang=\"{}\"><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><meta name=referrer content=no-referrer><title>{title} · Напоминалочка</title><style>:root{{color-scheme:light dark}}*{{box-sizing:border-box}}body{{margin:0;background:#f6f7ef;color:#24352e;font:17px/1.6 system-ui,sans-serif}}main{{max-width:680px;margin:8vh auto;padding:32px;border-radius:28px;background:#fffdf7}}h1{{font-size:28px;line-height:1.2}}h2{{font-size:20px;margin-top:28px}}a{{color:#316b55}}.button{{display:inline-block;padding:12px 20px;border-radius:16px;background:#d1eddd;text-decoration:none;font-weight:600}}@media(max-width:720px){{main{{margin:20px 12px;padding:24px}}}}@media(prefers-color-scheme:dark){{body{{background:#17231d;color:#e4eee6}}main{{background:#23332b}}a{{color:#b3dfc4}}.button{{background:#345344}}}}</style><main><h1>{title}</h1>{body}</main></html>",
+        r#"<!doctype html><html lang="{}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><meta name="color-scheme" content="light dark"><title>{title} · Напоминалочка</title>{stylesheets}<script src="/appearance.js"></script></head><body class="min-h-dvh bg-background font-sans text-foreground"><main class="mx-auto flex max-w-2xl flex-col gap-6 px-4 py-10 sm:py-16"><article class="space-y-6 rounded-2xl bg-card p-6 text-card-foreground ring-1 ring-foreground/10 sm:p-8"><img src="/avatar.png" alt="Напоминалочка / Napominalochka" width="80" height="80" class="size-20 rounded-full"><h1 class="text-2xl font-semibold tracking-tight">{title}</h1><div class="space-y-6">{body}</div></article></main></body></html>"#,
         language.code()
     );
     let mut response = Html(html).into_response();
-    response.headers_mut().insert("content-security-policy", HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"));
+    response.headers_mut().insert("content-security-policy", HeaderValue::from_static("default-src 'none'; style-src 'self'; font-src 'self'; script-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"));
     response
 }
 
@@ -412,7 +411,12 @@ mod tests {
             .uri("/integrations/yandex/result?outcome=%3Cscript%3Eevil%3C/script%3E&language=en")
             .body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(response.headers().get("content-security-policy").is_some());
+        let policy = response.headers()["content-security-policy"]
+            .to_str()
+            .unwrap();
+        assert!(policy.contains("style-src 'self'"));
+        assert!(policy.contains("script-src 'self'"));
+        assert!(!policy.contains("unsafe-inline"));
         let body = String::from_utf8(
             to_bytes(response.into_body(), 100000)
                 .await
@@ -422,6 +426,9 @@ mod tests {
         .unwrap();
         assert!(body.contains("Could not connect Yandex"));
         assert!(!body.contains("evil"));
+        assert!(body.contains("/appearance.js"));
+        assert!(body.contains("<link rel=\"stylesheet\" href=\"/assets/"));
+        assert!(!body.contains("<style"));
         let response = app()
             .oneshot(
                 Request::builder()

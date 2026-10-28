@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--check-only", action="store_true")
-    parser.add_argument("--photo", type=Path, default=ROOT / "assets/avatar.jpg")
+    parser.add_argument("--photo", type=Path, default=ROOT / "frontend/public/avatar.jpg")
     args = parser.parse_args()
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:

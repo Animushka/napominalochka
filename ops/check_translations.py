@@ -5,7 +5,7 @@ import json
 import re
 
 root = Path(__file__).resolve().parents[1]
-for ru, en in [(root / "locales/bot.ru.json", root / "locales/bot.en.json"), (root / "web/locales/ru.json", root / "web/locales/en.json")]:
+for ru, en in [(root / "locales/bot.ru.json", root / "locales/bot.en.json"), (root / "frontend/src/shared/i18n/messages/ru.json", root / "frontend/src/shared/i18n/messages/en.json")]:
     a, b = json.loads(ru.read_text()), json.loads(en.read_text())
     def flatten(value, prefix=""):
         result = {}

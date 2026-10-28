@@ -1,4 +1,4 @@
-<p align="center"><img src="web/avatar.png" width="160" alt="Napominalochka bell and calendar mascot"></p>
+<p align="center"><img src="frontend/public/avatar.jpg" width="160" alt="Napominalochka bell and calendar mascot"></p>
 <h1 align="center">Napominalochka · Напоминалочка</h1>
 <p align="center">Your little reminder companion.</p>
 <p align="center"><a href="https://t.me/napominalozhka_bot">Open bot</a> · <a href="https://napomni.bot.nu">Mini App</a> · <a href="README.md">Русский</a></p>
@@ -35,15 +35,32 @@ using an environment-provided bot token.
 
 ## Development
 
+Use Node.js 24 and Rust 1.88 or newer. The Mini App uses React, TypeScript,
+Vite, Tailwind and the stock shadcn/ui aria-maia kit. Source lives in
+`frontend/src`, split into `pages`, `features` and `shared`. Build the client
+first: `build.rs` embeds `frontend/dist` into the Rust binary and fails if the
+client is missing. Docker runs both stages automatically.
+
 ```sh
+npm ci --prefix frontend
+npm run build --prefix frontend
+npm run test:unit --prefix frontend
+npx --prefix frontend playwright install chromium
+npm run test:e2e --prefix frontend
 cargo test --locked
 cargo clippy --all-targets --locked -- -D warnings
 cargo fmt --all --check
 python3 ops/check_translations.py
 ```
 
+Run `npm run dev --prefix frontend` for the development UI; `/api` is proxied
+to the Rust server at `127.0.0.1:8080`. Signed Telegram initData is still required.
+Rebuild the frontend after client changes before starting the Rust binary.
+The UI uses the stock theme and Tailwind utilities without application CSS.
+Public OAuth pages and `/privacy` share the generated stylesheet.
+
 Chat catalogues: `locales/bot.{ru,en}.json`. Mini App catalogues:
-`web/locales/{ru,en}.json`. Avatar generated with built-in image_gen; its prompt
+`frontend/src/shared/i18n/messages/{ru,en}.json`. Avatar generated with built-in image_gen; its prompt
 is in `assets/avatar-prompt.txt`.
 
 ## Upstream
@@ -92,6 +109,6 @@ edits preserve the latest schedule, including when it advances while an editor i
 Calendar rules use the same anchors and include DST-gap exceptions for the next two
 years while ordinary recurrence remains unbounded.
 
-The Alice UI lives in `web/yandex.js`; chat and Mini App share the completion/snooze
+The Alice UI lives in `frontend/src/features/alice`; chat and Mini App share the completion/snooze
 service. API errors have stable codes and personal responses use no-store caching.
 Create a consistent SQLite backup before upgrading production.

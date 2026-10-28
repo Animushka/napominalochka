@@ -4,6 +4,7 @@ mod commands;
 mod config;
 mod conversation;
 mod db;
+mod frontend;
 mod i18n;
 mod model;
 mod panels;

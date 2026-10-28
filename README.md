@@ -1,4 +1,4 @@
-<p align="center"><img src="web/avatar.png" width="160" alt="Напоминалочка — колокольчик с календарём и галочкой"></p>
+<p align="center"><img src="frontend/public/avatar.jpg" width="160" alt="Напоминалочка — колокольчик с календарём и галочкой"></p>
 <h1 align="center">Напоминалочка · Napominalochka</h1>
 <p align="center">Важное — вовремя. Your little reminder companion.</p>
 <p align="center"><a href="https://t.me/napominalozhka_bot">Открыть бота / Open bot</a> · <a href="https://napomni.bot.nu">Mini App</a> · <a href="README.en.md">English</a></p>
@@ -45,15 +45,33 @@ docker compose ps
 
 ## Разработка
 
+Нужны Node.js 24 и Rust 1.88 или новее. Mini App использует React, TypeScript,
+Vite, Tailwind и готовые компоненты shadcn/ui (aria-maia). Исходники лежат в
+`frontend/src`: запуск в `app`, страницы в `pages`, функции в `features`,
+состояние напоминаний в `entities`, общий код в `shared`.
+Сначала соберите клиент: `build.rs` встраивает `frontend/dist` в бинарный файл
+и останавливает сборку, если клиент ещё не собран. Docker выполняет оба этапа сам.
+
 ```sh
+npm ci --prefix frontend
+npm run build --prefix frontend
+npm run test:unit --prefix frontend
+npx --prefix frontend playwright install chromium
+npm run test:e2e --prefix frontend
 cargo test --locked
 cargo clippy --all-targets --locked -- -D warnings
 cargo fmt --all --check
 python3 ops/check_translations.py
 ```
 
+Для локального интерфейса: `npm run dev --prefix frontend`; запросы `/api`
+передаются на Rust-сервер `127.0.0.1:8080`. Проверка initData остаётся обязательной.
+После изменения клиента перед запуском бинарного файла снова соберите `frontend`.
+Дизайн использует готовую тему и Tailwind utilities; отдельные стили приложения
+не добавляются. Публичные OAuth-страницы и `/privacy` используют тот же CSS.
+
 Переводы чата: `locales/bot.ru.json`, `locales/bot.en.json`.
-Переводы Mini App: `web/locales/ru.json`, `web/locales/en.json`.
+Переводы Mini App: `frontend/src/shared/i18n/messages/ru.json`, `frontend/src/shared/i18n/messages/en.json`.
 Аватар создан встроенной image_gen; промпт сохранён в `assets/avatar-prompt.txt`.
 
 ## Оригинал
@@ -109,6 +127,6 @@ python3 ops/check_translations.py
 переводе часов времени включаются на ближайшие два года. Обычное правило повторения
 не ограничено сроком.
 
-Экран Алисы отделён в `web/yandex.js`; действия чата и Mini App используют общий
+Экран Алисы отделён в `frontend/src/features/alice`; действия чата и Mini App используют общий
 сервис выполнения и откладывания. Ошибки API имеют стабильные коды, ответы с личными
 данными не кешируются. Перед обновлением рабочей базы нужна согласованная копия SQLite.
