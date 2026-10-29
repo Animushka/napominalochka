@@ -1,11 +1,11 @@
 import { useRef, useState, type FormEvent } from 'react';
-import { ArrowLeft, ChevronDown, ChevronUp, Repeat2, Save, Trash2 } from 'lucide-react';
-import type { Recurrence, ReminderDTO } from '@/shared/api/contracts';
+import { ArrowLeft, ChevronDown, ChevronUp, Repeat2, Save, SlidersHorizontal, Trash2 } from 'lucide-react';
+import type { Recurrence, ReminderDTO, ReminderSettings } from '@/shared/api/contracts';
 import { errorKey } from '@/shared/api';
 import { useI18n } from '@/shared/i18n';
 import { atTime, formatLocal, parseLocal, quickChoices } from '@/shared/lib/date';
 import { confirmAction, haptic, useTelegramButtons } from '@/shared/lib/telegram';
-import { AppSelect, Button, Card, CardContent, Input, Label, Textarea } from '@/shared/ui';
+import { AppSelect, Button, Card, CardContent, Input, Label, Switch, Textarea } from '@/shared/ui';
 import { isMissingReminder, useReminderState, type ReminderInput } from '@/entities/reminder';
 
 const recurrences: Recurrence[] = ['once', 'daily', 'weekdays', 'weekly', 'monthly', 'yearly'];
@@ -24,11 +24,19 @@ export function ReminderEditor({ reminder, onClose, onSaved }: ReminderEditorPro
     reminder: reminder ? { ...reminder, at: reminder.at.slice(0, 16) } : null,
     now: state?.now || '',
     timezone: state?.timezone || '',
+    settings: {
+      nag_interval_minutes: reminder?.settings?.nag_interval_minutes ?? null,
+      confirmation_check_minutes: reminder?.settings?.confirmation_check_minutes ?? null,
+      voice_enabled: reminder?.settings?.voice_enabled ?? true,
+    } as ReminderSettings,
   }));
   const [description, setDescription] = useState(snapshot.reminder?.description || '');
   const [at, setAt] = useState(() => snapshot.reminder?.at || formatLocal(atTime(parseLocal(snapshot.now), 9, 0, 1)));
   const [recurrence, setRecurrence] = useState<Recurrence>(snapshot.reminder?.recurrence || 'once');
   const [repeatOpen, setRepeatOpen] = useState(recurrence !== 'once');
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settings, setSettings] = useState<ReminderSettings>(snapshot.settings);
+  const customSettings = settings.nag_interval_minutes !== null || settings.confirmation_check_minutes !== null || !settings.voice_enabled;
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const locked = useRef(false);
@@ -45,6 +53,9 @@ export function ReminderEditor({ reminder, onClose, onSaved }: ReminderEditorPro
   async function save() {
     if (locked.current || isMutating) return;
     const input: ReminderInput = { description: description.trim(), at, recurrence };
+    if (settings.nag_interval_minutes !== snapshot.settings.nag_interval_minutes
+      || settings.confirmation_check_minutes !== snapshot.settings.confirmation_check_minutes
+      || settings.voice_enabled !== snapshot.settings.voice_enabled) input.settings = settings;
     if (!input.description) return showError('errors.descriptionRequired');
     if (Array.from(input.description).length > 1000) return showError('errors.descriptionTooLong');
     if (!date || !time || !Number.isFinite(parseLocal(at).getTime())) return showError('errors.dateRequired');
@@ -135,6 +146,47 @@ export function ReminderEditor({ reminder, onClose, onSaved }: ReminderEditorPro
             <span className="flex items-center gap-2 text-muted-foreground">{t(`repeat.${recurrence}`)}{repeatOpen ? <ChevronUp aria-hidden="true" /> : <ChevronDown aria-hidden="true" />}</span>
           </Button>
           {repeatOpen && <div id="repeat-controls"><AppSelect id="repeat" ariaLabel={t('form.repeat')} value={recurrence} disabled={busy} onValueChange={(value) => { setRecurrence(value as Recurrence); setError(null); haptic(); }} options={recurrences.map((value) => ({ value, label: t(`repeat.${value}`) }))} /></div>}
+        </CardContent>
+      </Card>
+      <Card className="py-0">
+        <CardContent className="space-y-3 p-5">
+          <Button type="button" variant="ghost" className="h-auto min-h-10 w-full justify-between whitespace-normal text-left" isDisabled={busy || isMutating}
+            aria-expanded={settingsOpen} aria-controls="reminder-settings" onPress={() => setSettingsOpen((previous) => !previous)}>
+            <span className="flex items-center gap-2"><SlidersHorizontal aria-hidden="true" />{t('reminderSettings.title')}</span>
+            <span className="flex items-center gap-2 text-xs text-muted-foreground">{t(customSettings ? 'reminderSettings.custom' : 'reminderSettings.default')}
+              {settingsOpen ? <ChevronUp aria-hidden="true" /> : <ChevronDown aria-hidden="true" />}
+            </span>
+          </Button>
+          {settingsOpen && <div id="reminder-settings" className="space-y-5 pt-2">
+            <p className="text-sm text-muted-foreground">{t('reminderSettings.help')}</p>
+            <div className="space-y-2">
+              <Label htmlFor="reminder-nag-interval">{t('reminderSettings.interval')}</Label>
+              <AppSelect id="reminder-nag-interval" ariaLabel={t('reminderSettings.interval')}
+                value={settings.nag_interval_minutes === null ? 'default' : String(settings.nag_interval_minutes)} disabled={busy || isMutating}
+                onValueChange={(value) => setSettings((previous) => ({ ...previous, nag_interval_minutes: value === 'default' ? null : Number(value) }))}
+                options={[{ value: 'default', label: t('reminderSettings.inheritInterval', { interval: t(`interval.${state?.nag_interval_minutes || 10}`) }) },
+                  ...[1, 5, 10, 20, 30, 60].map((value) => ({ value: String(value), label: t(`interval.${value}`) }))]} />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="reminder-confirmation">{t('reminderSettings.check')}</Label>
+              <AppSelect id="reminder-confirmation" ariaLabel={t('reminderSettings.check')}
+                value={settings.confirmation_check_minutes === null ? 'default' : String(settings.confirmation_check_minutes)} disabled={busy || isMutating}
+                onValueChange={(value) => setSettings((previous) => ({ ...previous, confirmation_check_minutes: value === 'default' ? null : Number(value) }))}
+                options={[
+                  { value: 'default', label: t('reminderSettings.inheritCheck', { setting: t(state?.confirmation_check_minutes === 20 ? 'reminderSettings.checkOn' : 'reminderSettings.checkOff') }) },
+                  { value: '0', label: t('reminderSettings.checkOff') }, { value: '20', label: t('reminderSettings.checkOn') },
+                ]} />
+            </div>
+            <div className="flex items-start justify-between gap-4">
+              <div className="space-y-2">
+                <Label htmlFor="reminder-voice">{t('reminderSettings.voice')}</Label>
+                <p id="reminder-voice-help" className="text-sm text-muted-foreground">{t('reminderSettings.voiceHelp')}</p>
+              </div>
+              <Switch id="reminder-voice" aria-label={t('reminderSettings.voice')} aria-describedby="reminder-voice-help"
+                isSelected={settings.voice_enabled} isDisabled={busy || isMutating}
+                onChange={(voice_enabled) => setSettings((previous) => ({ ...previous, voice_enabled }))} />
+            </div>
+          </div>}
         </CardContent>
       </Card>
       {error && <p role="alert" className="text-sm text-destructive">{t(error)}</p>}

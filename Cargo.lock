@@ -627,6 +627,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "form_urlencoded",
+ "futures-util",
  "getrandom 0.4.3",
  "hex",
  "hmac",

@@ -2,6 +2,26 @@ export type Lang = "ru" | "en";
 export type Recurrence = "once" | "daily" | "weekdays" | "weekly" | "monthly" | "yearly";
 export type SnoozeDuration = "10m" | "1h" | "tomorrow";
 
+export interface ReminderSettings {
+  nag_interval_minutes: number | null;
+  confirmation_check_minutes: number | null;
+  voice_enabled: boolean;
+}
+
+export interface CompletionDTO {
+  id: number;
+  description: string;
+  scheduled_at: string | null;
+  completed_at: string;
+  undone_at: string | null;
+  can_undo: boolean;
+}
+
+export interface HistoryPageDTO {
+  items: CompletionDTO[];
+  next_cursor: number | null;
+}
+
 export interface ReminderDTO {
   id: number;
   description: string;
@@ -10,6 +30,7 @@ export interface ReminderDTO {
   when: string;
   relative: string;
   repeat: string;
+  settings?: ReminderSettings;
 }
 
 export interface PendingDTO {

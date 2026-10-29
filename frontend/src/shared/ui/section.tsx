@@ -8,17 +8,18 @@ export interface SectionProps {
   icon?: ReactNode;
   children: ReactNode;
   defaultOpen?: boolean;
+  open?: boolean;
   onOpenChange?: (open: boolean) => void;
   id?: string;
   "data-testid"?: string;
   className?: string;
 }
 
-export function Section({ title, description, icon, children, defaultOpen = false, onOpenChange, id, className, ...props }: SectionProps) {
+export function Section({ title, description, icon, children, defaultOpen = false, open, onOpenChange, id, className, ...props }: SectionProps) {
   const sectionKey = useId();
   return (
     <Card id={id} data-testid={props["data-testid"]} className={className ? `gap-0 py-0 ${className}` : "gap-0 py-0"}>
-      <Accordion defaultExpandedKeys={defaultOpen ? [sectionKey] : []} onExpandedChange={(keys) => onOpenChange?.(keys.has(sectionKey))} className="border-0">
+      <Accordion {...(open === undefined ? { defaultExpandedKeys: defaultOpen ? [sectionKey] : [] } : { expandedKeys: open ? [sectionKey] : [] })} onExpandedChange={(keys) => onOpenChange?.(keys.has(sectionKey))} className="border-0">
         <AccordionItem id={sectionKey}>
           <AccordionTrigger className="items-center p-5">
             <span className="flex min-w-0 items-center gap-3">

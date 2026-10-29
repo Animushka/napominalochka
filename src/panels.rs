@@ -8,7 +8,7 @@ use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 use crate::callback::{Action, Subject};
 use crate::i18n::Lang;
 use crate::model::Snooze;
-use crate::model::{Recurrence, Reminder, User};
+use crate::model::{Recurrence, Reminder, ReminderTime, User, UserTz};
 
 pub struct Panel {
     pub text: String,
@@ -17,8 +17,9 @@ pub struct Panel {
 
 /// How far ahead the calendar can be paged.
 const MAX_MONTHS_AHEAD: u32 = 60;
-/// Most reminders shown (with buttons) by `/list`; Telegram limits keyboard size.
-const MAX_LISTED: usize = 30;
+/// Keep each page comfortably within Telegram's 4096 UTF-16-unit text budget.
+const LIST_PAGE_SIZE: usize = 10;
+const LIST_PREVIEW_UNITS: usize = 120;
 
 fn button(label: impl Into<String>, action: Action) -> InlineKeyboardButton {
     InlineKeyboardButton::callback(label, action.encode())
@@ -58,7 +59,37 @@ fn back_or_cancel(lang: Lang, subject: Subject, back: Action) -> Vec<InlineKeybo
 
 /// Step 1: quick choices.
 pub fn when_lang(subject: Subject, text: &str, now: NaiveDateTime, lang: Lang) -> Panel {
-    let in_minutes = |m: i64| truncate_to_minute(now + Duration::minutes(m));
+    when_inner(subject, text, now, None, lang)
+}
+
+/// Real chat flows retain the current instant for elapsed quick choices across DST.
+pub fn when_at_lang(
+    subject: Subject,
+    text: &str,
+    now: DateTime<Utc>,
+    tz: UserTz,
+    lang: Lang,
+) -> Panel {
+    when_inner(subject, text, tz.local(now), Some(now), lang)
+}
+
+fn when_inner(
+    subject: Subject,
+    text: &str,
+    now: NaiveDateTime,
+    instant: Option<DateTime<Utc>>,
+    lang: Lang,
+) -> Panel {
+    let in_minutes = |m: i64| match instant {
+        Some(now) => Action::AtInstant(
+            subject,
+            now.checked_add_signed(Duration::minutes(m)).unwrap_or(now),
+        ),
+        None => Action::At(
+            subject,
+            truncate_to_minute(now.checked_add_signed(Duration::minutes(m)).unwrap_or(now)),
+        ),
+    };
     let today = now.date();
     let evening = today.and_time(time(20, 0));
     let (evening_label, evening) = if now < evening - Duration::minutes(30) {
@@ -73,18 +104,9 @@ pub fn when_lang(subject: Subject, text: &str, now: NaiveDateTime, lang: Lang) -
 
     let mut rows = vec![
         vec![
-            button(
-                lang.text("button.fifteen"),
-                Action::At(subject, in_minutes(15)),
-            ),
-            button(
-                lang.text("button.hour"),
-                Action::At(subject, in_minutes(60)),
-            ),
-            button(
-                lang.text("button.three_hours"),
-                Action::At(subject, in_minutes(180)),
-            ),
+            button(lang.text("button.fifteen"), in_minutes(15)),
+            button(lang.text("button.hour"), in_minutes(60)),
+            button(lang.text("button.three_hours"), in_minutes(180)),
         ],
         vec![
             button(evening_label, Action::At(subject, evening)),
@@ -281,7 +303,44 @@ pub fn minutes_lang(
 
 /// Final step: how often. Tapping an option saves the reminder.
 pub fn repeat_lang(subject: Subject, text: &str, at: NaiveDateTime, lang: Lang) -> Panel {
-    let option = |label: String, r: Recurrence| button(label, Action::Save(subject, at, r));
+    repeat_inner(subject, text, at, None, lang)
+}
+
+pub fn repeat_time_lang(
+    subject: Subject,
+    text: &str,
+    at: ReminderTime,
+    tz: UserTz,
+    lang: Lang,
+) -> Panel {
+    repeat_inner(
+        subject,
+        text,
+        at.local(tz),
+        match at {
+            ReminderTime::Instant(at) => Some(at),
+            ReminderTime::Local(_) => None,
+        },
+        lang,
+    )
+}
+
+fn repeat_inner(
+    subject: Subject,
+    text: &str,
+    at: NaiveDateTime,
+    instant: Option<DateTime<Utc>>,
+    lang: Lang,
+) -> Panel {
+    let option = |label: String, r: Recurrence| {
+        button(
+            label,
+            match instant {
+                Some(at) => Action::SaveInstant(subject, at, r),
+                None => Action::Save(subject, at, r),
+            },
+        )
+    };
     let mut rows = vec![
         vec![
             option(lang.text("repeat.once"), Recurrence::Once),
@@ -388,40 +447,88 @@ pub fn manage_lang(reminder: &Reminder, user: &User, now: DateTime<Utc>, lang: L
 }
 
 pub fn list_lang(reminders: &[Reminder], user: &User, lang: Lang) -> Panel {
+    list_page_lang(reminders, user, 0, lang)
+}
+
+/// Stateless pages keep old `list` callbacks valid and never expose another user's ids:
+/// callers supply only reminders already loaded through the owner-scoped service.
+pub fn list_page_lang(reminders: &[Reminder], user: &User, page: usize, lang: Lang) -> Panel {
     if reminders.is_empty() {
         return Panel {
             text: lang.text("list.empty"),
             keyboard: InlineKeyboardMarkup::default(),
         };
     }
-
+    let last_page = (reminders.len() - 1) / LIST_PAGE_SIZE;
+    let page = page.min(last_page);
+    let start = page * LIST_PAGE_SIZE;
     let mut text = lang.render("list.heading", &[("timezone", user.tz.to_string())]);
     let mut rows = Vec::new();
-    for (index, reminder) in reminders.iter().take(MAX_LISTED).enumerate() {
+    for (offset, reminder) in reminders
+        .iter()
+        .skip(start)
+        .take(LIST_PAGE_SIZE)
+        .enumerate()
+    {
+        let index = start + offset + 1;
         let local = user.tz.local(reminder.due_at);
         text.push_str(&format!(
-            "\n{}. {}\n    {} · {}",
-            index + 1,
-            reminder.description,
+            "\n{index}. {}\n    {} · {}",
+            truncate_units(&reminder.description, LIST_PREVIEW_UNITS),
             lang.date(local),
             lang.recurrence(reminder.recurrence, reminder.anchor_local.unwrap_or(local))
         ));
         rows.push(vec![button(
-            format!("{}. {}", index + 1, truncate(&reminder.description, 40)),
+            format!("{index}. {}", truncate(&reminder.description, 40)),
             Action::Manage(reminder.id),
         )]);
     }
-    if reminders.len() > MAX_LISTED {
+    if last_page > 0 {
         text.push_str(&lang.render(
-            "list.more",
-            &[("count", (reminders.len() - MAX_LISTED).to_string())],
+            "list.page",
+            &[
+                ("page", (page + 1).to_string()),
+                ("pages", (last_page + 1).to_string()),
+            ],
         ));
+        let mut navigation = Vec::new();
+        if page > 0 {
+            navigation.push(button(
+                lang.text("list.previous"),
+                Action::ListPage(page - 1),
+            ));
+        }
+        if page < last_page {
+            navigation.push(button(lang.text("list.next"), Action::ListPage(page + 1)));
+        }
+        rows.push(navigation);
     }
     text.push_str(&lang.text("list.hint"));
+    debug_assert!(
+        text.encode_utf16().count() <= 4096,
+        "list page exceeds Telegram's message budget"
+    );
     Panel {
         text,
         keyboard: InlineKeyboardMarkup::new(rows),
     }
+}
+
+fn truncate_units(text: &str, max_units: usize) -> String {
+    if text.encode_utf16().count() <= max_units {
+        return text.to_owned();
+    }
+    let mut units = 0;
+    let mut truncated = String::new();
+    for ch in text.chars() {
+        if units + ch.len_utf16() >= max_units {
+            break;
+        }
+        units += ch.len_utf16();
+        truncated.push(ch);
+    }
+    truncated.push('…');
+    truncated
 }
 
 fn time(hour: u32, minute: u32) -> NaiveTime {
@@ -461,6 +568,29 @@ pub fn nag_keyboard_lang(nagging_id: i64, lang: crate::i18n::Lang) -> InlineKeyb
             ),
         ],
     ])
+}
+
+pub fn completion_keyboard_lang(completion_id: i64, lang: Lang) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new([[button(
+        lang.text("button.undo_completion"),
+        Action::UndoCompletion(completion_id),
+    )]])
+}
+
+/// A legacy check has no journal entry to restore. New checks refer to a durable
+/// completion even after the delivery queue removes its successfully sent row.
+pub fn confirmation_keyboard_lang(completion_id: Option<i64>, lang: Lang) -> InlineKeyboardMarkup {
+    let mut rows = vec![vec![InlineKeyboardButton::callback(
+        lang.text("check.ack"),
+        "check:ok",
+    )]];
+    if let Some(id) = completion_id {
+        rows.push(vec![button(
+            lang.text("check.retry"),
+            Action::UndoCompletion(id),
+        )]);
+    }
+    InlineKeyboardMarkup::new(rows)
 }
 
 #[allow(dead_code)]
@@ -623,5 +753,88 @@ mod tests {
         assert_eq!(relative(t, t + Duration::minutes(200)), "in 3 h 20 min");
         assert_eq!(relative(t, t + Duration::hours(2)), "in 2 h");
         assert_eq!(relative(t, t + Duration::days(4)), "in 4 days");
+    }
+    #[test]
+    fn list_pages_fit_telegram_and_reach_every_reminder() {
+        let user = User {
+            id: 7,
+            first_name: "Ada".into(),
+            last_name: String::new(),
+            tz: UserTz::parse("UTC").unwrap(),
+        };
+        let reminders: Vec<_> = (1..=37)
+            .map(|id| Reminder {
+                id,
+                user_id: user.id,
+                description: "💛".repeat(1000),
+                due_at: local(2026, 10, 30, 9, 0).and_utc(),
+                recurrence: Recurrence::Daily,
+                anchor_local: None,
+                settings: Default::default(),
+            })
+            .collect();
+        for lang in [Lang::Ru, Lang::En] {
+            let mut reachable = Vec::new();
+            for page in 0..4 {
+                let panel = list_page_lang(&reminders, &user, page, lang);
+                assert!(panel.text.encode_utf16().count() <= 4096);
+                let page_actions = actions(&panel);
+                reachable.extend(page_actions.iter().filter_map(|a| match a {
+                    Action::Manage(id) => Some(*id),
+                    _ => None,
+                }));
+                if page < 3 {
+                    assert!(page_actions.contains(&Action::ListPage(page + 1)));
+                }
+                if page > 0 {
+                    assert!(page_actions.contains(&Action::ListPage(page - 1)));
+                }
+            }
+            assert_eq!(reachable, (1..=37).collect::<Vec<_>>());
+            let stale = list_page_lang(&reminders, &user, usize::MAX, lang);
+            assert!(actions(&stale).contains(&Action::Manage(37)));
+        }
+    }
+
+    #[test]
+    fn elapsed_quick_choices_keep_utc_across_the_repeated_hour() {
+        let tz = UserTz::parse("Europe/London").unwrap();
+        let now = local(2026, 10, 25, 0, 30).and_utc();
+        let panel = when_at_lang(Subject::Draft(1), "pills", now, tz, Lang::En);
+        assert!(actions(&panel).contains(&Action::AtInstant(
+            Subject::Draft(1),
+            now + Duration::hours(1)
+        )));
+        let repeat = repeat_time_lang(
+            Subject::Draft(1),
+            "pills",
+            ReminderTime::Instant(now + Duration::hours(1)),
+            tz,
+            Lang::En,
+        );
+        assert!(actions(&repeat).contains(&Action::SaveInstant(
+            Subject::Draft(1),
+            now + Duration::hours(1),
+            Recurrence::Once
+        )));
+    }
+    #[test]
+    fn completion_controls_refer_to_durable_history_and_legacy_checks_stay_compatible() {
+        for lang in [Lang::Ru, Lang::En] {
+            let undo = completion_keyboard_lang(42, lang);
+            assert_eq!(undo.inline_keyboard.len(), 1);
+            let check = confirmation_keyboard_lang(Some(42), lang);
+            assert_eq!(check.inline_keyboard.len(), 2);
+            assert_eq!(check.inline_keyboard[0][0].text, lang.text("check.ack"));
+            assert_eq!(check.inline_keyboard[1][0].text, lang.text("check.retry"));
+            let panel = Panel {
+                text: String::new(),
+                keyboard: check,
+            };
+            assert_eq!(actions(&panel), vec![Action::UndoCompletion(42)]);
+            let legacy = confirmation_keyboard_lang(None, lang);
+            assert_eq!(legacy.inline_keyboard.len(), 1);
+            assert_eq!(legacy.inline_keyboard[0][0].text, lang.text("check.ack"));
+        }
     }
 }

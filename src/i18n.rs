@@ -66,6 +66,7 @@ impl Lang {
         match error {
             service::Error::NotRegistered => self.text("error.register"),
             service::Error::NotFound => self.text("error.missing"),
+            service::Error::CompletionUnavailable => self.text("undo.unavailable"),
             service::Error::Input(error) => self.input_error(error),
             service::Error::InvalidPreferences(_) => self.text("error.preferences"),
             service::Error::Internal(_) => self.text("error.internal"),

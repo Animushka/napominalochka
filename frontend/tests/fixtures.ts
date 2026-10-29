@@ -1,9 +1,9 @@
 import { expect, type Page, type Route } from '@playwright/test'
-import type { AppStateDTO, Scenario, YandexStatus } from '../src/shared/api/contracts'
+import type { AppStateDTO, CompletionDTO, PendingDTO, Scenario, YandexStatus } from '../src/shared/api/contracts'
 
 type Reply = { status?: number; body?: unknown; abort?: boolean; settled?: () => void }
 type Override = () => Reply | Promise<Reply>
-export interface ApiCall { method: string; path: string; body: any; authorization: string | undefined }
+export interface ApiCall { method: string; path: string; body: any; authorization: string | undefined; query?: string }
 const clone = <T>(value: T): T => structuredClone(value)
 
 export function stateFixture(): AppStateDTO {
@@ -23,6 +23,8 @@ export class MockApp {
     { id: 'speaker-b', name: 'Office reminder', is_active: true },
     { id: 'inactive', name: 'Inactive scenario', is_active: false },
   ]
+  history: CompletionDTO[] = []
+  private completed = new Map<number, PendingDTO>()
   calls: ApiCall[] = []
   unexpected: string[] = []
   pageErrors: string[] = []
@@ -94,7 +96,7 @@ export class MockApp {
       if (!url.pathname.startsWith('/api/')) { await route.continue(); return }
       const request = route.request()
       const networkSettled = request.response().then((response) => response?.finished()).catch(() => undefined)
-      const call = { method: request.method(), path: url.pathname, body: request.postDataJSON(), authorization: request.headers().authorization }
+      const call = { method: request.method(), path: url.pathname, query: url.search, body: request.postDataJSON(), authorization: request.headers().authorization }
       this.calls.push(call)
       const key = `${call.method} ${call.path}`
       const override = this.overrides.get(key)?.shift()
@@ -115,12 +117,38 @@ export class MockApp {
     await route.fulfill({ status: reply.status ?? 200, contentType: 'application/json', body: JSON.stringify(reply.body ?? {}) })
   }
 
-  private respond({ method, path, body }: ApiCall): Reply {
+  private respond({ method, path, body, query }: ApiCall): Reply {
     if (method === 'GET' && path === '/api/state') return { body: clone(this.state) }
     if (method === 'PATCH' && path === '/api/preferences') { this.state = { ...this.state, ...body }; return { body: clone(this.state) } }
     if (method === 'PUT' && path === '/api/timezone') { this.state.timezone = body.timezone; this.state.timezone_id = body.timezone; return { body: clone(this.state) } }
     if (method === 'POST' && /^\/api\/pending\/\d+\/done$/.test(path)) {
+      const pending = this.state.pending.find((item) => item.id === Number(path.split('/')[3]))
+      if (pending) {
+        const id = Math.max(0, ...this.history.map((item) => item.id)) + 1
+        this.history.unshift({ id, description: pending.description, scheduled_at: pending.next_at,
+          completed_at: this.state.now || '2026-10-28T12:00:00', undone_at: null, can_undo: true })
+        this.completed.set(id, clone(pending))
+      }
       this.state.pending = this.state.pending.filter((item) => item.id !== Number(path.split('/')[3])); return { body: clone(this.state) }
+    }
+    if (method === 'GET' && path === '/api/history') {
+      const params = new URLSearchParams(query)
+      const before = params.has('before') ? Number(params.get('before')) : Infinity
+      const limit = Math.min(20, Math.max(1, Number(params.get('limit') || 20)))
+      const remaining = this.history.filter((item) => item.id < before).sort((a, b) => b.id - a.id)
+      const items = remaining.slice(0, limit)
+      return { body: { items: clone(items), next_cursor: remaining.length > limit ? items.at(-1)!.id : null } }
+    }
+    if (method === 'POST' && /^\/api\/history\/\d+\/undo$/.test(path)) {
+      const id = Number(path.split('/')[3]); const item = this.history.find((entry) => entry.id === id)
+      if (!item) return { status: 404, body: { code: 'completion_not_found' } }
+      if (item.undone_at) return { body: clone(this.state) }
+      if (!item.can_undo) return { status: 409, body: { code: 'completion_unavailable' } }
+      item.undone_at = this.state.now || '2026-10-28T12:00:00'; item.can_undo = false
+      const previous = this.completed.get(id)
+      this.state.pending.push({ id: 1000 + id, reminder_id: previous?.reminder_id ?? null,
+        description: item.description, next_at: '2026-10-28T12:10:00', next_when: '', relative: '' })
+      return { body: clone(this.state) }
     }
     if (method === 'POST' && /^\/api\/pending\/\d+\/snooze$/.test(path)) {
       const pending = this.state.pending.find((item) => item.id === Number(path.split('/')[3]))!

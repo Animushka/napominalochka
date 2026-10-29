@@ -254,8 +254,8 @@ async fn callback(
                     lang,
                     title,
                     &format!(
-                        "<p class=\"text-sm leading-relaxed text-muted-foreground\">{text}</p><a class=\"{PUBLIC_BUTTON}\" href=\"https://t.me/napominalozhka_bot?start=yandex_{}\">{button}</a>",
-                        pending.completion_token
+                        "<p class=\"text-sm leading-relaxed text-muted-foreground\">{text}</p><a class=\"{PUBLIC_BUTTON}\" href=\"{}\">{button}</a>",
+                        telegram_link(&state.bot_username, Some(&pending.completion_token))
                     ),
                 );
             }
@@ -272,7 +272,10 @@ struct PageQuery {
     language: Option<String>,
     outcome: Option<String>,
 }
-async fn result_page(Query(query): Query<PageQuery>) -> Response {
+async fn result_page(
+    State(state): State<Arc<WebState>>,
+    Query(query): Query<PageQuery>,
+) -> Response {
     let language = Lang::parse(query.language.as_deref().unwrap_or("ru"));
     let (title, text) = match (language, query.outcome.as_deref()) {
         (Lang::Ru, Some("cancelled")) => (
@@ -301,10 +304,23 @@ async fn result_page(Query(query): Query<PageQuery>) -> Response {
         language,
         title,
         &format!(
-            "<p class=\"text-sm leading-relaxed text-muted-foreground\">{text}</p><a class=\"{PUBLIC_BUTTON}\" href=\"https://t.me/napominalozhka_bot\">{button}</a>"
+            "<p class=\"text-sm leading-relaxed text-muted-foreground\">{text}</p><a class=\"{PUBLIC_BUTTON}\" href=\"{}\">{button}</a>",
+            telegram_link(&state.bot_username, None)
         ),
     )
 }
+fn telegram_link(username: &str, receipt: Option<&str>) -> String {
+    let mut url = url::Url::parse("https://t.me/").expect("valid Telegram base URL");
+    url.path_segments_mut()
+        .expect("Telegram URL has a path")
+        .push(username);
+    if let Some(receipt) = receipt {
+        url.query_pairs_mut()
+            .append_pair("start", &format!("yandex_{receipt}"));
+    }
+    url.into()
+}
+
 async fn privacy_page() -> Response {
     public_page(Lang::Ru, "Данные / Your data", include_str!("privacy.html"))
 }
@@ -333,9 +349,24 @@ mod tests {
         crate::web::router(Arc::new(WebState {
             service: Service::new(Db::open_in_memory().unwrap()),
             bot_token: "123456:test-token".into(),
+            bot_username: "custom_reminder_bot".into(),
+            health: crate::health::Health::new(),
             web_app_url: Some(url::Url::parse("https://example.com").unwrap()),
             yandex: None,
         }))
+    }
+
+    #[test]
+    fn telegram_links_use_the_current_bot_and_encode_receipts() {
+        let receipt = "a".repeat(48);
+        assert_eq!(
+            telegram_link("another_bot", Some(&receipt)),
+            format!("https://t.me/another_bot?start=yandex_{receipt}")
+        );
+        assert_eq!(
+            telegram_link("another_bot", None),
+            "https://t.me/another_bot"
+        );
     }
 
     #[tokio::test]
@@ -425,6 +456,8 @@ mod tests {
         )
         .unwrap();
         assert!(body.contains("Could not connect Yandex"));
+        assert!(body.contains("https://t.me/custom_reminder_bot"));
+        assert!(!body.contains("https://t.me/napominalozhka_bot"));
         assert!(!body.contains("evil"));
         assert!(body.contains("/appearance.js"));
         assert!(body.contains("<link rel=\"stylesheet\" href=\"/assets/"));

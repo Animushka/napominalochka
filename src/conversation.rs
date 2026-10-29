@@ -10,7 +10,7 @@ use url::Url;
 use crate::calendar;
 use crate::callback::{Action, Subject};
 use crate::i18n::Lang;
-use crate::model::{InputError, User, UserTz};
+use crate::model::{InputError, ReminderTime, User, UserTz};
 use crate::panels::{self, Panel};
 use crate::service::{self, Profile, Service};
 use crate::time_input;
@@ -156,7 +156,8 @@ pub async fn on_text(
         && let Some(at) = time_input::parse(text, user.tz, now)
     {
         return Ok(vec![
-            panels::repeat_lang(Subject::Draft(draft.id), &draft.text, at, lang).into(),
+            panels::repeat_time_lang(Subject::Draft(draft.id), &draft.text, at, user.tz, lang)
+                .into(),
         ]);
     }
     start_reminder(service, &user, text, now).await
@@ -172,13 +173,7 @@ pub async fn start_reminder(
     let lang = language(service, user.id).await?;
     let draft = service.start_draft(user.id, text, now).await?;
     Ok(vec![
-        panels::when_lang(
-            Subject::Draft(draft.id),
-            &draft.text,
-            user.tz.local(now),
-            lang,
-        )
-        .into(),
+        panels::when_at_lang(Subject::Draft(draft.id), &draft.text, now, user.tz, lang).into(),
     ])
 }
 
@@ -322,6 +317,9 @@ pub async fn on_callback(
             crate::i18n::Lang::parse(&service.preferences(user_id).await?.language)
                 .text("error.preferences"),
         )),
+        Err(service::Error::CompletionUnavailable) => {
+            Ok(CallbackReply::toast(lang.text("undo.unavailable")))
+        }
         Err(service::Error::Internal(error)) => Err(error),
     }
 }
@@ -354,10 +352,43 @@ async fn handle_action(
         }
         Action::Done(id) | Action::LegacyNaggingAck(id) => {
             return Ok(if service.done_at(user_id, id, now).await? {
-                CallbackReply::finish(format!("✅ {nag_text}"), Some(&lang.text("done.toast")))
+                let keyboard = match service.completion_for_source(user_id, id).await {
+                    Ok(Some(completion)) if completion.can_undo => {
+                        panels::completion_keyboard_lang(completion.id, lang)
+                    }
+                    Ok(_) => InlineKeyboardMarkup::default(),
+                    Err(error) => {
+                        // The completion succeeded. A failed optional UI read must not
+                        // turn that success into a request to complete it again.
+                        tracing::warn!(?error, user_id, "could not load completion undo button");
+                        InlineKeyboardMarkup::default()
+                    }
+                };
+                CallbackReply {
+                    toast: Some(lang.text("done.toast")),
+                    edit: Some(Panel {
+                        text: format!("✅ {nag_text}"),
+                        keyboard,
+                    }),
+                }
             } else {
                 already_done()
             });
+        }
+        Action::UndoCompletion(id) => {
+            let restored = service.undo_completion(user_id, id, now).await?;
+            return Ok(CallbackReply::finish(
+                lang.text(if restored {
+                    "undo.restored_message"
+                } else {
+                    "undo.already_message"
+                }),
+                Some(&lang.text(if restored {
+                    "undo.toast"
+                } else {
+                    "undo.already"
+                })),
+            ));
         }
         Action::LegacyReminderAck(id) => {
             return Ok(if service.done_legacy(user_id, id).await? {
@@ -389,7 +420,7 @@ async fn handle_action(
 
         Action::When(subject) => {
             let text = subject_text(service, user_id, subject).await?;
-            CallbackReply::edit(panels::when_lang(subject, &text, now_local, lang))
+            CallbackReply::edit(panels::when_at_lang(subject, &text, now, user.tz, lang))
         }
         Action::Calendar(subject, year, month) => {
             let text = subject_text(service, user_id, subject).await?;
@@ -417,17 +448,48 @@ async fn handle_action(
             CallbackReply::edit(panels::repeat_lang(subject, &text, at, lang))
         }
 
-        Action::Save(subject, at, recurrence) => {
-            let saved = match subject {
-                Subject::Draft(id) => service
-                    .save_draft(&user, id, at, recurrence, now)
-                    .await
-                    .map(|r| (r, lang.text("reminder.saved"))),
-                Subject::Reminder(id) => service
-                    .update(&user, id, None, at, recurrence, now)
-                    .await
-                    .map(|r| (r, lang.text("reminder.updated"))),
+        Action::AtInstant(subject, at) => {
+            let text = subject_text(service, user_id, subject).await?;
+            CallbackReply::edit(panels::repeat_time_lang(
+                subject,
+                &text,
+                ReminderTime::Instant(at),
+                user.tz,
+                lang,
+            ))
+        }
+
+        Action::Save(subject, _, _) | Action::SaveInstant(subject, _, _) => {
+            let (time, recurrence) = match action {
+                Action::Save(_, at, recurrence) => (ReminderTime::Local(at), recurrence),
+                Action::SaveInstant(_, at, recurrence) => (ReminderTime::Instant(at), recurrence),
+                _ => unreachable!("save action matched above"),
             };
+            let saved = match (subject, time) {
+                (Subject::Draft(id), ReminderTime::Local(at)) => {
+                    service.save_draft(&user, id, at, recurrence, now).await
+                }
+                (Subject::Draft(id), ReminderTime::Instant(at)) => {
+                    service.save_draft_at(&user, id, at, recurrence, now).await
+                }
+                (Subject::Reminder(id), ReminderTime::Local(at)) => {
+                    service.update(&user, id, None, at, recurrence, now).await
+                }
+                (Subject::Reminder(id), ReminderTime::Instant(at)) => {
+                    service
+                        .update_at(&user, id, None, at, recurrence, now)
+                        .await
+                }
+            }
+            .map(|reminder| {
+                (
+                    reminder,
+                    lang.text(match subject {
+                        Subject::Draft(_) => "reminder.saved",
+                        Subject::Reminder(_) => "reminder.updated",
+                    }),
+                )
+            });
             match saved {
                 Ok((reminder, heading)) => CallbackReply {
                     toast: Some(lang.text("saved.toast")),
@@ -438,7 +500,7 @@ async fn handle_action(
                     let text = subject_text(service, user_id, subject).await?;
                     CallbackReply {
                         toast: Some(lang.text("error.past_retry")),
-                        edit: Some(panels::when_lang(subject, &text, now_local, lang)),
+                        edit: Some(panels::when_at_lang(subject, &text, now, user.tz, lang)),
                     }
                 }
                 Err(error) => return Err(error),
@@ -460,14 +522,19 @@ async fn handle_action(
                 Some(&lang.text("removed.toast")),
             )
         }
-        Action::List => {
+        Action::List | Action::ListPage(_) => {
+            let page = match action {
+                Action::ListPage(page) => page,
+                _ => 0,
+            };
             let reminders = service.list(user_id).await?;
-            CallbackReply::edit(panels::list_lang(&reminders, &user, lang))
+            CallbackReply::edit(panels::list_page_lang(&reminders, &user, page, lang))
         }
 
         Action::Noop
         | Action::CalendarReset
         | Action::Done(_)
+        | Action::UndoCompletion(_)
         | Action::LegacyNaggingAck(_)
         | Action::LegacyReminderAck(_) => unreachable!("handled above"),
     })
@@ -796,6 +863,275 @@ mod tests {
         assert_eq!(
             reply.toast.as_deref(),
             Some("This reminder is no longer available.")
+        );
+    }
+    #[tokio::test]
+    async fn typed_duration_survives_callbacks_and_saves_the_exact_fold_instant() {
+        let store = Db::open_in_memory().unwrap();
+        let service = Service::new(store.clone());
+        service
+            .set_preferences(7, Some("en"), None, None)
+            .await
+            .unwrap();
+        let tz = UserTz::parse("Europe/London").unwrap();
+        let now = local(2026, 10, 25, 0, 30).and_utc();
+        set_timezone(&service, &sender(), tz, now).await.unwrap();
+        on_text(&service, &sender(), "pills", false, now)
+            .await
+            .unwrap();
+        let replies = on_text(&service, &sender(), "in 30 minutes", false, now)
+            .await
+            .unwrap();
+        let action = find(&replies[0].markup, "Once");
+        let target = now + Duration::minutes(30);
+        assert!(matches!(action, Action::SaveInstant(_, at, Recurrence::Once) if at == target));
+        on_callback(&service, 7, &action.encode(), Some("pills"), None, now)
+            .await
+            .unwrap();
+        let reminder = store.reminders_for_user(7).await.unwrap().remove(0);
+        assert_eq!(reminder.due_at, target);
+        assert_eq!(reminder.anchor_local, Some(tz.local(target)));
+    }
+
+    #[tokio::test]
+    async fn list_navigation_is_owner_scoped_and_clamps_stale_pages() {
+        let store = Db::open_in_memory().unwrap();
+        let service = Service::new(store.clone());
+        service
+            .set_preferences(7, Some("en"), None, None)
+            .await
+            .unwrap();
+        set_timezone(&service, &sender(), SGT, now()).await.unwrap();
+        for index in 1..=35 {
+            store
+                .add_reminder(
+                    7,
+                    format!("item {index}"),
+                    now() + Duration::days(1),
+                    Recurrence::Daily,
+                )
+                .await
+                .unwrap();
+        }
+        let second = press(&service, Action::ListPage(1)).await;
+        assert!(second.edit.as_ref().unwrap().text.contains("11. item 11"));
+        let last = press(&service, Action::ListPage(usize::MAX)).await;
+        assert!(last.edit.as_ref().unwrap().text.contains("35. item 35"));
+        let other = Sender {
+            chat_id: 8,
+            ..sender()
+        };
+        set_timezone(&service, &other, SGT, now()).await.unwrap();
+        let empty = on_callback(
+            &service,
+            8,
+            &Action::ListPage(1).encode(),
+            None,
+            None,
+            now(),
+        )
+        .await
+        .unwrap();
+        assert!(!empty.edit.unwrap().text.contains("item"));
+    }
+    async fn completion_fixture(recurrence: Recurrence) -> (Db, Service, crate::model::Nagging) {
+        let store = Db::open_in_memory().unwrap();
+        let service = Service::new(store.clone());
+        service
+            .set_preferences(7, Some("en"), None, Some(20))
+            .await
+            .unwrap();
+        set_timezone(&service, &sender(), SGT, now()).await.unwrap();
+        let reminder = store
+            .add_reminder(7, "pills".into(), now(), recurrence)
+            .await
+            .unwrap();
+        let pending = store
+            .fire_reminder(reminder.id, now(), now())
+            .await
+            .unwrap()
+            .unwrap();
+        (store, service, pending)
+    }
+
+    #[tokio::test]
+    async fn completing_and_undoing_from_chat_restores_once_without_resetting_its_timer() {
+        for done in [Action::Done as fn(i64) -> Action, Action::LegacyNaggingAck] {
+            let (store, service, pending) = completion_fixture(Recurrence::Once).await;
+            let reply = on_callback(
+                &service,
+                7,
+                &done(pending.id).encode(),
+                Some("⏰ pills"),
+                None,
+                now(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(reply.edit.as_ref().unwrap().text, "✅ pills");
+            let undo = find(&edit_markup(&reply), "↩️ Undo completion");
+            let completion = service
+                .completion_for_source(7, pending.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(undo, Action::UndoCompletion(completion.id));
+            assert!(store.naggings_for_user(7).await.unwrap().is_empty());
+
+            let undo_at = now() + Duration::minutes(2);
+            let reply = on_callback(&service, 7, &undo.encode(), Some("✅ pills"), None, undo_at)
+                .await
+                .unwrap();
+            assert_eq!(reply.toast.as_deref(), Some("Completion undone"));
+            assert!(reply.edit.unwrap().text.contains("10 minutes"));
+            let restored = store.naggings_for_user(7).await.unwrap();
+            assert_eq!(restored.len(), 1);
+            assert_ne!(restored[0].id, pending.id);
+            assert_eq!(restored[0].next_at, undo_at + Duration::minutes(10));
+            assert!(
+                store
+                    .due_confirmations(now() + Duration::hours(1))
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+
+            let replay = on_callback(
+                &service,
+                7,
+                &undo.encode(),
+                None,
+                None,
+                undo_at + Duration::minutes(1),
+            )
+            .await
+            .unwrap();
+            assert_eq!(replay.toast.as_deref(), Some("Already undone"));
+            assert_eq!(store.naggings_for_user(7).await.unwrap(), restored);
+            let journal = store.completion_history(7, None, 20).await.unwrap();
+            assert_eq!(journal.items.len(), 1);
+            assert!(journal.items[0].undone_at.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_negative_followup_answer_works_after_the_sent_queue_row_was_removed() {
+        use crate::delivery::{Delivery, DeliveryQueue};
+        let (store, service, pending) = completion_fixture(Recurrence::Once).await;
+        on_callback(
+            &service,
+            7,
+            &Action::Done(pending.id).encode(),
+            Some("⏰ pills"),
+            None,
+            now(),
+        )
+        .await
+        .unwrap();
+        let at = now() + Duration::minutes(20);
+        let confirmation = store.due_confirmations(at).await.unwrap().remove(0);
+        let panel = Panel {
+            text: String::new(),
+            keyboard: panels::confirmation_keyboard_lang(confirmation.completion_id, Lang::En),
+        };
+        let retry = find(&Markup::Inline(panel.keyboard), "No, remind me again");
+        let job = store
+            .claim_delivery(7, at, at + Duration::seconds(30))
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .finish_delivery(job, Delivery::Sent, at)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .due_confirmations(at + Duration::hours(1))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let reply = on_callback(
+            &service,
+            7,
+            &retry.encode(),
+            Some("Follow-up check"),
+            None,
+            at + Duration::minutes(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply.toast.as_deref(), Some("Completion undone"));
+        assert_eq!(
+            store.naggings_for_user(7).await.unwrap()[0].next_at,
+            at + Duration::minutes(11)
+        );
+    }
+
+    #[tokio::test]
+    async fn another_user_cannot_undo_a_completion_from_a_forwarded_button() {
+        let (store, service, pending) = completion_fixture(Recurrence::Once).await;
+        service
+            .set_preferences(8, Some("en"), None, None)
+            .await
+            .unwrap();
+        let done = on_callback(
+            &service,
+            7,
+            &Action::Done(pending.id).encode(),
+            Some("⏰ pills"),
+            None,
+            now(),
+        )
+        .await
+        .unwrap();
+        let undo = find(&edit_markup(&done), "↩️ Undo completion");
+        let reply = on_callback(&service, 8, &undo.encode(), Some("forwarded"), None, now())
+            .await
+            .unwrap();
+        assert_eq!(
+            reply.toast.as_deref(),
+            Some("This reminder is no longer available.")
+        );
+        assert!(store.naggings_for_user(7).await.unwrap().is_empty());
+        assert!(store.naggings_for_user(8).await.unwrap().is_empty());
+        let journal = store.completion_history(7, None, 20).await.unwrap();
+        assert!(journal.items[0].undone_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_old_chat_undo_cannot_restore_a_previous_recurring_occurrence() {
+        let (store, service, pending) = completion_fixture(Recurrence::Daily).await;
+        let done = on_callback(
+            &service,
+            7,
+            &Action::Done(pending.id).encode(),
+            Some("⏰ pills"),
+            None,
+            now(),
+        )
+        .await
+        .unwrap();
+        let undo = find(&edit_markup(&done), "↩️ Undo completion");
+        let next_day = now() + Duration::days(1);
+        let current = store
+            .fire_reminder(pending.reminder_id.unwrap(), next_day, next_day)
+            .await
+            .unwrap()
+            .unwrap();
+        let reply = on_callback(&service, 7, &undo.encode(), None, None, next_day)
+            .await
+            .unwrap();
+        assert_eq!(
+            reply.toast.as_deref(),
+            Some(Lang::En.text("undo.unavailable").as_str())
+        );
+        assert!(reply.edit.is_none());
+        assert_eq!(store.naggings_for_user(7).await.unwrap(), vec![current]);
+        assert!(
+            store.completion_history(7, None, 20).await.unwrap().items[0]
+                .undone_at
+                .is_none()
         );
     }
 }

@@ -112,3 +112,29 @@ years while ordinary recurrence remains unbounded.
 The Alice UI lives in `frontend/src/features/alice`; chat and Mini App share the completion/snooze
 service. API errors have stable codes and personal responses use no-store caching.
 Create a consistent SQLite backup before upgrading production.
+
+
+## Backend architecture and delivery
+
+Use cases live in `src/application`, depending on a repository port implemented by
+`src/db/repository.rs`. Planning is separate from bounded per-chat delivery; durable
+technical retries use 1/2/4/5-minute backoff independently of the nag interval.
+Mandatory tasks are supervised, and `/health` checks storage and planner progress.
+Migrations 008/009 extend existing data with delivery leases and Yandex preparation
+backoff; take a consistent SQLite backup before updating a running instance.
+See [backend architecture](docs/backend-architecture.md) for boundaries and guarantees.
+
+
+## Completion history and individual settings
+
+Done marks now create a persistent, owner-scoped journal with timestamps. The Mini
+App loads history lazily with cursor pagination; Telegram completion messages have
+Undo, and follow-up checks include “No, remind me again”. Undo restores one pending
+occurrence for ten minutes later without triggering Alice; repeated clicks are
+idempotent. A newer recurring occurrence or a deleted parent prevents old undo.
+History starts with new marks after this update and is deleted with `/unregister`.
+
+Each reminder can override the repeat interval and follow-up preference and opt out
+of speaker audio. Null overrides follow account defaults; audio never bypasses the
+account-wide Alice switch. Updates are atomic with the text and schedule. Migrations
+010/011 extend existing data without fabricating earlier completion timestamps.

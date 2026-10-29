@@ -294,6 +294,7 @@ mod tests {
             due_at,
             recurrence,
             anchor_local: None,
+            settings: crate::model::ReminderSettings::default(),
         }
     }
 

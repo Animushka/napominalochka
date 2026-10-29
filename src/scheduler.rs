@@ -1,9 +1,8 @@
-//! Background loop that fires due reminders, repeats naggings and maintains the database.
+//! Advances due schedules and supervises independent per-chat delivery workers.
 //!
-//! Messages go out through a [`Notifier`], so the scheduling logic can be tested without
-//! Telegram.
+//! Planning only writes durable occurrences. Delivery policy lives in `delivery`;
+//! slow Telegram requests never stop planning or another user's notifications.
 
-use std::future::Future;
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, SubsecRound, Utc};
@@ -11,161 +10,128 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
 use crate::db::Db;
+use crate::delivery;
+use crate::delivery::DeliveryQueue;
+use crate::health::Heartbeat;
+#[cfg(test)]
 use crate::model::{Confirmation, Nagging};
 
-/// How often the database is polled for due reminders and naggings.
+// Compatibility for existing Telegram adapters; the transport port belongs to delivery.
+pub use crate::delivery::{Delivery, Notifier};
+
 const TICK_INTERVAL: StdDuration = StdDuration::from_secs(10);
 const MAINTENANCE_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
-/// Drafts (reminders started but never given a time) are discarded after this long.
 const DRAFT_LIFETIME: Duration = Duration::days(1);
 
-/// Outcome of sending one reminder message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Delivery {
-    Sent,
-    /// The chat cannot be reached any more (bot blocked, chat deleted, ...).
-    Unreachable,
-    /// A temporary failure; the nagging is retried at its next interval.
-    Failed(String),
+pub async fn run_monitored<N: Notifier>(
+    notifier: N,
+    db: Db,
+    shutdown: CancellationToken,
+    heartbeat: Heartbeat,
+) {
+    run_loop(notifier, db, shutdown, Some(heartbeat)).await;
 }
 
-/// Sends reminder messages to users.
-pub trait Notifier: Send + Sync + 'static {
-    fn send(&self, nagging: &Nagging) -> impl Future<Output = Delivery> + Send;
-    fn send_confirmation(
-        &self,
-        confirmation: &Confirmation,
-    ) -> impl Future<Output = Delivery> + Send;
+#[cfg(test)]
+async fn run<N: Notifier>(notifier: N, db: Db, shutdown: CancellationToken) {
+    run_loop(notifier, db, shutdown, None).await;
 }
 
-pub async fn run<N: Notifier>(notifier: N, db: Db, shutdown: CancellationToken) {
+async fn run_loop<N: Notifier>(
+    notifier: N,
+    db: Db,
+    shutdown: CancellationToken,
+    heartbeat: Option<Heartbeat>,
+) {
     let mut ticker = tokio::time::interval(TICK_INTERVAL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_maintenance = Instant::now();
+    let mut workers = delivery::Workers::new(notifier, db.clone(), shutdown.clone());
 
     loop {
         tokio::select! {
+            biased;
             () = shutdown.cancelled() => break,
+            // A permanently busy delivery queue must not starve planning/heartbeat.
             _ = ticker.tick() => {}
+            Some((user_id, result)) = workers.next_completion(), if workers.has_running() => {
+                if let Err(error) = result {
+                    tracing::error!(?error, user_id, "Telegram delivery worker failed");
+                }
+                continue;
+            }
         }
 
         let now = Utc::now().trunc_subsecs(0);
-        tick(&notifier, &db, now).await;
-
+        let planned = plan(&db, now).await;
+        let users = db.due_delivery_users(now).await;
+        match (&planned, &users) {
+            (Ok(()), Ok(_)) => {
+                if let Some(heartbeat) = &heartbeat {
+                    heartbeat.beat();
+                }
+            }
+            _ => {
+                if let Err(error) = &planned {
+                    tracing::error!(?error, "failed to plan reminders");
+                }
+                if let Err(error) = &users {
+                    tracing::error!(?error, "failed to read delivery queue");
+                }
+            }
+        }
+        if let Ok(users) = users {
+            workers.enqueue(users);
+        }
         if last_maintenance.elapsed() >= MAINTENANCE_INTERVAL {
             maintain(&db, now).await;
             last_maintenance = Instant::now();
         }
     }
+    // Dropping in-flight requests leaves their durable leases intact until expiry.
+    // A response may have been lost after acceptance, so immediate replay is avoided.
+    drop(workers);
     tracing::info!("scheduler stopped");
 }
 
-/// Fires reminders that are due and repeats naggings that are due, as of `now`.
-pub async fn tick<N: Notifier>(notifier: &N, db: &Db, now: DateTime<Utc>) {
-    if let Err(error) = fire_due_reminders(notifier, db, now).await {
-        tracing::error!(?error, "failed to process due reminders");
+/// Planning has no transport dependency and can be tested independently of Telegram.
+async fn plan(db: &Db, now: DateTime<Utc>) -> anyhow::Result<()> {
+    for reminder in db.due_reminders(now).await? {
+        if db.fire_reminder(reminder.id, now, now).await?.is_some() {
+            tracing::info!(
+                reminder_id = reminder.id,
+                user_id = reminder.user_id,
+                "reminder planned"
+            );
+        }
     }
-    if let Err(error) = repeat_due_naggings(notifier, db, now).await {
-        tracing::error!(?error, "failed to process due naggings");
-    }
-    if let Err(error) = send_due_confirmations(notifier, db, now).await {
-        tracing::error!(?error, "failed to process completion checks");
-    }
+    Ok(())
+}
+
+#[cfg(test)]
+async fn tick<N: Notifier>(notifier: &N, db: &Db, now: DateTime<Utc>) {
+    plan(db, now).await.unwrap();
+    delivery::drain(notifier, db, now, &CancellationToken::new())
+        .await
+        .unwrap();
+}
+
+#[cfg(test)]
+async fn repeat_due_naggings<N: Notifier>(
+    notifier: &N,
+    db: &Db,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    delivery::drain(notifier, db, now, &CancellationToken::new()).await
 }
 
 async fn maintain(db: &Db, now: DateTime<Utc>) {
     if let Err(error) = db.delete_drafts_before(now - DRAFT_LIFETIME).await {
         tracing::error!(?error, "failed to delete old drafts");
     }
-    match db.vacuum().await {
-        Ok(()) => tracing::info!("vacuumed database"),
-        Err(error) => tracing::error!(?error, "failed to vacuum database"),
+    if let Err(error) = db.vacuum().await {
+        tracing::error!(?error, "failed to vacuum database");
     }
-}
-
-async fn fire_due_reminders<N: Notifier>(
-    notifier: &N,
-    db: &Db,
-    now: DateTime<Utc>,
-) -> anyhow::Result<()> {
-    for reminder in db.due_reminders(now).await? {
-        // Record the firing before sending: a failed send is retried by the nagging itself.
-        let interval =
-            Duration::minutes(db.preferences(reminder.user_id).await?.nag_interval_minutes);
-        if let Some(nagging) = db.fire_reminder(reminder.id, now, now + interval).await? {
-            tracing::info!(
-                reminder_id = reminder.id,
-                user_id = reminder.user_id,
-                "reminder fired"
-            );
-            deliver(notifier, db, &nagging).await?;
-        }
-    }
-    Ok(())
-}
-
-async fn repeat_due_naggings<N: Notifier>(
-    notifier: &N,
-    db: &Db,
-    now: DateTime<Utc>,
-) -> anyhow::Result<()> {
-    for nagging in db.due_naggings(now).await? {
-        let interval =
-            Duration::minutes(db.preferences(nagging.user_id).await?.nag_interval_minutes);
-        if db.claim_nagging(&nagging, now, now + interval).await? {
-            deliver(notifier, db, &nagging).await?;
-        }
-    }
-    Ok(())
-}
-
-/// One delivery per completion. Its confirmation button never reenters the nagging loop.
-async fn send_due_confirmations<N: Notifier>(
-    notifier: &N,
-    db: &Db,
-    now: DateTime<Utc>,
-) -> anyhow::Result<()> {
-    for confirmation in db.due_confirmations(now).await? {
-        match notifier.send_confirmation(&confirmation).await {
-            Delivery::Sent | Delivery::Unreachable => {
-                db.delete_confirmation(confirmation.id).await?
-            }
-            Delivery::Failed(error) => {
-                tracing::warn!(
-                    error,
-                    confirmation_id = confirmation.id,
-                    "failed to send completion check; will retry"
-                );
-                db.postpone_confirmation(confirmation.id, now + Duration::minutes(1))
-                    .await?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Sends one reminder message. Delivery failures are logged rather than propagated so that
-/// one unreachable chat does not hold up everyone else's reminders.
-async fn deliver<N: Notifier>(notifier: &N, db: &Db, nagging: &Nagging) -> anyhow::Result<()> {
-    match notifier.send(nagging).await {
-        Delivery::Sent => {}
-        Delivery::Unreachable => {
-            let removed = db.delete_naggings_for_user(nagging.user_id).await?;
-            tracing::warn!(
-                user_id = nagging.user_id,
-                removed,
-                "chat unreachable; stopped nagging it"
-            );
-        }
-        Delivery::Failed(error) => {
-            tracing::warn!(
-                error,
-                nagging_id = nagging.id,
-                "failed to send reminder; will retry"
-            );
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -435,10 +401,9 @@ mod tests {
         tick(&notifier, &db, at(9, 10)).await;
         assert_eq!(notifier.take(), vec![(1, "user 1".into())]);
         tick(&notifier, &db, at(9, 30)).await;
-        assert_eq!(
-            notifier.take(),
-            vec![(1, "user 1".into()), (2, "user 2".into())]
-        );
+        let mut sent = notifier.take();
+        sent.sort(); // Independent chats intentionally have no global send ordering.
+        assert_eq!(sent, vec![(1, "user 1".into()), (2, "user 2".into())]);
         assert_eq!(
             crate::model::Preferences::default().nag_interval_minutes,
             10
@@ -502,5 +467,188 @@ mod tests {
         tick(&notifier, &db, at(10, 0)).await;
         assert!(notifier.take().is_empty());
         assert!(db.due_naggings(at(10, 0)).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn technical_retry_is_independent_of_a_sixty_minute_nag_interval() {
+        let (notifier, db) = setup().await;
+        db.set_preferences(1, None, Some(60), None).await.unwrap();
+        db.add_reminder(1, "pills".into(), at(9, 0), Recurrence::Once)
+            .await
+            .unwrap();
+        notifier.set_outcome(1, Delivery::Failed("network unavailable".into()));
+        tick(&notifier, &db, at(9, 0)).await;
+        assert_eq!(db.naggings_for_user(1).await.unwrap()[0].next_at, at(9, 1));
+        tick(&notifier, &db, at(9, 1)).await;
+        assert_eq!(db.naggings_for_user(1).await.unwrap()[0].next_at, at(9, 3));
+        notifier.set_outcome(1, Delivery::Sent);
+        tick(&notifier, &db, at(9, 3)).await;
+        assert_eq!(notifier.take(), vec![(1, "pills".into())]);
+        assert_eq!(db.naggings_for_user(1).await.unwrap()[0].next_at, at(10, 3));
+    }
+
+    #[tokio::test]
+    async fn disabling_checks_during_another_send_cancels_queued_checks() {
+        struct DisableChecks {
+            db: Db,
+            sent: Mutex<Vec<i64>>,
+        }
+        impl Notifier for DisableChecks {
+            async fn send(&self, _: &Nagging) -> Delivery {
+                unreachable!()
+            }
+            async fn send_confirmation(&self, item: &Confirmation) -> Delivery {
+                self.sent.lock().unwrap().push(item.id);
+                self.db
+                    .set_preferences(item.user_id, None, None, Some(0))
+                    .await
+                    .unwrap();
+                Delivery::Sent
+            }
+        }
+        let (_, db) = setup().await;
+        db.set_preferences(1, None, None, Some(20)).await.unwrap();
+        for text in ["first", "cancelled"] {
+            let reminder = db
+                .add_reminder(1, text.into(), at(8, 0), Recurrence::Daily)
+                .await
+                .unwrap();
+            let occurrence = db
+                .fire_reminder(reminder.id, at(8, 0), at(10, 0))
+                .await
+                .unwrap()
+                .unwrap();
+            db.complete_nagging(1, occurrence.id, at(8, 40))
+                .await
+                .unwrap();
+        }
+        let notifier = DisableChecks {
+            db: db.clone(),
+            sent: Mutex::new(Vec::new()),
+        };
+        tick(&notifier, &db, at(9, 0)).await;
+        assert_eq!(notifier.sent.lock().unwrap().len(), 1);
+        assert!(db.due_confirmations(at(10, 0)).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn slow_chat_does_not_block_another_user_or_shutdown() {
+        use std::sync::Arc;
+        struct SlowChat {
+            first_started: Arc<tokio::sync::Notify>,
+            second_sent: Arc<tokio::sync::Notify>,
+        }
+        impl Notifier for SlowChat {
+            async fn send(&self, item: &Nagging) -> Delivery {
+                if item.user_id == 1 {
+                    self.first_started.notify_one();
+                    std::future::pending::<()>().await;
+                } else {
+                    self.second_sent.notify_one();
+                }
+                Delivery::Sent
+            }
+            async fn send_confirmation(&self, _: &Confirmation) -> Delivery {
+                unreachable!()
+            }
+        }
+        let (_, db) = setup().await;
+        let now = Utc::now().trunc_subsecs(0);
+        for user_id in [1, 2] {
+            db.add_reminder(
+                user_id,
+                "proof".into(),
+                now - Duration::minutes(1),
+                Recurrence::Once,
+            )
+            .await
+            .unwrap();
+        }
+        let first_started = Arc::new(tokio::sync::Notify::new());
+        let second_sent = Arc::new(tokio::sync::Notify::new());
+        let shutdown = CancellationToken::new();
+        let worker = tokio::spawn(run(
+            SlowChat {
+                first_started: first_started.clone(),
+                second_sent: second_sent.clone(),
+            },
+            db.clone(),
+            shutdown.clone(),
+        ));
+        tokio::time::timeout(StdDuration::from_secs(2), first_started.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(StdDuration::from_secs(2), second_sent.notified())
+            .await
+            .unwrap();
+        shutdown.cancel();
+        tokio::time::timeout(StdDuration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            db.claim_delivery(1, now, now + delivery::CLAIM_DURATION)
+                .await
+                .unwrap()
+                .is_none(),
+            "interrupted send keeps its durable lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_workers_refill_all_ready_chats_without_another_planner_tick() {
+        struct QuickNotifier {
+            sent: tokio::sync::mpsc::UnboundedSender<i64>,
+        }
+        impl Notifier for QuickNotifier {
+            async fn send(&self, item: &Nagging) -> Delivery {
+                self.sent.send(item.user_id).unwrap();
+                Delivery::Sent
+            }
+            async fn send_confirmation(&self, _: &Confirmation) -> Delivery {
+                unreachable!()
+            }
+        }
+        let db = Db::open_in_memory().unwrap();
+        let now = Utc::now().trunc_subsecs(0);
+        let total = (delivery::MAX_CONCURRENT_CHATS * 3) as i64;
+        for user_id in 1..=total {
+            db.upsert_user(User {
+                id: user_id,
+                first_name: format!("user{user_id}"),
+                last_name: String::new(),
+                tz: UserTz::parse("UTC").unwrap(),
+            })
+            .await
+            .unwrap();
+            db.add_reminder(
+                user_id,
+                "ready".into(),
+                now - Duration::minutes(1),
+                Recurrence::Once,
+            )
+            .await
+            .unwrap();
+        }
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
+        let worker = tokio::spawn(run(QuickNotifier { sent }, db, shutdown.clone()));
+        let delivered = tokio::time::timeout(StdDuration::from_secs(5), async {
+            let mut users = std::collections::BTreeSet::new();
+            for _ in 0..total {
+                users.insert(received.recv().await.unwrap());
+            }
+            users
+        })
+        .await;
+        shutdown.cancel();
+        tokio::time::timeout(StdDuration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            delivered.expect("ready chats must drain before the next 10s planning tick"),
+            (1..=total).collect()
+        );
     }
 }

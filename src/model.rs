@@ -5,7 +5,8 @@ use std::str::FromStr;
 use std::sync::LazyLock;
 
 use chrono::{
-    DateTime, Datelike, Duration, FixedOffset, Months, NaiveDateTime, TimeZone, Utc, Weekday,
+    DateTime, Datelike, Duration, FixedOffset, Months, NaiveDateTime, Offset, TimeZone, Utc,
+    Weekday,
 };
 use chrono_tz::Tz;
 use regex::Regex;
@@ -29,6 +30,74 @@ impl Default for Preferences {
     }
 }
 
+/// Overrides inherit user defaults; voice eligibility retains the account switch.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReminderSettings {
+    pub nag_interval_minutes: Option<i64>,
+    pub confirmation_check_minutes: Option<i64>,
+    pub voice_enabled: bool,
+}
+
+impl Default for ReminderSettings {
+    fn default() -> Self {
+        Self {
+            nag_interval_minutes: None,
+            confirmation_check_minutes: None,
+            voice_enabled: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReminderWrite {
+    pub description: String,
+    pub due_at: DateTime<Utc>,
+    pub recurrence: Recurrence,
+    pub anchor_local: Option<NaiveDateTime>,
+    pub settings: ReminderSettings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReminderSchedule {
+    pub due_at: DateTime<Utc>,
+    pub recurrence: Recurrence,
+    pub anchor_local: Option<NaiveDateTime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReminderChanges {
+    pub description: Option<String>,
+    pub schedule: Option<ReminderSchedule>,
+    pub settings: Option<ReminderSettings>,
+}
+
+/// A completion mark records the user's action in the bot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completion {
+    pub id: i64,
+    pub user_id: i64,
+    pub description: String,
+    pub scheduled_at: Option<DateTime<Utc>>,
+    pub completed_at: DateTime<Utc>,
+    pub undone_at: Option<DateTime<Utc>>,
+    pub can_undo: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryPage {
+    pub items: Vec<Completion>,
+    pub next_cursor: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UndoResult {
+    Restored,
+    AlreadyRestored,
+    Unavailable,
+    NotFound,
+}
+
 /// A single optional check after completion, never part of the nagging loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Confirmation {
@@ -36,6 +105,24 @@ pub struct Confirmation {
     pub user_id: i64,
     pub description: String,
     pub due_at: DateTime<Utc>,
+    pub completion_id: Option<i64>,
+}
+
+/// A calendar selection keeps its local wall clock; an elapsed interval keeps its instant.
+/// This distinction matters when clocks move backwards and a local time occurs twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReminderTime {
+    Local(NaiveDateTime),
+    Instant(DateTime<Utc>),
+}
+
+impl ReminderTime {
+    pub fn local(self, tz: UserTz) -> NaiveDateTime {
+        match self {
+            Self::Local(at) => at,
+            Self::Instant(at) => tz.local(at),
+        }
+    }
 }
 
 /// How often a reminder repeats once it has fired.
@@ -307,12 +394,39 @@ impl UserTz {
     /// occurrence; non-existent times (clocks going forward) move forward by the gap.
     pub fn utc(self, local: NaiveDateTime) -> DateTime<Utc> {
         fn resolve<T: TimeZone>(tz: &T, local: NaiveDateTime) -> DateTime<Utc> {
-            (0..=3)
-                .find_map(|h| {
-                    tz.from_local_datetime(&(local + Duration::hours(h)))
-                        .earliest()
-                })
-                .map_or_else(|| local.and_utc(), |dt| dt.with_timezone(&Utc))
+            if let Some(at) = tz.from_local_datetime(&local).earliest() {
+                return at.with_timezone(&Utc);
+            }
+            // Find the offsets on both sides, then shift by the actual gap. Some zones
+            // jump by 30 minutes or an entire date, so adding one hour is incorrect.
+            let mut before = None;
+            let mut after = None;
+            for hours in 1..=48 {
+                before = before.or_else(|| {
+                    local
+                        .checked_sub_signed(Duration::hours(hours))
+                        .and_then(|at| tz.from_local_datetime(&at).latest())
+                });
+                after = after.or_else(|| {
+                    local
+                        .checked_add_signed(Duration::hours(hours))
+                        .and_then(|at| tz.from_local_datetime(&at).earliest())
+                });
+                if let (Some(before), Some(after)) = (&before, &after) {
+                    let gap = after.offset().fix().local_minus_utc()
+                        - before.offset().fix().local_minus_utc();
+                    if let Some(at) = local
+                        .checked_add_signed(Duration::seconds(i64::from(gap)))
+                        .and_then(|at| tz.from_local_datetime(&at).earliest())
+                    {
+                        return at.with_timezone(&Utc);
+                    }
+                    break;
+                }
+            }
+            // At chrono's representable boundary there may be no adjacent local date.
+            // Keep this conversion total and never overflow while looking for an offset.
+            local.and_utc()
         }
         match self {
             UserTz::Named(tz) => resolve(&tz, local),
@@ -401,6 +515,7 @@ pub struct Reminder {
     pub recurrence: Recurrence,
     /// Original local schedule; NULL in migrated rows until their next firing.
     pub anchor_local: Option<NaiveDateTime>,
+    pub settings: ReminderSettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -652,6 +767,21 @@ mod tests {
     fn recurrence_round_trips_through_db_value() {
         for r in Recurrence::ALL {
             assert_eq!(Recurrence::from_db(r.to_db()), Some(r));
+        }
+    }
+    #[test]
+    fn local_gaps_use_the_actual_offset_change_and_checked_dates() {
+        let half_hour = UserTz::Named(Tz::Australia__Lord_Howe);
+        let shifted = half_hour.utc(local(2026, 10, 4, 2, 15));
+        assert_eq!(half_hour.local(shifted), local(2026, 10, 4, 2, 45));
+
+        let skipped_date = UserTz::Named(Tz::Pacific__Apia);
+        let shifted = skipped_date.utc(local(2011, 12, 30, 12, 0));
+        assert_eq!(skipped_date.local(shifted), local(2011, 12, 31, 12, 0));
+        for offset in ["-12", "+14"] {
+            let tz = UserTz::parse(offset).unwrap();
+            let _ = tz.utc(NaiveDateTime::MIN);
+            let _ = tz.utc(NaiveDateTime::MAX);
         }
     }
 }

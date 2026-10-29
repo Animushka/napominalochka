@@ -362,7 +362,7 @@ for (const width of [320, 390, 620]) {
     const app = new MockApp(); app.yandex.connected = true
     await app.install(page); await app.open(page)
     const accordionButtons = page.getByRole('button').filter({ has: page.locator('svg[data-slot="accordion-trigger-icon"]') })
-    await expect(accordionButtons).toHaveCount(4)
+    await expect(accordionButtons).toHaveCount(5)
     for (const button of await accordionButtons.all()) await centeredChevron(button, 'svg[data-slot="accordion-trigger-icon"]')
     await preferencesAccordion(page).click()
     await centeredChevron(preferencesAccordion(page), 'svg[data-slot="accordion-trigger-icon"]')

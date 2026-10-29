@@ -5,19 +5,19 @@
 
 use std::sync::LazyLock;
 
-use chrono::{DateTime, Duration, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveTime, TimeZone, Utc};
 use interim::{Dialect, parse_date_string, parse_duration};
 use regex::Regex;
 
-use crate::model::UserTz;
+use crate::model::{ReminderTime, UserTz};
 
 /// Used when a day is given without a time ("friday", "25/12", "tomorrow").
 const DEFAULT_TIME: NaiveTime = NaiveTime::from_hms_opt(9, 0, 0).expect("valid time");
 /// Longer messages are treated as a new reminder rather than an answer to "when?".
 const MAX_LEN: usize = 40;
 
-/// Returns the local date/time, or `None` if the text is not a future time expression.
-pub fn parse(text: &str, tz: UserTz, now: DateTime<Utc>) -> Option<NaiveDateTime> {
+/// Keeps elapsed intervals in UTC and calendar choices in local time.
+pub fn parse(text: &str, tz: UserTz, now: DateTime<Utc>) -> Option<ReminderTime> {
     static HAS_TIME: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?i)\d{1,2}[:.]\d{2}|\d\s*(am|pm)\b|\bnoon\b|\bmidnight\b|\btonight\b")
             .expect("valid regex")
@@ -52,32 +52,36 @@ pub fn parse(text: &str, tz: UserTz, now: DateTime<Utc>) -> Option<NaiveDateTime
     let is_duration =
         normalised.chars().any(|c| c.is_ascii_digit()) && parse_duration(&normalised).is_ok();
 
-    let mut at = match tz {
+    let parsed = match tz {
         UserTz::Named(zone) => parse_in(&normalised, zone, now)?,
         UserTz::Fixed(offset) => parse_in(&normalised, offset.fixed(), now)?,
     };
-    if !is_duration && !HAS_TIME.is_match(&normalised) {
+    if is_duration {
+        return (parsed > now).then_some(ReminderTime::Instant(parsed));
+    }
+    let mut at = tz.local(parsed);
+    if !HAS_TIME.is_match(&normalised) {
         at = at.date().and_time(DEFAULT_TIME);
     }
 
-    if at <= now_local {
+    if tz.utc(at) <= now {
         // A bare time that has passed today ("9am" at 10:30) means tomorrow.
         // Explicit dates and nonpositive durations must never take this shortcut.
         if !BARE_CLOCK.is_match(&normalised) {
             return None;
         }
         at = at.checked_add_signed(Duration::days(1))?;
-        if at <= now_local {
+        if tz.utc(at) <= now {
             return None;
         }
     }
-    Some(at)
+    Some(ReminderTime::Local(at))
 }
 
-fn parse_in<T: TimeZone>(text: &str, tz: T, now: DateTime<Utc>) -> Option<NaiveDateTime> {
+fn parse_in<T: TimeZone>(text: &str, tz: T, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     parse_date_string(text, now.with_timezone(&tz), Dialect::Uk)
         .ok()
-        .map(|dt| dt.naive_local())
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 /// Rewrites phrases the parser does not know into ones it does.
@@ -124,10 +128,14 @@ fn normalise(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
+    use chrono::{NaiveDate, NaiveDateTime};
     use chrono_tz::Tz;
 
     const SGT: UserTz = UserTz::Named(Tz::Asia__Singapore);
+
+    fn parse_local(text: &str, tz: UserTz, now: DateTime<Utc>) -> Option<NaiveDateTime> {
+        parse(text, tz, now).map(|at| at.local(tz))
+    }
 
     fn local(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> NaiveDateTime {
         NaiveDate::from_ymd_opt(y, mo, d)
@@ -158,7 +166,7 @@ mod tests {
             ("tonight", local(2026, 10, 13, 20, 0)),
             ("1/11/2026 07:15", local(2026, 11, 1, 7, 15)),
         ] {
-            assert_eq!(parse(input, SGT, now()), Some(expected), "{input}");
+            assert_eq!(parse_local(input, SGT, now()), Some(expected), "{input}");
         }
     }
 
@@ -172,7 +180,7 @@ mod tests {
             ("пятницу 18:00", local(2026, 10, 16, 18, 0)),
             ("сегодня вечером", local(2026, 10, 13, 20, 0)),
         ] {
-            assert_eq!(parse(input, SGT, now()), Some(expected), "{input}");
+            assert_eq!(parse_local(input, SGT, now()), Some(expected), "{input}");
         }
     }
 
@@ -180,13 +188,13 @@ mod tests {
     fn only_bare_clocks_roll_forward_to_tomorrow() {
         for input in ["9am", "9 am", "09:00", "в 09:00", "at 9am"] {
             assert_eq!(
-                parse(input, SGT, now()),
+                parse_local(input, SGT, now()),
                 Some(local(2026, 10, 14, 9, 0)),
                 "{input}"
             );
         }
         assert_eq!(
-            parse("10:30", SGT, now()),
+            parse_local("10:30", SGT, now()),
             Some(local(2026, 10, 14, 10, 30))
         );
         for input in [
@@ -197,7 +205,7 @@ mod tests {
             "yesterday 11:00",
             "today",
         ] {
-            assert_eq!(parse(input, SGT, now()), None, "{input}");
+            assert_eq!(parse_local(input, SGT, now()), None, "{input}");
         }
     }
 
@@ -211,7 +219,7 @@ mod tests {
             "через 0 минут",
             "через -1 час",
         ] {
-            assert_eq!(parse(input, SGT, now()), None, "{input}");
+            assert_eq!(parse_local(input, SGT, now()), None, "{input}");
         }
     }
 
@@ -224,11 +232,11 @@ mod tests {
             ("послезавтра 7am", local(2026, 10, 15, 7, 0)),
             ("послезавтра утром", local(2026, 10, 15, 9, 0)),
         ] {
-            assert_eq!(parse(input, SGT, now()), Some(expected), "{input}");
+            assert_eq!(parse_local(input, SGT, now()), Some(expected), "{input}");
         }
         for input in ["послезавтра купить молоко", "послезавтра 25:00"]
         {
-            assert_eq!(parse(input, SGT, now()), None, "{input}");
+            assert_eq!(parse_local(input, SGT, now()), None, "{input}");
         }
     }
 
@@ -236,13 +244,13 @@ mod tests {
     fn day_after_tomorrow_uses_the_users_local_calendar() {
         let near_midnight = SGT.utc(local(2026, 10, 14, 0, 30));
         assert_eq!(
-            parse("послезавтра", SGT, near_midnight),
+            parse_local("послезавтра", SGT, near_midnight),
             Some(local(2026, 10, 16, 9, 0))
         );
         let london = UserTz::Named(Tz::Europe__London);
         let before_dst = london.utc(local(2026, 3, 28, 10, 30));
         assert_eq!(
-            parse("послезавтра 10:30", london, before_dst),
+            parse_local("послезавтра 10:30", london, before_dst),
             Some(local(2026, 3, 30, 10, 30))
         );
     }
@@ -255,7 +263,7 @@ mod tests {
             "buy milk and eggs tomorrow",
             "1/1/2020 08:00",
         ] {
-            assert_eq!(parse(input, SGT, now()), None, "{input}");
+            assert_eq!(parse_local(input, SGT, now()), None, "{input}");
         }
     }
 
@@ -263,10 +271,29 @@ mod tests {
     fn midnight_means_zero_hours_on_the_next_day() {
         for text in ["midnight", "полночь", "в полночь"] {
             assert_eq!(
-                parse(text, SGT, now()),
+                parse_local(text, SGT, now()),
                 Some(local(2026, 10, 14, 0, 0)),
                 "{text}"
             );
         }
+    }
+    #[test]
+    fn elapsed_intervals_preserve_the_future_instant_across_clock_changes() {
+        let london = UserTz::Named(Tz::Europe__London);
+        let before_fold = local(2026, 10, 25, 0, 30).and_utc();
+        for (input, minutes) in [("in 30 minutes", 30), ("через 1 час", 60)] {
+            assert_eq!(
+                super::parse(input, london, before_fold),
+                Some(ReminderTime::Instant(
+                    before_fold + Duration::minutes(minutes)
+                )),
+                "{input}"
+            );
+        }
+        let before_gap = local(2026, 3, 29, 0, 45).and_utc();
+        assert_eq!(
+            super::parse("30 minutes", london, before_gap),
+            Some(ReminderTime::Instant(before_gap + Duration::minutes(30)))
+        );
     }
 }

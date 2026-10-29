@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useState, type PropsWithChildren } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, ApiError } from '@/shared/api';
-import type { AppStateDTO, Lang, Recurrence, ReminderDTO, SnoozeDuration } from '@/shared/api/contracts';
+import type { AppStateDTO, CompletionDTO, HistoryPageDTO, Lang, Recurrence, ReminderDTO, ReminderSettings, SnoozeDuration } from '@/shared/api/contracts';
 import { useI18n } from '@/shared/i18n';
 import { deviceTimezone, offsetString } from '@/shared/lib/date';
 import { getTelegram } from '@/shared/lib/telegram';
@@ -12,6 +12,7 @@ export interface ReminderInput {
   at: string;
   recurrence: Recurrence;
   preserve_schedule?: true;
+  settings?: ReminderSettings;
 }
 export interface PreferencesPatch {
   language?: Lang;
@@ -26,6 +27,7 @@ type StateCommand =
   | { type: 'update'; id: number; input: ReminderInput }
   | { type: 'delete'; id: number }
   | { type: 'done'; id: number }
+  | { type: 'undo'; id: number }
   | { type: 'snooze'; id: number; duration: SnoozeDuration };
 
 interface CommandResult { alreadyCompleted?: boolean }
@@ -47,6 +49,8 @@ function useReminderStateModel(paused: boolean) {
   const owner = session.owner;
   const stateKey = ['reminders', 'state', owner] as const;
   const mutationKey = ['reminders', 'state-write', owner] as const;
+  const historyKey = ['reminders', 'history', owner] as const;
+  const [historyOpen, setHistoryOpen] = useState(false);
   const { setLanguage } = useI18n();
   const mutation = useMutation({
     mutationKey,
@@ -56,7 +60,7 @@ function useReminderStateModel(paused: boolean) {
       // Every write cancels earlier reads before contacting the server. A second
       // cancellation before committing protects against a focus event in flight.
       session.assertCurrent();
-      await client.cancelQueries({ queryKey: stateKey });
+      await Promise.all([client.cancelQueries({ queryKey: stateKey }), client.cancelQueries({ queryKey: historyKey })]);
       session.assertCurrent();
       let nextState: AppStateDTO | undefined;
       let alreadyCompleted = false;
@@ -97,6 +101,17 @@ function useReminderStateModel(paused: boolean) {
           if (previous) nextState = { ...previous, reminders: previous.reminders.filter((item) => item.id !== command.id), pending: previous.pending.filter((item) => item.reminder_id !== command.id) };
           break;
         }
+        case 'undo':
+          try {
+            nextState = await session.request(() => api<AppStateDTO>('POST', `/api/history/${command.id}/undo`));
+            session.assertCurrent();
+          } catch (error) {
+            session.assertCurrent();
+            await client.invalidateQueries({ queryKey: historyKey, refetchType: 'none' });
+            session.assertCurrent();
+            throw error;
+          }
+          break;
         case 'done':
         case 'snooze':
           try {
@@ -115,6 +130,8 @@ function useReminderStateModel(paused: boolean) {
       await client.cancelQueries({ queryKey: stateKey });
       session.assertCurrent();
       if (nextState) client.setQueryData(stateKey, nextState);
+      await client.invalidateQueries({ queryKey: historyKey, refetchType: 'none' });
+      session.assertCurrent();
       if (command.type === 'create' || command.type === 'update' || command.type === 'delete') {
         // Commit the known success immediately, then reconcile server-managed
         // schedules. A failed refresh must not turn a saved reminder into a retry.
@@ -155,6 +172,25 @@ function useReminderStateModel(paused: boolean) {
     refetchOnWindowFocus: true,
   });
 
+  const historyQuery = useInfiniteQuery({
+    queryKey: historyKey,
+    initialPageParam: null as number | null,
+    queryFn: async ({ pageParam, signal }) => {
+      session.assertCurrent();
+      const suffix = pageParam === null ? '' : `&before=${pageParam}`;
+      const page = await session.request(() => api<HistoryPageDTO>('GET', `/api/history?limit=20${suffix}`, undefined, signal));
+      session.assertCurrent();
+      return page;
+    },
+    getNextPageParam: (page) => page.next_cursor ?? undefined,
+    enabled: historyOpen && !mutation.isPending && !paused,
+    staleTime: 3000,
+    retry: false,
+    refetchInterval: historyOpen && !paused ? 30_000 : false,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: true,
+  });
+
   useEffect(() => {
     if (session.isCurrent() && (query.data?.language === 'ru' || query.data?.language === 'en')) setLanguage(query.data.language);
   }, [session, query.data?.language, setLanguage]);
@@ -177,12 +213,36 @@ function useReminderStateModel(paused: boolean) {
   }, [refresh]);
 
   const run = mutation.mutateAsync;
+  const historyEntries = new Map<number, CompletionDTO>();
+  for (const page of historyQuery.data?.pages ?? []) {
+    for (const item of page.items) if (!historyEntries.has(item.id)) historyEntries.set(item.id, item);
+  }
   return {
     state: query.data,
     isLoading: query.isPending,
     error: query.error,
     isMutating: mutation.isPending,
     refresh,
+    historyOpen,
+    setHistoryOpen,
+    history: [...historyEntries.values()],
+    historyLoading: historyQuery.isPending,
+    historyError: historyQuery.error,
+    historyHasMore: historyQuery.hasNextPage,
+    historyLoadingMore: historyQuery.isFetchingNextPage,
+    loadMoreHistory: async () => {
+      session.assertCurrent();
+      if (!historyOpen || paused || mutation.isPending || !historyQuery.hasNextPage || historyQuery.isFetchingNextPage) return;
+      await historyQuery.fetchNextPage();
+      session.assertCurrent();
+    },
+    retryHistory: async () => {
+      session.assertCurrent();
+      if (!historyOpen || paused || mutation.isPending) return;
+      await historyQuery.refetch();
+      session.assertCurrent();
+    },
+    undoCompletion: (id: number) => run({ type: 'undo', id }),
     updatePreferences: (patch: PreferencesPatch) => run({ type: 'preferences', patch }),
     setTimezone: (timezone: string) => run({ type: 'timezone', timezone }),
     createReminder: (input: ReminderInput) => run({ type: 'create', input }),

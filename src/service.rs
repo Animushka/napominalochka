@@ -1,357 +1,16 @@
-//! Application layer: every rule about reminders lives here, shared by the chat flow, the
-//! Mini App API and the commands. Callers handle presentation only.
+//! Composition alias for inbound adapters; use cases depend only on repository ports.
 
-use chrono::{DateTime, Duration, NaiveDateTime, NaiveTime, Utc};
-use thiserror::Error;
-
-use crate::db::{Db, Registration};
-use crate::model::{
-    Draft, InputError, Nagging, Preferences, Recurrence, Reminder, Snooze, User, UserTz,
-};
-
-pub const MAX_DESCRIPTION_CHARS: usize = 1000;
-/// "Snooze until tomorrow" means this local time.
-const SNOOZE_MORNING: NaiveTime = NaiveTime::from_hms_opt(9, 0, 0).expect("valid time");
-
-#[derive(Debug, Error)]
-pub enum Error {
-    #[error("Please set your timezone first.")]
-    NotRegistered,
-    /// The reminder or draft does not exist or belongs to someone else.
-    #[error("This reminder is no longer available.")]
-    NotFound,
-    #[error("Invalid preference: {0}")]
-    InvalidPreferences(&'static str),
-    #[error(transparent)]
-    Input(#[from] InputError),
-    #[error(transparent)]
-    Internal(#[from] anyhow::Error),
-}
-
-pub type Result<T> = std::result::Result<T, Error>;
-
-/// Who a request is from, as reported by Telegram.
-pub struct Profile {
-    pub id: i64,
-    pub first_name: String,
-    pub last_name: String,
-}
-
-/// A requested reminder: `at` is local time in the user's timezone.
-pub struct ReminderInput<'a> {
-    pub description: &'a str,
-    pub at: NaiveDateTime,
-    pub recurrence: Recurrence,
-}
-
-#[derive(Clone)]
-pub struct Service {
-    db: Db,
-}
-
-impl Service {
-    pub fn new(db: Db) -> Self {
-        Self { db }
-    }
-
-    pub async fn preferences(&self, user_id: i64) -> Result<Preferences> {
-        Ok(self.db.preferences(user_id).await?)
-    }
-
-    /// A manually chosen language is never overwritten by Telegram's language code.
-    pub async fn initialize_language(
-        &self,
-        user_id: i64,
-        telegram_language: Option<&str>,
-    ) -> Result<()> {
-        let language = if telegram_language.is_some_and(|code| {
-            code.eq_ignore_ascii_case("en") || code.to_ascii_lowercase().starts_with("en-")
-        }) {
-            "en"
-        } else {
-            "ru"
-        };
-        self.db
-            .initialize_language(user_id, language.into())
-            .await?;
-        Ok(())
-    }
-
-    pub async fn set_preferences(
-        &self,
-        user_id: i64,
-        language: Option<&str>,
-        nag_interval_minutes: Option<i64>,
-        confirmation_check_minutes: Option<i64>,
-    ) -> Result<Preferences> {
-        if language.is_some_and(|value| !matches!(value, "ru" | "en")) {
-            return Err(Error::InvalidPreferences("language"));
-        }
-        if nag_interval_minutes.is_some_and(|value| ![1, 5, 10, 20, 30, 60].contains(&value)) {
-            return Err(Error::InvalidPreferences("nag_interval_minutes"));
-        }
-        if confirmation_check_minutes.is_some_and(|value| ![0, 20].contains(&value)) {
-            return Err(Error::InvalidPreferences("confirmation_check_minutes"));
-        }
-        Ok(self
-            .db
-            .set_preferences(
-                user_id,
-                language.map(str::to_owned),
-                nag_interval_minutes,
-                confirmation_check_minutes,
-            )
-            .await?)
-    }
-
-    // ---- users ---------------------------------------------------------------------------
-
-    pub async fn user(&self, user_id: i64) -> Result<Option<User>> {
-        Ok(self.db.user(user_id).await?)
-    }
-
-    pub async fn registered(&self, user_id: i64) -> Result<User> {
-        self.user(user_id).await?.ok_or(Error::NotRegistered)
-    }
-
-    /// Registers the user or changes their timezone.
-    pub async fn set_timezone(&self, profile: Profile, tz: UserTz) -> Result<(User, Registration)> {
-        let user = User {
-            id: profile.id,
-            first_name: profile.first_name,
-            last_name: profile.last_name,
-            tz,
-        };
-        let registration = self.db.upsert_user(user.clone()).await?;
-        Ok((user, registration))
-    }
-
-    /// Deletes the user and all their data. Returns whether they were registered.
-    pub async fn unregister(&self, user_id: i64) -> Result<bool> {
-        Ok(self.db.delete_user(user_id).await?)
-    }
-
-    // ---- reminders -----------------------------------------------------------------------
-
-    pub async fn list(&self, user_id: i64) -> Result<Vec<Reminder>> {
-        Ok(self.db.reminders_for_user(user_id).await?)
-    }
-
-    pub async fn reminder(&self, user_id: i64, reminder_id: i64) -> Result<Reminder> {
-        self.db
-            .reminder(user_id, reminder_id)
-            .await?
-            .ok_or(Error::NotFound)
-    }
-
-    pub async fn create(
-        &self,
-        user: &User,
-        input: ReminderInput<'_>,
-        now: DateTime<Utc>,
-    ) -> Result<Reminder> {
-        let description = description(input.description)?;
-        let due_at = first_due(input.at, input.recurrence, user.tz, now)?;
-        Ok(self
-            .db
-            .add_reminder_with_anchor(
-                user.id,
-                description,
-                due_at,
-                input.recurrence,
-                Some(input.at),
-            )
-            .await?)
-    }
-
-    /// Changes a reminder's time and repeat, and its description unless `description` is
-    /// `None`.
-    pub async fn update(
-        &self,
-        user: &User,
-        reminder_id: i64,
-        description: Option<&str>,
-        at: NaiveDateTime,
-        recurrence: Recurrence,
-        now: DateTime<Utc>,
-    ) -> Result<Reminder> {
-        let description = description.map(self::description).transpose()?;
-        let current = self.reminder(user.id, reminder_id).await?;
-        if at == user.tz.local(current.due_at) && recurrence == current.recurrence {
-            return self
-                .db
-                .update_reminder_description(user.id, reminder_id, description)
-                .await?
-                .ok_or(Error::NotFound);
-        }
-        let due_at = first_due(at, recurrence, user.tz, now)?;
-        self.db
-            .update_reminder_with_anchor(
-                user.id,
-                reminder_id,
-                description,
-                due_at,
-                recurrence,
-                Some(at),
-            )
-            .await?
-            .ok_or(Error::NotFound)
-    }
-
-    /// Explicit text-only edits preserve the schedule even if a reminder fired while its
-    /// edit form was open. The presentation layer knows whether schedule fields changed.
-    pub async fn rename(&self, user_id: i64, reminder_id: i64, text: &str) -> Result<Reminder> {
-        self.db
-            .update_reminder_description(user_id, reminder_id, Some(description(text)?))
-            .await?
-            .ok_or(Error::NotFound)
-    }
-
-    /// Deletes a reminder and stops its nagging; returns what was deleted.
-    pub async fn delete(&self, user_id: i64, reminder_id: i64) -> Result<Reminder> {
-        let reminder = self.reminder(user_id, reminder_id).await?;
-        self.db.delete_reminder(user_id, reminder_id).await?;
-        Ok(reminder)
-    }
-
-    pub async fn delete_all(&self, user_id: i64) -> Result<usize> {
-        Ok(self.db.delete_all_reminders(user_id).await?)
-    }
-
-    // ---- drafts (text waiting for a time) ------------------------------------------------
-
-    pub async fn start_draft(&self, user_id: i64, text: &str, now: DateTime<Utc>) -> Result<Draft> {
-        Ok(self
-            .db
-            .create_draft(user_id, description(text)?, now)
-            .await?)
-    }
-
-    pub async fn draft(&self, user_id: i64, draft_id: i64) -> Result<Draft> {
-        self.db
-            .draft(user_id, draft_id)
-            .await?
-            .ok_or(Error::NotFound)
-    }
-
-    /// The user's draft if it was started within `window`.
-    pub async fn pending_draft(
-        &self,
-        user_id: i64,
-        window: Duration,
-        now: DateTime<Utc>,
-    ) -> Result<Option<Draft>> {
-        Ok(self.db.pending_draft(user_id, now - window).await?)
-    }
-
-    pub async fn cancel_draft(&self, user_id: i64, draft_id: i64) -> Result<()> {
-        self.db.delete_draft(user_id, draft_id).await?;
-        Ok(())
-    }
-
-    /// Turns a draft into a reminder. `NotFound` if it was already saved or cancelled.
-    pub async fn save_draft(
-        &self,
-        user: &User,
-        draft_id: i64,
-        at: NaiveDateTime,
-        recurrence: Recurrence,
-        now: DateTime<Utc>,
-    ) -> Result<Reminder> {
-        let due_at = first_due(at, recurrence, user.tz, now)?;
-        self.db
-            .save_draft_with_anchor(user.id, draft_id, due_at, recurrence, Some(at))
-            .await?
-            .ok_or(Error::NotFound)
-    }
-
-    // ---- naggings ------------------------------------------------------------------------
-
-    /// All unfinished occurrences, including those explicitly snoozed into the future.
-    pub async fn pending(&self, user_id: i64) -> Result<Vec<Nagging>> {
-        Ok(self.db.naggings_for_user(user_id).await?)
-    }
-
-    /// Records completion and optionally schedules one check. Returns `false` if already done.
-    #[cfg(test)]
-    pub async fn done(&self, user_id: i64, nagging_id: i64) -> Result<bool> {
-        self.done_at(user_id, nagging_id, Utc::now()).await
-    }
-
-    pub async fn done_at(&self, user_id: i64, nagging_id: i64, now: DateTime<Utc>) -> Result<bool> {
-        Ok(self.db.complete_nagging(user_id, nagging_id, now).await?)
-    }
-
-    /// Stops naggings by reminder id, for buttons sent by the .NET bot.
-    pub async fn done_legacy(&self, user_id: i64, reminder_id: i64) -> Result<bool> {
-        Ok(self.db.acknowledge_reminder(user_id, reminder_id).await?)
-    }
-
-    /// Postpones a nagging; returns when it will nag again, or `None` if it was already done.
-    pub async fn snooze(
-        &self,
-        user: &User,
-        nagging_id: i64,
-        snooze: Snooze,
-        now: DateTime<Utc>,
-    ) -> Result<Option<DateTime<Utc>>> {
-        let until = match snooze {
-            Snooze::TenMinutes => now + Duration::minutes(10),
-            Snooze::OneHour => now + Duration::hours(1),
-            Snooze::TomorrowMorning => {
-                let tomorrow = user.tz.local(now).date() + Duration::days(1);
-                user.tz.utc(tomorrow.and_time(SNOOZE_MORNING))
-            }
-        };
-        let snoozed = self.db.snooze_nagging(user.id, nagging_id, until).await?;
-        Ok(snoozed.then_some(until))
-    }
-
-    // ---- calendar feed -------------------------------------------------------------------
-
-    /// The user's feed token; `reset` replaces it, revoking the old feed URL.
-    pub async fn calendar_token(&self, user_id: i64, reset: bool) -> Result<String> {
-        self.db
-            .calendar_token(user_id, reset)
-            .await?
-            .ok_or(Error::NotRegistered)
-    }
-
-    /// The feed owner and their reminders, if the token is valid.
-    pub async fn calendar_feed(&self, token: &str) -> Result<Option<(User, Vec<Reminder>)>> {
-        let Some(user) = self.db.user_by_calendar_token(token.to_owned()).await? else {
-            return Ok(None);
-        };
-        let reminders = self.db.reminders_for_user(user.id).await?;
-        Ok(Some((user, reminders)))
-    }
-}
-
-fn description(text: &str) -> Result<String> {
-    let text = text.trim();
-    if text.is_empty() {
-        return Err(InputError::EmptyDescription.into());
-    }
-    if text.chars().count() > MAX_DESCRIPTION_CHARS {
-        return Err(InputError::DescriptionTooLong.into());
-    }
-    Ok(text.to_owned())
-}
-
-/// A time that has passed moves to the next occurrence; for one-off reminders it is an error.
-fn first_due(
-    at: NaiveDateTime,
-    recurrence: Recurrence,
-    tz: UserTz,
-    now: DateTime<Utc>,
-) -> Result<DateTime<Utc>> {
-    recurrence
-        .first_due(at, tz, now)
-        .ok_or_else(|| InputError::InPast.into())
-}
+pub use crate::application::{Error, Profile, ReminderInput, Result};
+pub type Service = crate::application::ReminderService<crate::db::Db>;
 
 #[cfg(test)]
 mod tests {
+    use crate::application::MAX_DESCRIPTION_CHARS;
+    use crate::application::ports::Registration;
+    use crate::db::Db;
+    use crate::model::{InputError, Preferences, Recurrence, Snooze, User, UserTz};
+    use chrono::{DateTime, Duration, NaiveDateTime, Utc};
+
     use super::*;
     use chrono::NaiveDate;
     use chrono_tz::Tz;
@@ -501,7 +160,7 @@ mod tests {
             .unwrap();
         let due = reminder.due_at;
         let nagging = service
-            .db
+            .repository()
             .fire_reminder(reminder.id, due, due)
             .await
             .unwrap()
@@ -548,7 +207,7 @@ mod tests {
             None
         );
         let checks = service
-            .db
+            .repository()
             .due_confirmations(due + Duration::minutes(20))
             .await
             .unwrap();
@@ -631,7 +290,7 @@ mod tests {
             .unwrap();
         assert_eq!(reminder.anchor_local, Some(anchor));
         service
-            .db
+            .repository()
             .fire_reminder(reminder.id, reminder.due_at, reminder.due_at)
             .await
             .unwrap();
@@ -650,7 +309,7 @@ mod tests {
         assert_eq!(renamed.anchor_local, Some(anchor));
         assert_eq!(user.tz.local(renamed.due_at), february);
         service
-            .db
+            .repository()
             .fire_reminder(reminder.id, renamed.due_at, renamed.due_at)
             .await
             .unwrap();
@@ -719,7 +378,7 @@ mod tests {
         assert_eq!(reminder.anchor_local, Some(anchor));
         assert_eq!(user.tz.local(reminder.due_at), local(2026, 3, 29, 2, 30));
         service
-            .db
+            .repository()
             .fire_reminder(reminder.id, reminder.due_at, reminder.due_at)
             .await
             .unwrap();
@@ -763,7 +422,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let db = &service.db;
+        let db = service.repository();
         let nagging = db
             .fire_reminder(reminder.id, reminder.due_at, reminder.due_at)
             .await
@@ -850,5 +509,61 @@ mod tests {
             Preferences::default(),
             "unregister also clears preferences before timezone registration"
         );
+    }
+    #[tokio::test]
+    async fn an_elapsed_duration_preserves_the_second_clock_occurrence() {
+        let (service, _) = setup().await;
+        let london = UserTz::parse("Europe/London").unwrap();
+        let (user, _) = service
+            .set_timezone(
+                Profile {
+                    id: 1,
+                    first_name: "Ada".into(),
+                    last_name: String::new(),
+                },
+                london,
+            )
+            .await
+            .unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-10-25T00:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let target = now + Duration::hours(1);
+        let draft = service.start_draft(user.id, "proof", now).await.unwrap();
+        let reminder = service
+            .save_draft_at(&user, draft.id, target, Recurrence::Daily, now)
+            .await
+            .unwrap();
+        assert_eq!(reminder.due_at, target);
+        assert_eq!(reminder.anchor_local, Some(london.local(target)));
+        let renamed = service
+            .update_at(
+                &user,
+                reminder.id,
+                Some("updated"),
+                target,
+                Recurrence::Daily,
+                now,
+            )
+            .await
+            .unwrap();
+        assert_eq!(renamed.due_at, target);
+        assert_eq!(renamed.description, "updated");
+    }
+
+    #[tokio::test]
+    async fn an_exact_weekend_selection_still_obeys_weekday_recurrence() {
+        let (service, user) = setup().await;
+        let target = SGT.utc(local(2026, 10, 17, 9, 0));
+        let draft = service
+            .start_draft(user.id, "weekdays", now())
+            .await
+            .unwrap();
+        let reminder = service
+            .save_draft_at(&user, draft.id, target, Recurrence::Weekdays, now())
+            .await
+            .unwrap();
+        assert_eq!(reminder.due_at, SGT.utc(local(2026, 10, 19, 9, 0)));
+        assert_eq!(reminder.anchor_local, Some(local(2026, 10, 17, 9, 0)));
     }
 }

@@ -1,6 +1,7 @@
 import {
   DisclosurePanel as CollapsibleContentPrimitive,
   Disclosure as CollapsiblePrimitive,
+  DisclosureGroupStateContext,
   Button as CollapsibleTriggerPrimitive,
   type ButtonProps,
   type DisclosurePanelProps,
@@ -8,7 +9,12 @@ import {
 } from "react-aria-components"
 
 function Collapsible({ ...props }: DisclosureProps) {
-  return <CollapsiblePrimitive data-slot="collapsible" {...props} />
+  // A standalone disclosure must not toggle the enclosing accordion's expanded keys.
+  return (
+    <DisclosureGroupStateContext.Provider value={null}>
+      <CollapsiblePrimitive data-slot="collapsible" {...props} />
+    </DisclosureGroupStateContext.Provider>
+  )
 }
 
 function CollapsibleTrigger({ ...props }: ButtonProps) {

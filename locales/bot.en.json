@@ -92,6 +92,9 @@
   "list.empty": "You have no reminders. Send me any message to create one.",
   "list.heading": "Your reminders ({timezone}):\n",
   "list.more": "\n\n…and {count} more.",
+  "list.page": "\n\nPage {page} of {pages}.",
+  "list.previous": "⬅ Previous",
+  "list.next": "Next ➡",
   "list.hint": "\n\nTap a reminder to change or delete it.",
   "relative.now": "now",
   "relative.minutes": "in {minutes} min",
@@ -131,5 +134,12 @@
   "calendar.instructions": "📅 Your private calendar link:\n{webcal}\n\nSubscribe once to see reminders in your phone’s calendar, with offline alarms at the scheduled time, then after 5 and 10 minutes. Changes normally appear within about 15 minutes.\n\niPhone: Settings → Calendar (Apps → Calendar on iOS 18) → Accounts → Add Account → Other → Add Subscribed Calendar. Turn OFF “Remove Alerts”.\n\nGoogle Calendar (web): Other calendars → + → From URL:\n{url}\nGoogle refreshes only every few hours and may not alert you.\n\nKeep the link private: anyone with it can see your reminders. Tap “New link” to revoke it.",
   "yandex.connected": "💛 Yandex is connected. Open reminders, choose a scenario in the Alice section and test it. Announcements are enabled separately.",
   "yandex.confirm_failed": "Could not confirm the connection. Return to the Mini App and start signing in again from your own Telegram account.",
-  "yandex.unavailable": "Connecting Alice is not available yet. Please try again later."
+  "yandex.unavailable": "Connecting Alice is not available yet. Please try again later.",
+  "button.undo_completion": "↩️ Undo completion",
+  "check.retry": "No, remind me again",
+  "undo.toast": "Completion undone",
+  "undo.already": "Already undone",
+  "undo.restored_message": "↩️ Your “Done” mark has been undone.\n\nI will remind you again in 10 minutes.",
+  "undo.already_message": "↩️ This mark has already been undone. Check the app for your current reminders.",
+  "undo.unavailable": "This mark can no longer be undone: the reminder was deleted or its next occurrence has started. Check your current reminders in the app."
 }

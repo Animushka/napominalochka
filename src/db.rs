@@ -3,6 +3,14 @@
 //! A single connection is shared behind a mutex; every call runs on tokio's blocking pool
 //! so database I/O never stalls the async runtime.
 
+mod delivery;
+mod history;
+mod reminder_settings;
+mod repository;
+
+#[cfg(test)]
+mod migration_tests;
+
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -12,8 +20,12 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 
+#[cfg(test)]
+use crate::model::Confirmation;
+
 use crate::model::{
-    Confirmation, Draft, Nagging, Preferences, Recurrence, Reminder, User, UserTz, UtcOffset,
+    Draft, Nagging, Preferences, Recurrence, Reminder, ReminderChanges, ReminderSchedule,
+    ReminderSettings, ReminderWrite, User, UserTz, UtcOffset,
 };
 
 /// Migrations are applied in order; `PRAGMA user_version` records how many have run.
@@ -26,11 +38,14 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/005_preferences_and_confirmations.sql"),
     include_str!("../migrations/006_yandex.sql"),
     include_str!("../migrations/007_recurrence_anchor.sql"),
+    include_str!("../migrations/008_delivery_leases.sql"),
+    include_str!("../migrations/009_yandex_retry.sql"),
+    include_str!("../migrations/010_completion_history.sql"),
+    include_str!("../migrations/011_reminder_settings.sql"),
 ];
 
 const USER_COLUMNS: &str = "user_id, first_name, last_name, utc_offset_minutes, timezone";
-const REMINDER_COLUMNS: &str =
-    "reminder_id, user_id, description, due_at, recurrence, anchor_local";
+const REMINDER_COLUMNS: &str = "reminder_id, user_id, description, due_at, recurrence, anchor_local, nag_interval_minutes, confirmation_check_minutes, voice_enabled";
 
 /// Timestamps are stored as UTC text in the same format the .NET bot used (`DateTime.ToString("s")`).
 const TIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
@@ -40,12 +55,7 @@ pub struct Db {
     conn: Arc<Mutex<Connection>>,
 }
 
-/// Whether `upsert_user` created a new user or updated an existing one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Registration {
-    Created,
-    Updated,
-}
+pub use crate::application::ports::Registration;
 
 impl Db {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
@@ -124,7 +134,7 @@ impl Db {
                 params![language, nag_interval_minutes, confirmation_check_minutes, user_id], preferences_from_row,
             )?;
             if settings.confirmation_check_minutes == 0 {
-                tx.execute("DELETE FROM confirmations WHERE user_id = ?1", [user_id])?;
+                tx.execute(&format!("DELETE FROM confirmations WHERE user_id = ?1 AND ({}) <> 20", reminder_settings::EFFECTIVE_CONFIRMATION_CHECK), [user_id])?;
             }
             tx.commit()?;
             Ok(settings)
@@ -252,20 +262,23 @@ impl Db {
         recurrence: Recurrence,
         anchor_local: Option<NaiveDateTime>,
     ) -> anyhow::Result<Reminder> {
-        self.call(move |conn| {
-            conn.execute(
-                "INSERT INTO reminders (user_id, description, due_at, recurrence, anchor_local) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![user_id, description, DbTime(due_at), recurrence.to_db(), anchor_local.map(DbLocalTime)],
-            )?;
-            Ok(Reminder { id: conn.last_insert_rowid(), user_id, description, due_at, recurrence, anchor_local })
-        })
+        self.insert_reminder(
+            user_id,
+            ReminderWrite {
+                description,
+                due_at,
+                recurrence,
+                anchor_local,
+                settings: ReminderSettings::default(),
+            },
+        )
         .await
     }
 
     pub async fn reminders_for_user(&self, user_id: i64) -> anyhow::Result<Vec<Reminder>> {
         self.call(move |conn| {
             conn.prepare(
-                "SELECT reminder_id, user_id, description, due_at, recurrence, anchor_local
+                "SELECT reminder_id, user_id, description, due_at, recurrence, anchor_local, nag_interval_minutes, confirmation_check_minutes, voice_enabled
                  FROM reminders WHERE user_id = ?1 ORDER BY due_at, reminder_id",
             )?
             .query_map([user_id], reminder_from_row)?
@@ -320,27 +333,19 @@ impl Db {
         recurrence: Recurrence,
         anchor_local: Option<NaiveDateTime>,
     ) -> anyhow::Result<Option<Reminder>> {
-        self.call(move |conn| {
-            conn.query_row(
-                &format!(
-                    "UPDATE reminders
-                     SET description = COALESCE(?1, description), due_at = ?2, recurrence = ?3,
-                         anchor_local = ?6
-                     WHERE reminder_id = ?4 AND user_id = ?5
-                     RETURNING {REMINDER_COLUMNS}"
-                ),
-                params![
-                    description,
-                    DbTime(due_at),
-                    recurrence.to_db(),
-                    reminder_id,
-                    user_id,
-                    anchor_local.map(DbLocalTime)
-                ],
-                reminder_from_row,
-            )
-            .optional()
-        })
+        self.patch_reminder(
+            user_id,
+            reminder_id,
+            ReminderChanges {
+                description,
+                schedule: Some(ReminderSchedule {
+                    due_at,
+                    recurrence,
+                    anchor_local,
+                }),
+                settings: None,
+            },
+        )
         .await
     }
 
@@ -352,17 +357,15 @@ impl Db {
         reminder_id: i64,
         description: Option<String>,
     ) -> anyhow::Result<Option<Reminder>> {
-        self.call(move |conn| {
-            conn.query_row(
-                &format!(
-                    "UPDATE reminders SET description = COALESCE(?1, description)
-                          WHERE reminder_id = ?2 AND user_id = ?3 RETURNING {REMINDER_COLUMNS}"
-                ),
-                params![description, reminder_id, user_id],
-                reminder_from_row,
-            )
-            .optional()
-        })
+        self.patch_reminder(
+            user_id,
+            reminder_id,
+            ReminderChanges {
+                description,
+                schedule: None,
+                settings: None,
+            },
+        )
         .await
     }
 
@@ -400,7 +403,7 @@ impl Db {
     pub async fn due_reminders(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<Reminder>> {
         self.call(move |conn| {
             conn.prepare(
-                "SELECT reminder_id, user_id, description, due_at, recurrence, anchor_local
+                "SELECT reminder_id, user_id, description, due_at, recurrence, anchor_local, nag_interval_minutes, confirmation_check_minutes, voice_enabled
                  FROM reminders WHERE due_at <= ?1 ORDER BY due_at, reminder_id",
             )?
             .query_map([DbTime(now)], reminder_from_row)?
@@ -431,8 +434,8 @@ impl Db {
 
             tx.execute("DELETE FROM naggings WHERE reminder_id = ?1", [reminder.id])?;
             tx.execute(
-                "INSERT INTO naggings (reminder_id, user_id, description, next_at) VALUES (?1, ?2, ?3, ?4)",
-                params![reminder.id, reminder.user_id, reminder.description, DbTime(first_nag_at)],
+                "INSERT INTO naggings (reminder_id, user_id, description, next_at, scheduled_at, nag_interval_minutes, confirmation_check_minutes, voice_enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![reminder.id, reminder.user_id, reminder.description, DbTime(first_nag_at), DbTime(reminder.due_at), reminder.settings.nag_interval_minutes, reminder.settings.confirmation_check_minutes, reminder.settings.voice_enabled],
             )?;
             let nagging = Nagging {
                 id: tx.last_insert_rowid(),
@@ -446,8 +449,8 @@ impl Db {
                 "INSERT INTO yandex_jobs (nagging_id, user_id, generation, scenario_id, created_at)
                  SELECT ?1, user_id, generation, scenario_id, ?2 FROM yandex_connections
                  WHERE user_id = ?3 AND encrypted_tokens IS NOT NULL AND enabled = 1
-                 AND requires_reconnect = 0 AND scenario_id IS NOT NULL",
-                params![nagging.id, now.timestamp(), reminder.user_id],
+                 AND requires_reconnect = 0 AND scenario_id IS NOT NULL AND ?4 = 1",
+                params![nagging.id, now.timestamp(), reminder.user_id, reminder.settings.voice_enabled],
             )?;
 
             let tz = user_tz(&tx, reminder.user_id)?;
@@ -458,8 +461,8 @@ impl Db {
             });
             match next {
                 Some(next) => tx.execute(
-                    "UPDATE reminders SET due_at = ?1, anchor_local = ?3 WHERE reminder_id = ?2",
-                    params![DbTime(next), reminder.id, anchor.map(DbLocalTime)],
+                    "UPDATE reminders SET due_at = ?1, anchor_local = ?3, last_fired_nagging_id = ?4 WHERE reminder_id = ?2",
+                    params![DbTime(next), reminder.id, anchor.map(DbLocalTime), nagging.id],
                 )?,
                 None => tx.execute("DELETE FROM reminders WHERE reminder_id = ?1", [reminder.id])?,
             };
@@ -486,6 +489,7 @@ impl Db {
         .await
     }
 
+    #[cfg(test)]
     pub async fn due_naggings(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<Nagging>> {
         self.call(move |conn| {
             conn.prepare(
@@ -500,6 +504,7 @@ impl Db {
 
     /// Claims one due delivery only while its observed schedule is still current. A stale
     /// scheduler snapshot must not overwrite a snooze or send a completed/deleted occurrence.
+    #[cfg(test)]
     pub async fn claim_nagging(
         &self,
         observed: &Nagging,
@@ -529,7 +534,7 @@ impl Db {
         self.complete_nagging(user_id, nagging_id, Utc::now()).await
     }
 
-    /// Completion and its optional one-time check are recorded atomically.
+    /// Completion history and its optional one-time check are recorded atomically.
     pub async fn complete_nagging(
         &self,
         user_id: i64,
@@ -538,46 +543,17 @@ impl Db {
     ) -> anyhow::Result<bool> {
         self.call(move |conn| {
             let tx = conn.transaction()?;
-            let completed: Option<(String, Option<i64>)> = tx.query_row(
-                "DELETE FROM naggings WHERE nagging_id = ?1 AND user_id = ?2 RETURNING description, reminder_id",
-                [nagging_id, user_id], |row| Ok((row.get(0)?, row.get(1)?)),
-            ).optional()?;
-            let Some((description, reminder_id)) = completed else { return Ok(false) };
-            let delay: i64 = tx.query_row("SELECT confirmation_check_minutes FROM preferences WHERE user_id = ?1", [user_id], |row| row.get(0)).optional()?.unwrap_or(0);
-            if delay == 20 {
-                tx.execute("INSERT INTO confirmations (source_nagging_id, reminder_id, user_id, description, due_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![nagging_id, reminder_id, user_id, description, DbTime(now + chrono::Duration::minutes(delay))])?;
-            }
+            let changed = history::complete(&tx, user_id, nagging_id, now)?;
             tx.commit()?;
-            Ok(true)
-        }).await
+            Ok(changed)
+        })
+        .await
     }
 
+    #[cfg(test)]
     pub async fn due_confirmations(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<Confirmation>> {
-        self.call(move |conn| conn.prepare("SELECT confirmation_id, user_id, description, due_at FROM confirmations WHERE due_at <= ?1 ORDER BY due_at, confirmation_id")?
-            .query_map([DbTime(now)], |row| Ok(Confirmation { id: row.get(0)?, user_id: row.get(1)?, description: row.get(2)?, due_at: row.get::<_, DbTime>(3)?.0 }))?.collect()).await
-    }
-
-    pub async fn delete_confirmation(&self, id: i64) -> anyhow::Result<()> {
-        self.call(move |conn| {
-            conn.execute("DELETE FROM confirmations WHERE confirmation_id = ?1", [id])?;
-            Ok(())
-        })
-        .await
-    }
-
-    pub async fn postpone_confirmation(
-        &self,
-        id: i64,
-        due_at: DateTime<Utc>,
-    ) -> anyhow::Result<()> {
-        self.call(move |conn| {
-            conn.execute(
-                "UPDATE confirmations SET due_at = ?1 WHERE confirmation_id = ?2",
-                params![DbTime(due_at), id],
-            )?;
-            Ok(())
-        })
-        .await
+        self.call(move |conn| conn.prepare("SELECT confirmation_id, user_id, description, due_at, completion_id FROM confirmations WHERE due_at <= ?1 ORDER BY due_at, confirmation_id")?
+            .query_map([DbTime(now)], |row| Ok(Confirmation { id: row.get(0)?, user_id: row.get(1)?, description: row.get(2)?, due_at: row.get::<_, DbTime>(3)?.0, completion_id: row.get(4)? }))?.collect()).await
     }
 
     /// Postpones the next nag. Only the user being nagged can snooze it.
@@ -590,7 +566,7 @@ impl Db {
         self.call(move |conn| {
             let tx = conn.transaction()?;
             let changed = tx.execute(
-                "UPDATE naggings SET next_at = ?1 WHERE nagging_id = ?2 AND user_id = ?3",
+                "UPDATE naggings SET next_at = ?1, delivery_claim = NULL, delivery_lease_until = NULL, delivery_attempts = 0 WHERE nagging_id = ?2 AND user_id = ?3",
                 params![DbTime(next_at), nagging_id, user_id],
             )? > 0;
             if changed {
@@ -614,27 +590,17 @@ impl Db {
         user_id: i64,
         reminder_id: i64,
     ) -> anyhow::Result<bool> {
-        let due_at = Utc::now() + chrono::Duration::minutes(20);
+        let now = Utc::now();
         self.call(move |conn| {
             let tx = conn.transaction()?;
-            tx.execute(
-                "INSERT INTO confirmations (source_nagging_id, reminder_id, user_id, description, due_at)
-                 SELECT nagging_id, reminder_id, user_id, description, ?1 FROM naggings
-                 WHERE reminder_id = ?2 AND user_id = ?3
-                 AND EXISTS (SELECT 1 FROM preferences WHERE user_id = ?3 AND confirmation_check_minutes = 20)
-                 ON CONFLICT (source_nagging_id) DO NOTHING",
-                params![DbTime(due_at), reminder_id, user_id],
-            )?;
-            let removed = tx.execute("DELETE FROM naggings WHERE reminder_id = ?1 AND user_id = ?2", [reminder_id, user_id])? > 0;
+            let ids = tx.prepare("SELECT nagging_id FROM naggings WHERE reminder_id=?1 AND user_id=?2 ORDER BY nagging_id")?
+                .query_map([reminder_id,user_id], |row| row.get::<_,i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut changed = false;
+            for id in ids { changed |= history::complete(&tx,user_id,id,now)?; }
             tx.commit()?;
-            Ok(removed)
+            Ok(changed)
         }).await
-    }
-
-    /// Stops nagging a user, e.g. after they blocked the bot.
-    pub async fn delete_naggings_for_user(&self, user_id: i64) -> anyhow::Result<usize> {
-        self.call(move |conn| conn.execute("DELETE FROM naggings WHERE user_id = ?1", [user_id]))
-            .await
     }
 
     // ---- drafts ------------------------------------------------------------------------
@@ -744,7 +710,7 @@ impl Db {
                 "INSERT INTO reminders (user_id, description, due_at, recurrence, anchor_local) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![user_id, description, DbTime(due_at), recurrence.to_db(), anchor_local.map(DbLocalTime)],
             )?;
-            let reminder = Reminder { id: tx.last_insert_rowid(), user_id, description, due_at, recurrence, anchor_local };
+            let reminder = Reminder { id: tx.last_insert_rowid(), user_id, description, due_at, recurrence, anchor_local, settings: ReminderSettings::default() };
             tx.commit()?;
             Ok(Some(reminder))
         })
@@ -858,6 +824,11 @@ fn reminder_from_row(row: &Row<'_>) -> rusqlite::Result<Reminder> {
         recurrence: Recurrence::from_db(recurrence)
             .ok_or_else(|| invalid_column(4, "unknown recurrence"))?,
         anchor_local: row.get::<_, Option<DbLocalTime>>(5)?.map(|time| time.0),
+        settings: ReminderSettings {
+            nag_interval_minutes: row.get(6)?,
+            confirmation_check_minutes: row.get(7)?,
+            voice_enabled: row.get(8)?,
+        },
     })
 }
 

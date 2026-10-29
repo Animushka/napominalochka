@@ -1,15 +1,19 @@
+mod application;
 mod calendar;
 mod callback;
 mod commands;
 mod config;
 mod conversation;
 mod db;
+mod delivery;
 mod frontend;
+mod health;
 mod i18n;
 mod model;
 mod panels;
 mod scheduler;
 mod service;
+mod supervisor;
 mod telegram;
 mod time_input;
 mod web;
@@ -18,6 +22,7 @@ mod yandex_web;
 
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use teloxide::adaptors::throttle::Limits;
@@ -62,7 +67,9 @@ fn main() -> ExitCode {
         }
     };
 
-    match runtime.block_on(run(config)) {
+    let result = runtime.block_on(run(config));
+    runtime.shutdown_timeout(Duration::from_secs(2));
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(error = format!("{error:#}"), "fatal error");
@@ -104,22 +111,34 @@ async fn run(config: Config) -> anyhow::Result<()> {
         .map(|settings| yandex::Yandex::new(settings, db.clone()))
         .transpose()
         .context("configuring Yandex integration")?;
-    let yandex_worker = yandex.clone().map(|integration| {
+    let health = health::Health::new();
+    let mut supervisor = supervisor::Supervisor::new(Duration::from_secs(10));
+    if let Some(integration) = yandex.clone() {
         let shutdown = shutdown.clone();
-        tokio::spawn(async move { integration.run_worker(shutdown).await })
+        supervisor.spawn("yandex", async move {
+            integration.run_worker(shutdown).await;
+            Ok(())
+        });
+    }
+    let planner_shutdown = shutdown.clone();
+    let heartbeat = health.heartbeat();
+    let notifier = telegram::TelegramNotifier(bot.clone(), service.clone());
+    supervisor.spawn("planner and delivery", async move {
+        scheduler::run_monitored(notifier, db, planner_shutdown, heartbeat).await;
+        Ok(())
     });
-    let scheduler = tokio::spawn(scheduler::run(
-        telegram::TelegramNotifier(bot.clone(), service.clone()),
-        db,
-        shutdown.clone(),
-    ));
     let web_state = Arc::new(web::WebState {
         service: service.clone(),
         bot_token: config.telegram_token.clone(),
+        bot_username: bot_info.username.clone(),
         web_app_url: config.web_app_url.clone(),
         yandex: yandex.clone(),
+        health: health.clone(),
     });
-    let web_server = tokio::spawn(web::serve(config.web_listen, web_state, shutdown.clone()));
+    supervisor.spawn(
+        "web",
+        web::serve(config.web_listen, web_state, shutdown.clone()),
+    );
 
     let handler = dptree::entry()
         .branch(Update::filter_message().endpoint(telegram::handle_message))
@@ -138,24 +157,19 @@ async fn run(config: Config) -> anyhow::Result<()> {
         .build();
 
     let dispatcher_token = dispatcher.shutdown_token();
-    let signal_shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        wait_for_shutdown_signal().await;
-        tracing::info!("shutting down");
-        signal_shutdown.cancel();
-        if let Ok(done) = dispatcher_token.shutdown() {
-            done.await;
-        }
+    supervisor.spawn("telegram", async move {
+        dispatcher.dispatch().await;
+        Ok(())
     });
-
-    dispatcher.dispatch().await;
-    shutdown.cancel();
-    scheduler.await.context("scheduler task panicked")?;
-    if let Some(worker) = yandex_worker {
-        worker.await.context("Yandex worker task panicked")?;
-    }
-    web_server.await.context("web server task panicked")??;
-    Ok(())
+    supervisor
+        .run_until(wait_for_shutdown_signal(), shutdown, || async move {
+            health.stop();
+            tracing::info!("shutting down");
+            if let Ok(done) = dispatcher_token.shutdown() {
+                done.await;
+            }
+        })
+        .await
 }
 
 /// Resolves on Ctrl+C or, on Unix, SIGTERM (what `docker stop` sends).
