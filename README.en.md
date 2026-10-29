@@ -125,11 +125,12 @@ backoff; take a consistent SQLite backup before updating a running instance.
 See [backend architecture](docs/backend-architecture.md) for boundaries and guarantees.
 
 
-## Completion history and individual settings
+## Undo completion and individual settings
 
-Done marks now create a persistent, owner-scoped journal with timestamps. The Mini
-App loads history lazily with cursor pagination; Telegram completion messages have
-Undo, and follow-up checks include “No, remind me again”. Undo restores one pending
+Telegram completion messages have Undo, and follow-up checks include “No, remind
+me again”. The Mini App shows scheduled and pending reminders without a separate
+history section. A persistent, owner-scoped server journal supports undo and
+follow-up checks. Undo restores one pending
 occurrence for ten minutes later without triggering Alice; repeated clicks are
 idempotent. A newer recurring occurrence or a deleted parent prevents old undo.
 History starts with new marks after this update and is deleted with `/unregister`.

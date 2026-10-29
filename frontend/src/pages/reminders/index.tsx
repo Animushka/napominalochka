@@ -9,7 +9,6 @@ import { ReminderEditor, ReminderList, ReminderStateProvider, useReminderState }
 import { Preferences } from '@/features/preferences';
 import { Calendar } from '@/features/calendar';
 import { AlicePanel } from '@/features/alice';
-import { HistoryPanel } from '@/features/history';
 
 export function RemindersPage({ accountKey }: { accountKey: string }) {
   const [editing, setEditing] = useState<ReminderDTO | null | undefined>(undefined);
@@ -53,7 +52,6 @@ function Screen({ accountKey, editing, setEditing }: {
       <Button size="lg" className="min-h-11 w-full" onPress={() => open(null)}><Plus aria-hidden="true" />{t('action.add')}</Button>
       {error && <Alert variant="destructive"><AlertDescription>{t(errorKey(error))}</AlertDescription></Alert>}
       <ReminderList state={state} onEdit={open} />
-      <HistoryPanel />
       <p className="flex items-center justify-center gap-1.5 text-xs text-muted-foreground"><Clock3 className="size-3.5" aria-hidden="true" />{t('timezone.label')} {state.timezone}</p>
       <div className="space-y-3">
         <Preferences state={state} />

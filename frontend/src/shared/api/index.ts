@@ -22,7 +22,6 @@ export const errorKeys: Readonly<Record<string, string>> = {
   past_time: "errors.dateInPast", time_in_past: "errors.dateInPast", date_in_past: "errors.dateInPast", past_datetime: "errors.dateInPast",
   empty_description: "errors.descriptionRequired", description_required: "errors.descriptionRequired", description_too_long: "errors.descriptionTooLong",
   invalid_timezone: "errors.timezone", timezone_required: "errors.timezone",
-  completion_unavailable: "errors.completionUnavailable",
   invalid_preferences: "errors.preferences", calendar_disabled: "errors.calendarDisabled", rate_limited: "errors.rateLimited",
   yandex_not_connected: "yandex.errors.notConnected", yandex_reconnect_required: "yandex.errors.reconnect",
   yandex_scenario_missing: "yandex.errors.scenarioMissing", yandex_rate_limited: "yandex.errors.rateLimited",

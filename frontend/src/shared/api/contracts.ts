@@ -8,20 +8,6 @@ export interface ReminderSettings {
   voice_enabled: boolean;
 }
 
-export interface CompletionDTO {
-  id: number;
-  description: string;
-  scheduled_at: string | null;
-  completed_at: string;
-  undone_at: string | null;
-  can_undo: boolean;
-}
-
-export interface HistoryPageDTO {
-  items: CompletionDTO[];
-  next_cursor: number | null;
-}
-
 export interface ReminderDTO {
   id: number;
   description: string;

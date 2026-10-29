@@ -3,9 +3,15 @@ import { MockApp, aliceAccordion, chooseScenario, openAlice, preferencesAccordio
 
 test('Done removes only the pending occurrence and retains the recurring reminder', async ({ page }) => {
   const app = new MockApp(); await app.install(page); await app.open(page)
+  await expect(page.getByRole('button', { name: /^Completion history / })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'View or undo completion', exact: true })).toHaveCount(0)
   await page.getByRole('button', { name: 'Mark as done: Read a chapter' }).click()
   await expect(page.getByRole('heading', { name: 'Read a chapter' })).toHaveCount(0)
   await expect(page.getByRole('button', { name: 'Edit reminder: Water the plants' })).toBeVisible()
+  await expect(page.getByRole('status')).toContainText('Done')
+  await expect(page.getByRole('button', { name: /^Completion history / })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'View or undo completion', exact: true })).toHaveCount(0)
+  expect(app.matching('GET', '/api/history')).toHaveLength(0)
   expect(app.matching('POST', '/api/pending/21/done')).toHaveLength(1)
   expect(app.matching('DELETE', '/api/reminders/11')).toHaveLength(0)
   await app.assertClean()
@@ -362,7 +368,7 @@ for (const width of [320, 390, 620]) {
     const app = new MockApp(); app.yandex.connected = true
     await app.install(page); await app.open(page)
     const accordionButtons = page.getByRole('button').filter({ has: page.locator('svg[data-slot="accordion-trigger-icon"]') })
-    await expect(accordionButtons).toHaveCount(5)
+    await expect(accordionButtons).toHaveCount(4)
     for (const button of await accordionButtons.all()) await centeredChevron(button, 'svg[data-slot="accordion-trigger-icon"]')
     await preferencesAccordion(page).click()
     await centeredChevron(preferencesAccordion(page), 'svg[data-slot="accordion-trigger-icon"]')

@@ -15,7 +15,7 @@ interface ReminderListProps {
 
 export function ReminderList({ state, onEdit }: ReminderListProps) {
   const { t, locale } = useI18n();
-  const { doneReminder, snoozeReminder, setHistoryOpen, isMutating } = useReminderState();
+  const { doneReminder, snoozeReminder, isMutating } = useReminderState();
   const [snoozeId, setSnoozeId] = useState<number | null>(null);
   const locked = useRef(false);
   const [busyId, setBusyId] = useState<number | null>(null);
@@ -44,13 +44,7 @@ export function ReminderList({ state, onEdit }: ReminderListProps) {
   }
 
   return <div className="space-y-6">
-    {status && <div className="space-y-2">
-      <p role="status" aria-live="polite" className={status.error ? 'text-sm text-destructive' : 'text-sm text-muted-foreground'}>{t(status.key)}</p>
-      {status.key === 'pending.completed' && <Button variant="outline" size="sm" onPress={() => {
-        setHistoryOpen(true);
-        requestAnimationFrame(() => document.getElementById('completion-history')?.scrollIntoView({ block: 'start', behavior: 'smooth' }));
-      }}>{t('history.viewOrUndo')}</Button>}
-    </div>}
+    {status && <p role="status" aria-live="polite" className={status.error ? 'text-sm text-destructive' : 'text-sm text-muted-foreground'}>{t(status.key)}</p>}
     {pending.length > 0 && <section aria-labelledby="pending-title" className="space-y-3">
       <div className="flex items-center gap-2">
         <h2 id="pending-title" className="text-lg font-semibold">{t('pending.title')}</h2>
