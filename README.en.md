@@ -1,114 +1,74 @@
-<p align="center"><img src="frontend/public/avatar.jpg" width="160" alt="Napominalochka bell and calendar mascot"></p>
-<h1 align="center">Napominalochka · Напоминалочка</h1>
-<p align="center">Your little reminder companion.</p>
-<p align="center"><a href="https://t.me/napominalozhka_bot">Open bot</a> · <a href="https://napomni.bot.nu">Mini App</a> · <a href="README.md">Русский</a></p>
+<p align="center"><img src="frontend/public/avatar.jpg" width="160" alt="Napominalochka"></p>
+<h1 align="center">Napominalochka</h1>
+<p align="center"><a href="https://t.me/napominalozhka_bot">Open bot</a> · <a href="README.md">Русский</a></p>
 
-A personal reminder bot with a Telegram Mini App. Create and edit reminders,
-choose a schedule, snooze, and keep receiving nudges until you tap Done.
+A reminder bot with a Telegram Mini App. Keeps reminding you until you tap Done.
 
-- Full Russian and English UI with persistent language selection.
-- One-off, daily, weekday, weekly, monthly and yearly schedules.
-- A pending section keeps fired reminders visible until Done, with snooze actions in the Mini App.
-- Per-user nudge intervals: 1, 5, 10, 20, 30 or 60 minutes; default 10.
-- Optional one-time follow-up check 20 minutes after Done. The bot asks
-  whether everything is definitely done.
-- Timezones, calendar subscription, durable reminders and completion checks.
-- One container, SQLite and signed Telegram Mini App authentication.
+## Features
+
+- One-off, daily, weekday, weekly, monthly and yearly reminders.
+- Configurable repeat intervals and snooze.
+- Optional follow-up check 20 minutes after Done.
+- Timezones, calendar export, Russian and English interfaces.
+- Voice announcements through an Alice scenario linked to your own Yandex account.
 
 ## Self-host
 
-Copy `.env.example` to `.env`, set your own `TELEGRAM_BOT_TOKEN` and HTTPS
-`WEB_APP_URL`, create `data/` writable by UID/GID 10001, then run:
+You need Docker Compose, a Telegram bot token and an HTTPS domain for the Mini App.
 
 ```sh
+cp .env.example .env
+# Set TELEGRAM_BOT_TOKEN and WEB_APP_URL in .env.
+mkdir -p data
+sudo chown 10001:10001 data
 docker compose up -d --build
+docker compose ps
 ```
 
-The service binds to `127.0.0.1:8097`; see `Caddyfile.example` for HTTPS.
-Back up SQLite consistently before upgrading. Runtime credentials, data and
-logs stay local and are excluded from Git. The public repository contains no
-production bot token or DNS account credentials.
+Configure an HTTPS proxy to `127.0.0.1:8097` using [Caddyfile.example](Caddyfile.example).
+Open your bot and send `/start`.
 
-Use `/language ru` or `/language en`, or the language selector in the Mini App.
-`ops/configure_bot.py` applies localized public profile text and the avatar
-using an environment-provided bot token.
+Data is stored in `data/`. Make a consistent SQLite backup before upgrading.
+Keep `.env`, tokens and keys out of Git.
+
+## Connect Alice
+
+For your own installation, register a Yandex OAuth app for user authorization
+with `iot:view` and `iot:control` permissions. Set its Redirect URI to
+`https://YOUR-DOMAIN/integrations/yandex/callback`.
+
+Set `YANDEX_CLIENT_ID`, `YANDEX_CLIENT_SECRET` and `YANDEX_TOKEN_KEY` in `.env`
+(generate the key with `openssl rand -hex 32`), then recreate the container:
+`docker compose up -d --force-recreate`. Keep this persistent key with your database
+backup: it decrypts stored tokens. The integration is hidden without these settings.
+
+Create a scenario with a read-aloud action in Home with Alice. Connect Yandex in
+the Mini App, confirm the link in Telegram, select and test your scenario, then
+enable announcements.
+
+Alice runs the entire selected scenario once when a reminder is due and reads
+a preset phrase. Reminder text is not sent to Yandex; repeats and follow-up
+checks stay in Telegram.
 
 ## Development
 
-Use Node.js 24 and Rust 1.88 or newer. The Mini App uses React, TypeScript,
-Vite, Tailwind and the stock shadcn/ui aria-maia kit. Source lives in
-`frontend/src`, split into `pages`, `features` and `shared`. Build the client
-first: `build.rs` embeds `frontend/dist` into the Rust binary and fails if the
-client is missing. Docker runs both stages automatically.
+Rust 1.88+, Node.js 24+. The server uses Rust and SQLite; the Mini App uses React
+and TypeScript.
 
 ```sh
 npm ci --prefix frontend
 npm run build --prefix frontend
-npm run test:unit --prefix frontend
-npx --prefix frontend playwright install chromium
-npm run test:e2e --prefix frontend
-cargo test --locked
-cargo clippy --all-targets --locked -- -D warnings
-cargo fmt --all --check
-python3 ops/check_translations.py
+cargo run --locked
 ```
 
-Run `npm run dev --prefix frontend` for the development UI; `/api` is proxied
-to the Rust server at `127.0.0.1:8080`. Signed Telegram initData is still required.
-Rebuild the frontend after client changes before starting the Rust binary.
-The UI uses the stock theme and Tailwind utilities without application CSS.
-Public OAuth pages and `/privacy` share the generated stylesheet.
-
-Chat catalogues: `locales/bot.{ru,en}.json`. Mini App catalogues:
-`frontend/src/shared/i18n/messages/{ru,en}.json`. Avatar generated with built-in image_gen; its prompt
-is in `assets/avatar-prompt.txt`.
+Pass the environment variables from `.env` to the server before starting it;
+Docker Compose reads the file automatically. The client is embedded in the binary,
+so rebuild it after changes. For UI development, run `npm run dev --prefix frontend`
+(`/api` proxies to `127.0.0.1:8080`; Telegram initData is required).
+See [CI](.github/workflows/ci.yml) for checks.
 
 ## Upstream
 
-Based on **[ExtremelyNaggyBot](https://dev.decryptology.net/decryp7/ExtremelyNaggyBot)**
-by **decryp7 (Kok Yong)**, with original history preserved. See [UPSTREAM.md](UPSTREAM.md)
-for provenance and license status, and [README.upstream.md](README.upstream.md)
-for the original documentation.
-
-## Alice: individual scenario connections
-
-The optional integration uses the official Yandex Smart Home API. Each Telegram user
-links their own account and chooses one scenario. The speaker reads the fixed phrase
-configured in Home with Alice; reminder text is not sent to Yandex. The entire selected
-scenario runs, including every configured action.
-
-Register a Yandex OAuth app **for user authorization**, request `iot:view` and
-`iot:control`, and register `https://YOUR-DOMAIN/integrations/yandex/callback` as its web
-Redirect URI. Configure `YANDEX_CLIENT_ID`, `YANDEX_CLIENT_SECRET` and a persistent
-`YANDEX_TOKEN_KEY` (32 random bytes encoded as hex) in the private `.env`, then recreate
-the container. The panel is hidden when unconfigured. Secrets never reach the Mini App;
-`/privacy` describes data handling.
-
-Users create a read-aloud scenario, connect Yandex from the Mini App, and confirm using
-the callback page's return-to-Telegram button. Only the Telegram identity that started
-the connection can redeem it. They then save a scenario, test it, and separately enable
-announcements. Announcements default to off and run only at the first due occurrence;
-Telegram handles repeats, snooze and completion checks.
-
-Delivery runs independently with a durable queue, one action per user per minute and a
-five-minute job lifetime. Ambiguous launch responses are never retried and disable
-announcements until reviewed. Disconnect and `/unregister` remove tokens and queued
-commands; dispatched actions cannot be recalled. Full provider revocation is available
-in Yandex ID settings. Tokens are AES-256-GCM encrypted; securely back up the separate
-key with the database. One-use state, PKCE and a Telegram-bound callback receipt protect
-account linking. Mock HTTP tests cover these flows; verify actual speech with a real
-account and speaker after configuration.
-
-## Scheduling reliability
-
-Recurring reminders retain their original local date/time independently of the next
-UTC occurrence. Short months clamp only that occurrence, and DST gaps do not permanently
-shift future reminders. Additive migration 007 preserves existing data; legacy records
-use their current saved date as the initial anchor on first firing. Description-only
-edits preserve the latest schedule, including when it advances while an editor is open.
-Calendar rules use the same anchors and include DST-gap exceptions for the next two
-years while ordinary recurrence remains unbounded.
-
-The Alice UI lives in `frontend/src/features/alice`; chat and Mini App share the completion/snooze
-service. API errors have stable codes and personal responses use no-store caching.
-Create a consistent SQLite backup before upgrading production.
+Based on [ExtremelyNaggyBot](https://dev.decryptology.net/decryp7/ExtremelyNaggyBot)
+by decryp7 (Kok Yong), with history and attribution preserved.
+See [UPSTREAM.md](UPSTREAM.md) for provenance and license status.
