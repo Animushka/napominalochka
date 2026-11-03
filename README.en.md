@@ -67,8 +67,6 @@ so rebuild it after changes. For UI development, run `npm run dev --prefix front
 (`/api` proxies to `127.0.0.1:8080`; Telegram initData is required).
 See [CI](.github/workflows/ci.yml) for checks.
 
-The Rust library structure and module boundaries are documented in [backend architecture](docs/backend-architecture.md).
-
 ## Upstream
 
 Based on [ExtremelyNaggyBot](https://dev.decryptology.net/decryp7/ExtremelyNaggyBot)

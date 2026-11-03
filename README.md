@@ -66,8 +66,6 @@ Docker Compose. Клиент встраивается в бинарный фай
 (прокси `/api` на `127.0.0.1:8080`; требуется Telegram initData).
 Проверки описаны в [CI](.github/workflows/ci.yml).
 
-Устройство библиотеки Rust и границы модулей описаны в [архитектуре бэкенда](docs/backend-architecture.md).
-
 ## Происхождение
 
 Основан на [ExtremelyNaggyBot](https://dev.decryptology.net/decryp7/ExtremelyNaggyBot)
