@@ -6,7 +6,7 @@ COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY frontend ./
 # Tailwind scans the public OAuth/privacy pages as well as the React application.
-COPY src/yandex_web.rs src/privacy.html /src/src/
+COPY src/adapters/http/yandex.rs src/adapters/http/privacy.html /src/src/adapters/http/
 RUN npm run build
 
 FROM rust:1-alpine AS dependencies
@@ -15,7 +15,7 @@ WORKDIR /src
 
 # Build dependencies in their own layer so source changes don't rebuild them.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo 'fn main() {}' > src/main.rs \
+RUN mkdir src && touch src/lib.rs && echo 'fn main() {}' > src/main.rs \
     && cargo build --release --locked \
     && rm -rf src
 
@@ -25,7 +25,7 @@ COPY locales ./locales
 COPY src ./src
 COPY build.rs ./
 COPY --from=frontend /src/frontend/dist ./frontend/dist
-RUN touch src/main.rs && cargo build --release --locked
+RUN touch src/main.rs src/lib.rs && cargo build --release --locked
 
 FROM alpine:3
 RUN apk add --no-cache ca-certificates \

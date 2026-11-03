@@ -61,6 +61,8 @@ npm run test:e2e --prefix frontend
 cargo test --locked
 cargo clippy --all-targets --locked -- -D warnings
 cargo fmt --all --check
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
+python3 ops/check_architecture.py
 python3 ops/check_translations.py
 ```
 
@@ -134,8 +136,11 @@ python3 ops/check_translations.py
 
 ## Архитектура и доставка
 
-Прикладные операции находятся в `src/application` и зависят от интерфейса хранилища;
-SQLite реализует его в `src/db/repository.rs`. Планирование отделено от доставки:
+Cargo-пакет содержит библиотеку `napominalochka` с внутренними модулями и тонкий
+исполняемый файл. Домен находится в `src/domain`, прикладные сервисы и интерфейсы — в `src/application`.
+Telegram, HTTP и Яндекс вынесены в `src/adapters`; сборка зависимостей — в `src/bootstrap`.
+Сервисы получают зависимости через интерфейсы; обработчики не зависят от SQLite.
+SQLite реализует интерфейс хранилища в `src/infrastructure/sqlite/repository.rs`. Планирование отделено от доставки:
 до восьми чатов обслуживаются независимо, сетевые ошибки повторяются с сохранённой
 задержкой 1/2/4/5 минут независимо от частоты обычных напоминаний. Аренды заданий
 восстанавливаются после перезапуска. `/list` разбит на страницы с ограничением

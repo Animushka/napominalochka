@@ -1,40 +1,93 @@
-# Backend boundaries
+# Backend architecture
 
-The composition root is `src/main.rs`. It constructs the SQLite adapter, reminder
-service, Telegram and HTTP adapters, Yandex integration, readiness state and the
-supervisor. Public HTTP contracts, Telegram commands and the existing database are
-preserved.
+The Cargo package contains the `napominalochka` library and the existing
+`extremely-naggy-bot` executable. `src/main.rs` returns the result of
+`napominalochka::run()`. `src/lib.rs` exposes only that documented entry point;
+implementation modules and their contracts stay private to the crate.
+
+Concrete adapters and process lifecycle are assembled in `src/bootstrap`.
+Startup failures propagate as `Result`; telemetry initialization also returns an
+error instead of panicking if a global subscriber is already installed.
+HTTP contracts, callback values, token envelopes and the SQLite schema stay compatible.
 
 ```text
-Telegram / Mini App HTTP
-          |
-      service::Service          (composition alias)
-          |
- application::ReminderService<R>
-          |
- application::ports::ReminderRepository
-          |
-   db::Db + db/repository.rs    (SQLite adapter)
-
-scheduler planning -> persisted pending occurrences
-                            |
-                    delivery::DeliveryQueue
-                            |
-                    db/delivery.rs
-                            |
-                    delivery::Notifier -> Telegram
+src/
+  lib.rs                  documented application entry point, private implementation modules
+  main.rs                 thin executable delegating to the library
+  domain/                 entities, validated timezone values, recurrence rules, errors
+  application/
+    reminders/            reminder service: CRUD, drafts, completion, preferences, calendar
+    ports/                reminder and planning repository interfaces
+    scheduling/           scheduler object, durable planning and maintenance
+    delivery.rs           queue/transport ports and bounded delivery workers
+    health.rs             readiness and planner progress
+    yandex/               OAuth, scenario actions, token maintenance and queue use cases
+      ports.rs            persistence, provider and token-vault interfaces
+      types.rs            integration data contracts and stable errors
+  adapters/
+    telegram/             commands, callbacks, conversation, keyboards, notifier
+    http/                 routes, initData authentication, error mapping, assets, OAuth pages
+    yandex/               outbound HTTP provider and AES token-vault implementations
+    calendar.rs           ICS presentation
+    i18n.rs               presentation translations
+  infrastructure/
+    sqlite/               connection, migrations, row mapping and atomic repositories
+  bootstrap/              configuration, dependency construction and worker supervision
 ```
 
-## Application and domain
+Tests live beside their owning modules in `tests.rs` (or a named `*_tests.rs`).
+They may compose the real SQLite/HTTP adapters; production inner layers cannot.
+Reminder fixtures own a database handle alongside the same service used in production;
+there is no test-only service implementation or repository accessor.
+`tests/startup.rs` exercises the compiled executable as a separate process.
 
-`model.rs` owns reminder/timezone types and calendar rules.
-`application/reminders.rs` owns validation and use cases, depending only on the
-repository port in `application/ports.rs`. It imports neither SQLite nor Telegram
-nor HTTP frameworks. Repository implementations preserve ownership and transaction
-boundaries; adapters translate application errors into user-facing responses.
+## Dependency direction
 
-`service.rs` wires the generic application service to SQLite for inbound adapters
-and holds integration tests. It contains no alternate copy of business rules.
+```text
+Telegram / HTTP adapters -> application services -> domain
+                                      |
+                               application ports
+                                      ^
+                         SQLite / HTTP / AES adapters
+
+bootstrap -> constructs and injects the concrete adapters
+```
+
+The allowed layer references are enforced by `python3 ops/check_architecture.py`
+in CI. `domain` may refer only to itself; `application` may also refer to the domain.
+Adapters and persistence implementations may refer inward and to their own layer.
+Only bootstrap chooses concrete dependencies. No transport framework, SQL driver,
+HTTP client or encryption implementation belongs in the application/domain.
+
+## Objects and encapsulation
+
+`ReminderService` encapsulates repository access and shared validation/use cases.
+It owns `Arc<dyn ReminderRepository>`: inbound adapters do not encode
+SQLite in their types. `Scheduler<R, N>` owns the planning repository and notifier;
+planning and delivery need their own ports, rather than a concrete database.
+`YandexService` owns repository/provider/token-vault interfaces and per-account locks.
+The SQLite `Db`, HTTP `Provider`, AES `TokenCipher`, `Health` and `Supervisor` own
+state for their respective responsibilities. Private fields protect that state;
+objects are cloned through shared ownership where needed. Pure calendar and
+formatting functions remain ordinary functions; no inheritance hierarchy is needed.
+
+Repository methods own transaction boundaries and generation/lease checks. Their
+interfaces exchange domain/application values, never SQLite rows or HTTP responses.
+Application code selects behavior; adapters translate protocols and errors.
+Yandex failures use the exhaustive `FailureDisposition` enum (retry at a timestamp,
+disable, reconnect) instead of independent booleans. Object-safe async ports use
+boxed futures at those boundaries; forwarding adapters return the underlying future
+directly. Shared service handles derive `Clone` over `Arc`.
+
+Project imports name their dependencies explicitly; wildcard imports are reserved
+for test fixtures and third-party preludes. SQLite schema migration lives in
+`schema.rs`, separately from connection ownership and row mapping.
+
+`rust-toolchain.toml` declares stable Rust with rustfmt and Clippy. Cargo lints forbid
+unsafe code, unused must-use results and unfinished debug/todo placeholders, and
+warn on unreachable public APIs. CI treats compiler/Clippy and rustdoc warnings as
+errors. `Cargo.lock` continues to fix dependency versions.
+
 Calendar selections stay local times; elapsed durations carry their exact UTC
 instant through typed callbacks and application methods. This distinguishes the
 second occurrence of a repeated clock time during a daylight-saving change.
@@ -59,9 +112,9 @@ and the queue uses claims to prevent simultaneous sends of the same event.
 
 ## Yandex
 
-`yandex.rs` coordinates per-account authorization and settings. `yandex/provider.rs`
-owns HTTP, `crypto.rs` owns encrypted token envelopes, and `worker.rs` owns the
-persisted voice queue. `yandex_web.rs` contains the HTTP and OAuth return adapters.
+`application/yandex` coordinates per-account authorization and settings. `adapters/yandex/provider.rs`
+owns HTTP, `adapters/yandex/crypto.rs` owns encrypted token envelopes, and `application/yandex/worker.rs` owns the
+persisted voice queue. `adapters/http/yandex.rs` contains the HTTP and OAuth return adapters.
 
 Temporary preparation/read failures retain the user's enabled setting and pending
 work with persisted backoff. A voice job is claimed only after preparation,
@@ -72,7 +125,7 @@ actual Telegram bot username.
 
 ## Lifecycle and readiness
 
-`supervisor.rs` observes every mandatory worker while the process is running. An
+`bootstrap/supervisor.rs` observes every mandatory worker while the process is running. An
 unexpected return, error or panic cancels siblings and causes an unsuccessful exit.
 The normal shutdown budget is ten seconds; runtime blocking work receives up to two
 additional seconds, within Compose's fifteen-second grace period.

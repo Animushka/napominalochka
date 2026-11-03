@@ -6,6 +6,9 @@ rust-version = "1.88"
 description = "A Telegram reminder bot that keeps nagging until you acknowledge."
 publish = false
 
+[lib]
+name = "napominalochka"
+
 [dependencies]
 anyhow = "1"
 aes-gcm = "0.10.3"
@@ -43,3 +46,13 @@ strip = true
 
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+unreachable_pub = "warn"
+unused_must_use = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"

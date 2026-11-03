@@ -3,8 +3,8 @@
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/figtree";
 
-@source "../../../src/yandex_web.rs";
-@source "../../../src/privacy.html";
+@source "../../../src/adapters/http/yandex.rs";
+@source "../../../src/adapters/http/privacy.html";
 
 @custom-variant dark (&:is(.dark *));
 

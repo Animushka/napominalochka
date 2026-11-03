@@ -50,6 +50,8 @@ npm run test:e2e --prefix frontend
 cargo test --locked
 cargo clippy --all-targets --locked -- -D warnings
 cargo fmt --all --check
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
+python3 ops/check_architecture.py
 python3 ops/check_translations.py
 ```
 
@@ -116,8 +118,11 @@ Create a consistent SQLite backup before upgrading production.
 
 ## Backend architecture and delivery
 
-Use cases live in `src/application`, depending on a repository port implemented by
-`src/db/repository.rs`. Planning is separate from bounded per-chat delivery; durable
+The Cargo package contains the `napominalochka` library with private modules and a
+thin executable. The domain lives in `src/domain`, application services/ports in `src/application`,
+transport adapters in `src/adapters`, and dependency composition in `src/bootstrap`.
+Use cases depend on a repository port implemented by
+`src/infrastructure/sqlite/repository.rs`. Planning is separate from bounded per-chat delivery; durable
 technical retries use 1/2/4/5-minute backoff independently of the nag interval.
 Mandatory tasks are supervised, and `/health` checks storage and planner progress.
 Migrations 008/009 extend existing data with delivery leases and Yandex preparation
