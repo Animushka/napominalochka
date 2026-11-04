@@ -1,17 +1,19 @@
 //! Atomic Yandex persistence operations. No SQL escapes this adapter.
 use super::Db;
+use crate::application::ports::StorageResult;
 use crate::application::yandex::ports::YandexRepository;
 use crate::application::yandex::types::{
     ActionResult, AuthState, Connection, ConnectionFailure, DispatchWindow, Error,
     FailureDisposition, Job, NewAuth, PendingGrant, Result, Scenario,
 };
+use crate::domain::UserId;
 use futures_util::future::BoxFuture;
 use rusqlite::{OptionalExtension, Row, params};
 
 const CONNECTION_COLUMNS: &str = "generation, encrypted_tokens, expires_at, enabled, requires_reconnect, scenario_id, scenario_name, last_error, refresh_after";
 
 impl YandexRepository for Db {
-    fn recover_claims(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn recover_claims(&self) -> BoxFuture<'_, StorageResult<()>> {
         Box::pin(async move {
             self.call(|conn| {
                 let tx = conn.transaction()?;
@@ -25,7 +27,7 @@ impl YandexRepository for Db {
         &self,
         job: Job,
         result: Result<ActionResult>,
-    ) -> BoxFuture<'_, anyhow::Result<()>> {
+    ) -> BoxFuture<'_, StorageResult<()>> {
         Box::pin(async move {
             self.call(move |conn| {
                 let tx = conn.transaction()?;
@@ -45,7 +47,7 @@ impl YandexRepository for Db {
             }).await
         })
     }
-    fn next_job(&self, window: DispatchWindow) -> BoxFuture<'_, anyhow::Result<Option<Job>>> {
+    fn next_job(&self, window: DispatchWindow) -> BoxFuture<'_, StorageResult<Option<Job>>> {
         Box::pin(async move {
             self.call(move |conn| {
                 let tx = conn.transaction()?;
@@ -60,7 +62,7 @@ impl YandexRepository for Db {
             }).await
         })
     }
-    fn claim_job(&self, job: Job, window: DispatchWindow) -> BoxFuture<'_, anyhow::Result<bool>> {
+    fn claim_job(&self, job: Job, window: DispatchWindow) -> BoxFuture<'_, StorageResult<bool>> {
         Box::pin(async move {
             self.call(move |conn| {
                 let tx = conn.transaction()?;
@@ -71,12 +73,12 @@ impl YandexRepository for Db {
             }).await
         })
     }
-    fn job_valid(&self, job: Job, window: DispatchWindow) -> BoxFuture<'_, anyhow::Result<bool>> {
+    fn job_valid(&self, job: Job, window: DispatchWindow) -> BoxFuture<'_, StorageResult<bool>> {
         Box::pin(async move {
             self.call(move |conn| conn.query_row("SELECT EXISTS (SELECT 1 FROM yandex_jobs j JOIN yandex_connections c ON j.user_id = c.user_id WHERE j.job_id = ?1 AND j.state = 'claimed' AND j.created_at >= ?2 AND j.generation = c.generation AND j.scenario_id = c.scenario_id AND c.enabled = 1 AND c.requires_reconnect = 0 AND c.encrypted_tokens IS NOT NULL)", params![job.id, window.oldest_created_at], |row| row.get(0))).await
         })
     }
-    fn save_auth(&self, auth: NewAuth) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn save_auth(&self, auth: NewAuth) -> BoxFuture<'_, StorageResult<()>> {
         Box::pin(async move {
             let NewAuth {
                 user_id,
@@ -98,7 +100,7 @@ impl YandexRepository for Db {
             }).await
         })
     }
-    fn cancel_auth(&self, user_id: i64, hash: String) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn cancel_auth(&self, user_id: UserId, hash: String) -> BoxFuture<'_, StorageResult<()>> {
         Box::pin(async move {
             self.call(move |conn| {
                 conn.execute("UPDATE yandex_connections SET auth_nonce = NULL WHERE user_id = ?1 AND auth_nonce = ?2", params![user_id, hash])?;
@@ -106,7 +108,7 @@ impl YandexRepository for Db {
             }).await
         })
     }
-    fn save_grant(&self, grant: PendingGrant) -> BoxFuture<'_, anyhow::Result<bool>> {
+    fn save_grant(&self, grant: PendingGrant) -> BoxFuture<'_, StorageResult<bool>> {
         Box::pin(async move {
             let PendingGrant {
                 completion_hash,
@@ -128,10 +130,10 @@ impl YandexRepository for Db {
     }
     fn confirm_auth(
         &self,
-        user_id: i64,
+        user_id: UserId,
         hash: String,
         now: i64,
-    ) -> BoxFuture<'_, anyhow::Result<bool>> {
+    ) -> BoxFuture<'_, StorageResult<bool>> {
         Box::pin(async move {
             self.call(move |conn| {
                 let tx = conn.transaction()?;
@@ -151,12 +153,12 @@ impl YandexRepository for Db {
         &self,
         hash: String,
         now: i64,
-    ) -> BoxFuture<'_, anyhow::Result<Option<AuthState>>> {
+    ) -> BoxFuture<'_, StorageResult<Option<AuthState>>> {
         Box::pin(async move {
             self.call(move |conn| {
                 let tx = conn.transaction()?;
                 // DELETE RETURNING consumes even an expired state, preventing replay.
-                let row: Option<(i64, Vec<u8>, i64, String)> = tx.query_row("DELETE FROM yandex_oauth_states WHERE state_hash = ?1 RETURNING user_id, encrypted_verifier, expires_at, language", [&hash], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).optional()?;
+                let row: Option<(UserId, Vec<u8>, i64, crate::domain::Language)> = tx.query_row("DELETE FROM yandex_oauth_states WHERE state_hash = ?1 RETURNING user_id, encrypted_verifier, expires_at, language", [&hash], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).optional()?;
                 tx.commit()?;
                 Ok(row.filter(|row| row.2 > now).map(|(user_id, encrypted_verifier, _, language)| AuthState { user_id, state_hash: hash, encrypted_verifier, language }))
             }).await
@@ -164,11 +166,11 @@ impl YandexRepository for Db {
     }
     fn configure(
         &self,
-        user_id: i64,
+        user_id: UserId,
         generation: String,
         selected: Option<Scenario>,
         enabled: bool,
-    ) -> BoxFuture<'_, anyhow::Result<bool>> {
+    ) -> BoxFuture<'_, StorageResult<bool>> {
         Box::pin(async move {
             self.call(move |conn| {
                 let tx = conn.transaction()?;
@@ -180,7 +182,7 @@ impl YandexRepository for Db {
             }).await
         })
     }
-    fn disconnect(&self, user_id: i64) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn disconnect(&self, user_id: UserId) -> BoxFuture<'_, StorageResult<()>> {
         Box::pin(async move {
             self.call(move |conn| {
                 conn.execute(
@@ -192,7 +194,7 @@ impl YandexRepository for Db {
             .await
         })
     }
-    fn connection(&self, user_id: i64) -> BoxFuture<'_, anyhow::Result<Option<Connection>>> {
+    fn connection(&self, user_id: UserId) -> BoxFuture<'_, StorageResult<Option<Connection>>> {
         Box::pin(async move {
             self.call(move |conn| {
                 conn.query_row(
@@ -209,29 +211,29 @@ impl YandexRepository for Db {
     }
     fn update_tokens(
         &self,
-        user_id: i64,
+        user_id: UserId,
         generation: String,
         encrypted: Vec<u8>,
         expires_at: i64,
         refresh_after: i64,
-    ) -> BoxFuture<'_, anyhow::Result<bool>> {
+    ) -> BoxFuture<'_, StorageResult<bool>> {
         Box::pin(async move {
             self.call(move |conn| Ok(conn.execute("UPDATE yandex_connections SET encrypted_tokens = ?1, expires_at = ?2, refresh_after = ?3 WHERE user_id = ?4 AND generation = ?5 AND encrypted_tokens IS NOT NULL AND requires_reconnect = 0", params![encrypted, expires_at, refresh_after, user_id, generation])? > 0)).await
         })
     }
-    fn refresh_candidate(&self, now: i64) -> BoxFuture<'_, anyhow::Result<Option<i64>>> {
+    fn refresh_candidate(&self, now: i64) -> BoxFuture<'_, StorageResult<Option<UserId>>> {
         Box::pin(async move {
             self.call(move |conn| {
-                conn.query_row("SELECT user_id FROM yandex_connections WHERE encrypted_tokens IS NOT NULL AND requires_reconnect = 0 AND (expires_at IS NULL OR expires_at <= ?1 OR refresh_after IS NULL OR refresh_after <= ?1) ORDER BY COALESCE(refresh_after, 0), user_id LIMIT 1", [now], |row| row.get::<_, i64>(0)).optional()
+                conn.query_row("SELECT user_id FROM yandex_connections WHERE encrypted_tokens IS NOT NULL AND requires_reconnect = 0 AND (expires_at IS NULL OR expires_at <= ?1 OR refresh_after IS NULL OR refresh_after <= ?1) ORDER BY COALESCE(refresh_after, 0), user_id LIMIT 1", [now], |row| row.get::<_, UserId>(0)).optional()
             }).await
         })
     }
     fn defer_refresh(
         &self,
-        user_id: i64,
+        user_id: UserId,
         generation: String,
         retry_at: i64,
-    ) -> BoxFuture<'_, anyhow::Result<()>> {
+    ) -> BoxFuture<'_, StorageResult<()>> {
         Box::pin(async move {
             self.call(move |conn| {
                         conn.execute("UPDATE yandex_connections SET refresh_after = ?1 WHERE user_id = ?2 AND generation = ?3 AND encrypted_tokens IS NOT NULL AND requires_reconnect = 0", params![retry_at, user_id, generation])?;
@@ -241,15 +243,15 @@ impl YandexRepository for Db {
     }
     fn reserve_action(
         &self,
-        user_id: i64,
+        user_id: UserId,
         generation: String,
         window: DispatchWindow,
-    ) -> BoxFuture<'_, anyhow::Result<bool>> {
+    ) -> BoxFuture<'_, StorageResult<bool>> {
         Box::pin(async move {
             self.call(move |conn| Ok(conn.execute("UPDATE yandex_connections SET last_action_at = ?1 WHERE user_id = ?2 AND generation = ?3 AND encrypted_tokens IS NOT NULL AND requires_reconnect = 0 AND (last_action_at IS NULL OR last_action_at <= ?4)", params![window.now, user_id, generation, window.last_action_before])? > 0)).await
         })
     }
-    fn record_failure(&self, failure: ConnectionFailure) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn record_failure(&self, failure: ConnectionFailure) -> BoxFuture<'_, StorageResult<()>> {
         Box::pin(async move {
             let ConnectionFailure {
                 user_id,
@@ -275,9 +277,9 @@ impl YandexRepository for Db {
     }
     fn clear_temporary_failure(
         &self,
-        user_id: i64,
+        user_id: UserId,
         generation: String,
-    ) -> BoxFuture<'_, anyhow::Result<()>> {
+    ) -> BoxFuture<'_, StorageResult<()>> {
         Box::pin(async move {
             self.call(move |conn| {
                 conn.execute("UPDATE yandex_connections SET last_error = NULL, retry_after = NULL WHERE user_id = ?1 AND generation = ?2 AND last_error IN ('yandex_unavailable', 'yandex_rate_limited', 'yandex_internal')", params![user_id, generation])?;

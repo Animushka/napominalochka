@@ -1,14 +1,15 @@
 //! Reminder users use cases.
 use super::{Error, Profile, ReminderService, Result};
 use crate::application::ports::Registration;
+use crate::domain::UserId;
 use crate::domain::{User, UserTz};
 
 impl ReminderService {
-    pub(crate) async fn user(&self, user_id: i64) -> Result<Option<User>> {
+    pub(crate) async fn user(&self, user_id: UserId) -> Result<Option<User>> {
         Ok(self.repository.user(user_id).await?)
     }
 
-    pub(crate) async fn registered(&self, user_id: i64) -> Result<User> {
+    pub(crate) async fn registered(&self, user_id: UserId) -> Result<User> {
         self.user(user_id).await?.ok_or(Error::NotRegistered)
     }
 
@@ -29,7 +30,7 @@ impl ReminderService {
     }
 
     /// Deletes the user and all their data. Returns whether they were registered.
-    pub(crate) async fn unregister(&self, user_id: i64) -> Result<bool> {
+    pub(crate) async fn unregister(&self, user_id: UserId) -> Result<bool> {
         Ok(self.repository.delete_user(user_id).await?)
     }
 }

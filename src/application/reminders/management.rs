@@ -1,20 +1,22 @@
 //! Reminder creation, editing and deletion use cases.
-use super::{
-    Error, ReminderInput, ReminderService, Result, description, first_due, first_instant,
-    validate_settings,
-};
+use super::{Error, ReminderInput, ReminderService, Result, description, first_due, first_instant};
 use crate::domain::{
     Completion, HistoryPage, Recurrence, Reminder, ReminderChanges, ReminderSchedule,
     ReminderSettings, ReminderWrite, UndoResult, User,
 };
+use crate::domain::{CompletionId, NaggingId, ReminderId, UserId};
 use chrono::{DateTime, NaiveDateTime, Utc};
 
 impl ReminderService {
-    pub(crate) async fn list(&self, user_id: i64) -> Result<Vec<Reminder>> {
+    pub(crate) async fn list(&self, user_id: UserId) -> Result<Vec<Reminder>> {
         Ok(self.repository.reminders_for_user(user_id).await?)
     }
 
-    pub(crate) async fn reminder(&self, user_id: i64, reminder_id: i64) -> Result<Reminder> {
+    pub(crate) async fn reminder(
+        &self,
+        user_id: UserId,
+        reminder_id: ReminderId,
+    ) -> Result<Reminder> {
         self.repository
             .reminder(user_id, reminder_id)
             .await?
@@ -48,7 +50,6 @@ impl ReminderService {
         settings: ReminderSettings,
         now: DateTime<Utc>,
     ) -> Result<Reminder> {
-        validate_settings(&settings)?;
         let write = ReminderWrite {
             description: description(input.description)?,
             due_at: first_due(input.at, input.recurrence, user.tz, now)?,
@@ -63,16 +64,13 @@ impl ReminderService {
     pub(crate) async fn edit(
         &self,
         user: &User,
-        reminder_id: i64,
+        reminder_id: ReminderId,
         text: &str,
         schedule: Option<(NaiveDateTime, Recurrence)>,
         settings: Option<ReminderSettings>,
         now: DateTime<Utc>,
     ) -> Result<Reminder> {
         let description = Some(description(text)?);
-        if let Some(settings) = &settings {
-            validate_settings(settings)?;
-        }
         let current = self.reminder(user.id, reminder_id).await?;
         let schedule = match schedule {
             Some((at, recurrence))
@@ -102,8 +100,8 @@ impl ReminderService {
 
     pub(crate) async fn history(
         &self,
-        user_id: i64,
-        before: Option<i64>,
+        user_id: UserId,
+        before: Option<CompletionId>,
         limit: usize,
     ) -> Result<HistoryPage> {
         Ok(self
@@ -114,8 +112,8 @@ impl ReminderService {
 
     pub(crate) async fn completion_for_source(
         &self,
-        user_id: i64,
-        nagging_id: i64,
+        user_id: UserId,
+        nagging_id: NaggingId,
     ) -> Result<Option<Completion>> {
         Ok(self
             .repository
@@ -125,8 +123,8 @@ impl ReminderService {
 
     pub(crate) async fn undo_completion(
         &self,
-        user_id: i64,
-        completion_id: i64,
+        user_id: UserId,
+        completion_id: CompletionId,
         now: DateTime<Utc>,
     ) -> Result<bool> {
         match self
@@ -146,7 +144,7 @@ impl ReminderService {
     pub(crate) async fn update(
         &self,
         user: &User,
-        reminder_id: i64,
+        reminder_id: ReminderId,
         description: Option<&str>,
         at: NaiveDateTime,
         recurrence: Recurrence,
@@ -179,7 +177,7 @@ impl ReminderService {
     pub(crate) async fn update_at(
         &self,
         user: &User,
-        reminder_id: i64,
+        reminder_id: ReminderId,
         description: Option<&str>,
         at: DateTime<Utc>,
         recurrence: Recurrence,
@@ -205,8 +203,8 @@ impl ReminderService {
     #[cfg(test)]
     pub(crate) async fn rename(
         &self,
-        user_id: i64,
-        reminder_id: i64,
+        user_id: UserId,
+        reminder_id: ReminderId,
         text: &str,
     ) -> Result<Reminder> {
         self.repository
@@ -216,7 +214,11 @@ impl ReminderService {
     }
 
     /// Deletes a reminder and stops its nagging; returns what was deleted.
-    pub(crate) async fn delete(&self, user_id: i64, reminder_id: i64) -> Result<Reminder> {
+    pub(crate) async fn delete(
+        &self,
+        user_id: UserId,
+        reminder_id: ReminderId,
+    ) -> Result<Reminder> {
         let reminder = self.reminder(user_id, reminder_id).await?;
         self.repository
             .delete_reminder(user_id, reminder_id)
@@ -224,7 +226,7 @@ impl ReminderService {
         Ok(reminder)
     }
 
-    pub(crate) async fn delete_all(&self, user_id: i64) -> Result<usize> {
+    pub(crate) async fn delete_all(&self, user_id: UserId) -> Result<usize> {
         Ok(self.repository.delete_all_reminders(user_id).await?)
     }
 }

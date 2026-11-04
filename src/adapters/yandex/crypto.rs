@@ -5,6 +5,7 @@ use crate::application::yandex::{
     ports::TokenVault,
     types::{Error, Result},
 };
+use crate::domain::UserId;
 use aes_gcm::{
     Aes256Gcm, KeyInit, Nonce,
     aead::{Aead, Payload},
@@ -23,7 +24,7 @@ impl TokenCipher {
 impl TokenVault for TokenCipher {
     fn seal(
         &self,
-        user_id: i64,
+        user_id: UserId,
         generation: &str,
         kind: &str,
         plaintext: &[u8],
@@ -47,7 +48,13 @@ impl TokenVault for TokenCipher {
         Ok(envelope)
     }
 
-    fn open(&self, user_id: i64, generation: &str, kind: &str, envelope: &[u8]) -> Result<Vec<u8>> {
+    fn open(
+        &self,
+        user_id: UserId,
+        generation: &str,
+        kind: &str,
+        envelope: &[u8],
+    ) -> Result<Vec<u8>> {
         if envelope.len() < 29 || envelope[0] != 1 {
             return Err(Error::ReconnectRequired);
         }

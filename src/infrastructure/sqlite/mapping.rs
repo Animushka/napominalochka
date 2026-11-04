@@ -1,14 +1,16 @@
 //! SQLite row and timestamp conversion and transaction helpers.
 use super::{REMINDER_COLUMNS, TIME_FORMAT};
+use crate::application::ports::StorageResult;
 use crate::domain::{
     Draft, Nagging, Preferences, Recurrence, Reminder, ReminderSettings, User, UserTz, UtcOffset,
 };
+use crate::domain::{ReminderId, UserId};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{OptionalExtension, Row, Transaction};
 
 /// 256 random bits, hex encoded.
-pub(super) fn new_token() -> anyhow::Result<String> {
+pub(super) fn new_token() -> StorageResult<String> {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("no secure randomness: {e}"))?;
     Ok(hex::encode(bytes))
@@ -16,7 +18,7 @@ pub(super) fn new_token() -> anyhow::Result<String> {
 
 pub(super) fn reminder_by_id(
     tx: &Transaction<'_>,
-    reminder_id: i64,
+    reminder_id: ReminderId,
 ) -> rusqlite::Result<Option<Reminder>> {
     tx.query_row(
         &format!("SELECT {REMINDER_COLUMNS} FROM reminders WHERE reminder_id = ?1"),
@@ -26,7 +28,7 @@ pub(super) fn reminder_by_id(
     .optional()
 }
 
-pub(super) fn user_tz(tx: &Transaction<'_>, user_id: i64) -> rusqlite::Result<Option<UserTz>> {
+pub(super) fn user_tz(tx: &Transaction<'_>, user_id: UserId) -> rusqlite::Result<Option<UserTz>> {
     tx.query_row(
         "SELECT utc_offset_minutes, timezone FROM users WHERE user_id = ?1",
         [user_id],

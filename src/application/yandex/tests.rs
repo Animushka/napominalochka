@@ -2,6 +2,8 @@ use super::*;
 use crate::application::yandex::YandexService as Yandex;
 use crate::bootstrap::config::YandexConfig;
 use crate::bootstrap::services::yandex_with_endpoints;
+use crate::domain::{ConfirmationDelay, Language, UserId};
+
 use crate::domain::{Recurrence, User, UserTz, UtcOffset};
 use crate::infrastructure::sqlite::Db;
 use axum::{
@@ -189,21 +191,21 @@ impl Fixture {
         }
     }
 
-    async fn auth(&self, user_id: i64, tenant: &str) {
-        let url = self.yandex.start_auth(user_id, "en").await.unwrap();
+    async fn auth(&self, user_id: UserId, tenant: &str) {
+        let url = self.yandex.start_auth(user_id, Language::En).await.unwrap();
         let pending = self
             .yandex
             .prepare_auth(&state(&url), tenant)
             .await
             .unwrap();
-        assert_eq!(pending.language, "en");
+        assert_eq!(pending.language, Language::En);
         self.yandex
             .confirm_auth(user_id, &pending.completion_token)
             .await
             .unwrap();
     }
 
-    async fn ready(&self, user_id: i64, tenant: &str) {
+    async fn ready(&self, user_id: UserId, tenant: &str) {
         self.auth(user_id, tenant).await;
         self.yandex
             .configure(user_id, &format!("scenario-{tenant}"), true)
@@ -220,7 +222,7 @@ impl Fixture {
             .unwrap();
     }
 
-    async fn fire(&self, user_id: i64) -> crate::domain::Nagging {
+    async fn fire(&self, user_id: UserId) -> crate::domain::Nagging {
         let now = Utc::now();
         let reminder = self
             .db
@@ -257,7 +259,11 @@ fn state(url: &str) -> String {
 #[tokio::test]
 async fn oauth_pkce_state_is_opaque_one_use_and_expires() {
     let f = Fixture::new().await;
-    let url = f.yandex.start_auth(12345, "en").await.unwrap();
+    let url = f
+        .yandex
+        .start_auth(UserId(12345), Language::En)
+        .await
+        .unwrap();
     let query: HashMap<String, String> = Url::parse(&url)
         .unwrap()
         .query_pairs()
@@ -268,7 +274,7 @@ async fn oauth_pkce_state_is_opaque_one_use_and_expires() {
     let s = state(&url);
     assert!(!s.contains("12345"));
     let auth = f.yandex.consume_state(&s).await.unwrap();
-    assert_eq!(auth.user_id, 12345);
+    assert_eq!(auth.user_id, UserId(12345));
     let verifier = f
         .yandex
         .open(
@@ -286,8 +292,8 @@ async fn oauth_pkce_state_is_opaque_one_use_and_expires() {
         f.yandex.consume_state(&s).await,
         Err(Error::InvalidState)
     ));
-    let old = f.yandex.start_auth(1, "ru").await.unwrap();
-    let new = f.yandex.start_auth(1, "ru").await.unwrap();
+    let old = f.yandex.start_auth(UserId(1), Language::Ru).await.unwrap();
+    let new = f.yandex.start_auth(UserId(1), Language::Ru).await.unwrap();
     assert_eq!(
         f.yandex.cancel_auth(&state(&old)).await.unwrap_err(),
         Error::InvalidState
@@ -308,27 +314,38 @@ async fn oauth_pkce_state_is_opaque_one_use_and_expires() {
 #[tokio::test]
 async fn token_envelope_rejects_tampering_other_tenants_and_other_generations() {
     let f = Fixture::new().await;
-    let a = f.yandex.seal(1, "gen", "tokens", b"secret").unwrap();
-    let b = f.yandex.seal(1, "gen", "tokens", b"secret").unwrap();
+    let a = f
+        .yandex
+        .seal(UserId(1), "gen", "tokens", b"secret")
+        .unwrap();
+    let b = f
+        .yandex
+        .seal(UserId(1), "gen", "tokens", b"secret")
+        .unwrap();
     assert_ne!(a, b);
     assert!(!a.windows(6).any(|s| s == b"secret"));
-    assert_eq!(f.yandex.open(1, "gen", "tokens", &a).unwrap(), b"secret");
     assert_eq!(
-        f.yandex.open(2, "gen", "tokens", &a).unwrap_err(),
+        f.yandex.open(UserId(1), "gen", "tokens", &a).unwrap(),
+        b"secret"
+    );
+    assert_eq!(
+        f.yandex.open(UserId(2), "gen", "tokens", &a).unwrap_err(),
         Error::ReconnectRequired
     );
     assert_eq!(
-        f.yandex.open(1, "other", "tokens", &a).unwrap_err(),
+        f.yandex.open(UserId(1), "other", "tokens", &a).unwrap_err(),
         Error::ReconnectRequired
     );
     assert_eq!(
-        f.yandex.open(1, "gen", "pkce", &a).unwrap_err(),
+        f.yandex.open(UserId(1), "gen", "pkce", &a).unwrap_err(),
         Error::ReconnectRequired
     );
     let mut changed = a;
     changed[15] ^= 1;
     assert_eq!(
-        f.yandex.open(1, "gen", "tokens", &changed).unwrap_err(),
+        f.yandex
+            .open(UserId(1), "gen", "tokens", &changed)
+            .unwrap_err(),
         Error::ReconnectRequired
     );
 }
@@ -336,29 +353,39 @@ async fn token_envelope_rejects_tampering_other_tenants_and_other_generations() 
 #[tokio::test]
 async fn oauth_defaults_disabled_and_selection_is_owned_active_scenario() {
     let f = Fixture::new().await;
-    f.auth(1, "alice").await;
-    f.auth(2, "bob").await;
-    let status = f.yandex.status(1).await.unwrap();
+    f.auth(UserId(1), "alice").await;
+    f.auth(UserId(2), "bob").await;
+    let status = f.yandex.status(UserId(1)).await.unwrap();
     assert!(status.connected);
     assert!(!status.enabled);
     assert!(status.scenario_id.is_none());
     assert_eq!(
         f.yandex
-            .configure(1, "scenario-bob", true)
+            .configure(UserId(1), "scenario-bob", true)
             .await
             .unwrap_err(),
         Error::InvalidSelection
     );
     assert_eq!(
         f.yandex
-            .configure(1, "inactive-alice", true)
+            .configure(UserId(1), "inactive-alice", true)
             .await
             .unwrap_err(),
         Error::InvalidSelection
     );
-    f.yandex.configure(1, "scenario-alice", true).await.unwrap();
-    assert!(f.yandex.status(2).await.unwrap().scenario_id.is_none());
-    let json = serde_json::to_string(&f.yandex.status(1).await.unwrap()).unwrap();
+    f.yandex
+        .configure(UserId(1), "scenario-alice", true)
+        .await
+        .unwrap();
+    assert!(
+        f.yandex
+            .status(UserId(2))
+            .await
+            .unwrap()
+            .scenario_id
+            .is_none()
+    );
+    let json = serde_json::to_string(&f.yandex.status(UserId(1)).await.unwrap()).unwrap();
     assert!(
         !json.contains("access_token")
             && !json.contains("refresh_token")
@@ -371,7 +398,7 @@ async fn oauth_defaults_disabled_and_selection_is_owned_active_scenario() {
 async fn grant_scopes_are_checked_when_present_and_omission_is_valid() {
     let f = Fixture::new().await;
     f.mock.reduced_scope.store(true, Ordering::SeqCst);
-    let url = f.yandex.start_auth(1, "ru").await.unwrap();
+    let url = f.yandex.start_auth(UserId(1), Language::Ru).await.unwrap();
     assert_eq!(
         f.yandex
             .prepare_auth(&state(&url), "alice")
@@ -379,18 +406,18 @@ async fn grant_scopes_are_checked_when_present_and_omission_is_valid() {
             .unwrap_err(),
         Error::ReconnectRequired
     );
-    assert!(!f.yandex.status(1).await.unwrap().connected);
+    assert!(!f.yandex.status(UserId(1)).await.unwrap().connected);
     f.mock.omit_scope.store(true, Ordering::SeqCst);
-    f.auth(1, "alice").await;
-    assert!(f.yandex.status(1).await.unwrap().connected);
+    f.auth(UserId(1), "alice").await;
+    assert!(f.yandex.status(UserId(1)).await.unwrap().connected);
 }
 
 #[tokio::test]
 async fn near_expiry_token_refreshes_and_disconnect_removes_secrets_jobs_and_states() {
     let f = Fixture::new().await;
-    f.ready(1, "alice").await;
-    f.fire(1).await;
-    f.yandex.start_auth(1, "ru").await.unwrap();
+    f.ready(UserId(1), "alice").await;
+    f.fire(UserId(1)).await;
+    f.yandex.start_auth(UserId(1), Language::Ru).await.unwrap();
     f.db.call(|conn| {
         conn.execute(
             "UPDATE yandex_connections SET expires_at = unixepoch() + 30",
@@ -400,25 +427,25 @@ async fn near_expiry_token_refreshes_and_disconnect_removes_secrets_jobs_and_sta
     })
     .await
     .unwrap();
-    let results = tokio::join!(f.yandex.scenarios(1), f.yandex.scenarios(1));
+    let results = tokio::join!(f.yandex.scenarios(UserId(1)), f.yandex.scenarios(UserId(1)));
     assert!(results.0.is_ok() && results.1.is_ok());
     assert_eq!(f.mock.refreshes.load(Ordering::SeqCst), 1);
-    f.yandex.disconnect(1).await.unwrap();
+    f.yandex.disconnect(UserId(1)).await.unwrap();
     assert_eq!(f.count("yandex_connections").await, 0);
     assert_eq!(f.count("yandex_jobs").await, 0);
     assert_eq!(f.count("yandex_oauth_states").await, 0);
-    assert!(f.db.user(1).await.unwrap().is_some());
+    assert!(f.db.user(UserId(1)).await.unwrap().is_some());
 }
 
 #[tokio::test]
 async fn unregister_during_oauth_exchange_cannot_restore_integration() {
     let f = Fixture::new().await;
-    let url = f.yandex.start_auth(99, "ru").await.unwrap();
+    let url = f.yandex.start_auth(UserId(99), Language::Ru).await.unwrap();
     f.mock.block_token.store(true, Ordering::SeqCst);
     let yandex = f.yandex.clone();
     let handle = tokio::spawn(async move { yandex.prepare_auth(&state(&url), "alice").await });
     f.mock.token_entered.notified().await;
-    assert!(!f.db.delete_user(99).await.unwrap());
+    assert!(!f.db.delete_user(UserId(99)).await.unwrap());
     f.mock.token_release.notify_one();
     assert_eq!(handle.await.unwrap().unwrap_err(), Error::InvalidState);
     assert_eq!(f.count("yandex_connections").await, 0);
@@ -428,7 +455,7 @@ async fn unregister_during_oauth_exchange_cannot_restore_integration() {
 #[tokio::test]
 async fn unregister_during_refresh_cannot_restore_tokens_or_run_scenario() {
     let f = Fixture::new().await;
-    f.ready(1, "alice").await;
+    f.ready(UserId(1), "alice").await;
     f.db.call(|conn| {
         conn.execute(
             "UPDATE yandex_connections SET expires_at = unixepoch() + 30",
@@ -440,9 +467,9 @@ async fn unregister_during_refresh_cannot_restore_tokens_or_run_scenario() {
     .unwrap();
     f.mock.block_token.store(true, Ordering::SeqCst);
     let yandex = f.yandex.clone();
-    let handle = tokio::spawn(async move { yandex.test(1).await });
+    let handle = tokio::spawn(async move { yandex.test(UserId(1)).await });
     f.mock.token_entered.notified().await;
-    f.db.delete_user(1).await.unwrap();
+    f.db.delete_user(UserId(1)).await.unwrap();
     f.mock.token_release.notify_one();
     assert_eq!(handle.await.unwrap().unwrap_err(), Error::NotConnected);
     assert_eq!(f.count("yandex_connections").await, 0);
@@ -452,10 +479,10 @@ async fn unregister_during_refresh_cannot_restore_tokens_or_run_scenario() {
 #[tokio::test]
 async fn only_first_fire_enqueues_and_completion_cancels_delivery() {
     let f = Fixture::new().await;
-    f.ready(1, "alice").await;
+    f.ready(UserId(1), "alice").await;
     let now = Utc::now();
     let reminder =
-        f.db.add_reminder(1, "Daily".into(), now, Recurrence::Daily)
+        f.db.add_reminder(UserId(1), "Daily".into(), now, Recurrence::Daily)
             .await
             .unwrap();
     let nag =
@@ -476,12 +503,19 @@ async fn only_first_fire_enqueues_and_completion_cancels_delivery() {
             .unwrap()
     );
     assert_eq!(f.count("yandex_jobs").await, 1);
-    f.db.snooze_nagging(1, nag.id, now).await.unwrap();
+    f.db.snooze_nagging(UserId(1), nag.id, now).await.unwrap();
     assert_eq!(f.count("yandex_jobs").await, 0);
     f.yandex.worker_tick().await.unwrap();
     assert_eq!(f.mock.actions.load(Ordering::SeqCst), 0);
-    f.db.set_preferences(1, None, None, Some(20)).await.unwrap();
-    f.db.complete_nagging(1, nag.id, now).await.unwrap();
+    f.db.set_preferences(
+        UserId(1),
+        None,
+        None,
+        Some(ConfirmationDelay::TwentyMinutes),
+    )
+    .await
+    .unwrap();
+    f.db.complete_nagging(UserId(1), nag.id, now).await.unwrap();
     assert_eq!(f.count("yandex_jobs").await, 0);
     assert_eq!(
         f.db.due_confirmations(now + chrono::Duration::minutes(21))
@@ -497,21 +531,24 @@ async fn only_first_fire_enqueues_and_completion_cancels_delivery() {
 #[tokio::test]
 async fn normal_job_runs_once_and_test_shares_durable_cooldown() {
     let f = Fixture::new().await;
-    f.ready(1, "alice").await;
-    f.fire(1).await;
+    f.ready(UserId(1), "alice").await;
+    f.fire(UserId(1)).await;
     f.yandex.worker_tick().await.unwrap();
     f.yandex.worker_tick().await.unwrap();
     assert_eq!(f.mock.actions.load(Ordering::SeqCst), 1);
-    assert_eq!(f.yandex.test(1).await.unwrap_err(), Error::RateLimited);
-    assert!(f.yandex.status(1).await.unwrap().enabled);
+    assert_eq!(
+        f.yandex.test(UserId(1)).await.unwrap_err(),
+        Error::RateLimited
+    );
+    assert!(f.yandex.status(UserId(1)).await.unwrap().enabled);
     assert_eq!(f.db.due_naggings(Utc::now()).await.unwrap().len(), 1);
 }
 
 #[tokio::test]
 async fn ambiguous_post_failure_is_never_retried_and_does_not_remove_telegram_nag() {
     let f = Fixture::new().await;
-    f.ready(1, "alice").await;
-    f.fire(1).await;
+    f.ready(UserId(1), "alice").await;
+    f.fire(UserId(1)).await;
     f.mock.post_status.store(503, Ordering::SeqCst);
     f.yandex.worker_tick().await.unwrap();
     f.db.call(|conn| {
@@ -522,37 +559,37 @@ async fn ambiguous_post_failure_is_never_retried_and_does_not_remove_telegram_na
     .unwrap();
     f.yandex.worker_tick().await.unwrap();
     assert_eq!(f.mock.actions.load(Ordering::SeqCst), 1);
-    let status = f.yandex.status(1).await.unwrap();
+    let status = f.yandex.status(UserId(1)).await.unwrap();
     assert!(!status.enabled && status.connected && !status.requires_reconnect);
     assert_eq!(
         status.last_error.as_deref(),
         Some("yandex_delivery_uncertain")
     );
     assert_eq!(f.db.due_naggings(Utc::now()).await.unwrap().len(), 1);
-    assert!(f.db.user(1).await.unwrap().is_some());
+    assert!(f.db.user(UserId(1)).await.unwrap().is_some());
 }
 
 #[tokio::test]
 async fn unauthorized_provider_clears_tokens_and_requires_reconnect_only_for_that_user() {
     let f = Fixture::new().await;
-    f.ready(1, "alice").await;
-    f.auth(2, "bob").await;
+    f.ready(UserId(1), "alice").await;
+    f.auth(UserId(2), "bob").await;
     f.mock.info_status.store(401, Ordering::SeqCst);
     assert_eq!(
-        f.yandex.scenarios(1).await.unwrap_err(),
+        f.yandex.scenarios(UserId(1)).await.unwrap_err(),
         Error::ReconnectRequired
     );
-    let status = f.yandex.status(1).await.unwrap();
+    let status = f.yandex.status(UserId(1)).await.unwrap();
     assert!(status.requires_reconnect && !status.connected && !status.enabled);
-    assert!(f.yandex.status(2).await.unwrap().connected);
-    assert!(f.db.user(1).await.unwrap().is_some());
+    assert!(f.yandex.status(UserId(2)).await.unwrap().connected);
+    assert!(f.db.user(UserId(1)).await.unwrap().is_some());
 }
 
 #[tokio::test]
 async fn expired_generation_changed_and_deleted_jobs_never_run() {
     let f = Fixture::new().await;
-    f.ready(1, "alice").await;
-    let nag = f.fire(1).await;
+    f.ready(UserId(1), "alice").await;
+    let nag = f.fire(UserId(1)).await;
     f.db.call(|conn| {
         conn.execute("UPDATE yandex_jobs SET created_at = 0", [])?;
         Ok(())
@@ -561,8 +598,10 @@ async fn expired_generation_changed_and_deleted_jobs_never_run() {
     .unwrap();
     f.yandex.worker_tick().await.unwrap();
     assert_eq!(f.mock.actions.load(Ordering::SeqCst), 0);
-    f.db.complete_nagging(1, nag.id, Utc::now()).await.unwrap();
-    f.fire(1).await;
+    f.db.complete_nagging(UserId(1), nag.id, Utc::now())
+        .await
+        .unwrap();
+    f.fire(UserId(1)).await;
     f.db.call(|conn| {
         conn.execute("UPDATE yandex_jobs SET generation = 'old-account'", [])?;
         Ok(())
@@ -571,11 +610,11 @@ async fn expired_generation_changed_and_deleted_jobs_never_run() {
     .unwrap();
     f.yandex.worker_tick().await.unwrap();
     assert_eq!(f.mock.actions.load(Ordering::SeqCst), 0);
-    f.db.delete_all_reminders(1).await.unwrap();
+    f.db.delete_all_reminders(UserId(1)).await.unwrap();
     assert_eq!(f.count("yandex_jobs").await, 0);
-    f.fire(1).await;
+    f.fire(UserId(1)).await;
     f.yandex
-        .configure(1, "scenario-alice", false)
+        .configure(UserId(1), "scenario-alice", false)
         .await
         .unwrap();
     assert_eq!(f.count("yandex_jobs").await, 0);
@@ -586,49 +625,53 @@ async fn expired_generation_changed_and_deleted_jobs_never_run() {
 #[tokio::test]
 async fn disabled_connection_does_not_enqueue_and_can_be_disabled_offline() {
     let f = Fixture::new().await;
-    f.ready(1, "alice").await;
+    f.ready(UserId(1), "alice").await;
     f.mock.info_status.store(503, Ordering::SeqCst);
     f.yandex
-        .configure(1, "scenario-alice", false)
+        .configure(UserId(1), "scenario-alice", false)
         .await
         .unwrap();
-    f.fire(1).await;
+    f.fire(UserId(1)).await;
     assert_eq!(f.count("yandex_jobs").await, 0);
 }
 
 #[tokio::test]
 async fn snoozing_a_claimed_job_cancels_its_action_before_dispatch() {
     let f = Fixture::new().await;
-    f.ready(1, "alice").await;
-    let nagging = f.fire(1).await;
+    f.ready(UserId(1), "alice").await;
+    let nagging = f.fire(UserId(1)).await;
     let job = f.yandex.next_job().await.unwrap().unwrap();
     assert!(f.yandex.claim_job(job.clone()).await.unwrap());
-    let connection = f.yandex.require_connection(1).await.unwrap();
+    let connection = f.yandex.require_connection(UserId(1)).await.unwrap();
     assert!(
-        f.db.snooze_nagging(1, nagging.id, Utc::now() + chrono::Duration::hours(1))
-            .await
-            .unwrap()
+        f.db.snooze_nagging(
+            UserId(1),
+            nagging.id,
+            Utc::now() + chrono::Duration::hours(1)
+        )
+        .await
+        .unwrap()
     );
     f.yandex
-        .execute(1, &connection, &job.scenario_id, Some(&job))
+        .execute(UserId(1), &connection, &job.scenario_id, Some(&job))
         .await
         .unwrap();
     assert_eq!(f.mock.actions.load(Ordering::SeqCst), 0);
     assert_eq!(f.count("yandex_jobs").await, 0);
-    assert!(f.yandex.status(1).await.unwrap().enabled);
+    assert!(f.yandex.status(UserId(1)).await.unwrap().enabled);
 }
 
 #[tokio::test]
 async fn claimed_job_after_restart_is_uncertain_and_is_never_replayed() {
     let f = Fixture::new().await;
-    f.ready(1, "alice").await;
-    f.fire(1).await;
+    f.ready(UserId(1), "alice").await;
+    f.fire(UserId(1)).await;
     let job = f.yandex.next_job().await.unwrap().unwrap();
     assert!(f.yandex.claim_job(job).await.unwrap());
     f.yandex.recover_claims().await.unwrap();
     f.yandex.worker_tick().await.unwrap();
     assert_eq!(f.mock.actions.load(Ordering::SeqCst), 0);
-    let status = f.yandex.status(1).await.unwrap();
+    let status = f.yandex.status(UserId(1)).await.unwrap();
     assert!(!status.enabled);
     assert_eq!(
         status.last_error.as_deref(),
@@ -639,7 +682,7 @@ async fn claimed_job_after_restart_is_uncertain_and_is_never_replayed() {
 #[tokio::test]
 async fn refresh_rate_limit_preserves_credentials_and_reconnect_is_not_required() {
     let f = Fixture::new().await;
-    f.ready(1, "alice").await;
+    f.ready(UserId(1), "alice").await;
     f.db.call(|conn| {
         conn.execute(
             "UPDATE yandex_connections SET expires_at = unixepoch() + 30",
@@ -650,17 +693,20 @@ async fn refresh_rate_limit_preserves_credentials_and_reconnect_is_not_required(
     .await
     .unwrap();
     f.mock.token_status.store(429, Ordering::SeqCst);
-    assert_eq!(f.yandex.scenarios(1).await.unwrap_err(), Error::RateLimited);
-    let status = f.yandex.status(1).await.unwrap();
+    assert_eq!(
+        f.yandex.scenarios(UserId(1)).await.unwrap_err(),
+        Error::RateLimited
+    );
+    let status = f.yandex.status(UserId(1)).await.unwrap();
     assert!(status.connected && !status.requires_reconnect && status.enabled);
     f.mock.token_status.store(0, Ordering::SeqCst);
-    assert!(f.yandex.scenarios(1).await.is_ok());
+    assert!(f.yandex.scenarios(UserId(1)).await.is_ok());
 }
 
 #[tokio::test]
 async fn callback_receipt_requires_originating_telegram_user_and_is_one_use() {
     let f = Fixture::new().await;
-    let url = f.yandex.start_auth(1, "en").await.unwrap();
+    let url = f.yandex.start_auth(UserId(1), Language::En).await.unwrap();
     let pending = f.yandex.prepare_auth(&state(&url), "alice").await.unwrap();
     assert_eq!(pending.completion_token.len(), 48);
     assert!(
@@ -669,31 +715,31 @@ async fn callback_receipt_requires_originating_telegram_user_and_is_one_use() {
             .bytes()
             .all(|b| b.is_ascii_hexdigit())
     );
-    assert!(!f.yandex.status(1).await.unwrap().connected);
+    assert!(!f.yandex.status(UserId(1)).await.unwrap().connected);
     assert_eq!(
-        f.yandex.scenarios(1).await.unwrap_err(),
+        f.yandex.scenarios(UserId(1)).await.unwrap_err(),
         Error::NotConnected
     );
     // Sharing the initial authorize URL cannot bind a victim's Yandex account to
     // another Telegram account: the callback-only receipt is unusable by the victim.
     assert_eq!(
         f.yandex
-            .confirm_auth(2, &pending.completion_token)
+            .confirm_auth(UserId(2), &pending.completion_token)
             .await
             .unwrap_err(),
         Error::InvalidState
     );
-    assert!(!f.yandex.status(1).await.unwrap().connected);
+    assert!(!f.yandex.status(UserId(1)).await.unwrap().connected);
     assert!(
         f.yandex
-            .confirm_auth(1, &pending.completion_token)
+            .confirm_auth(UserId(1), &pending.completion_token)
             .await
             .unwrap()
             .connected
     );
     assert_eq!(
         f.yandex
-            .confirm_auth(1, &pending.completion_token)
+            .confirm_auth(UserId(1), &pending.completion_token)
             .await
             .unwrap_err(),
         Error::InvalidState
@@ -704,7 +750,7 @@ async fn callback_receipt_requires_originating_telegram_user_and_is_one_use() {
 #[tokio::test]
 async fn pending_grants_expire_and_disconnect_unregister_and_restart_invalidate_them() {
     let f = Fixture::new().await;
-    let url = f.yandex.start_auth(1, "ru").await.unwrap();
+    let url = f.yandex.start_auth(UserId(1), Language::Ru).await.unwrap();
     let first = f.yandex.prepare_auth(&state(&url), "alice").await.unwrap();
     f.db.call(|conn| {
         conn.execute("UPDATE yandex_pending_grants SET expires_at = 0", [])?;
@@ -714,39 +760,39 @@ async fn pending_grants_expire_and_disconnect_unregister_and_restart_invalidate_
     .unwrap();
     assert_eq!(
         f.yandex
-            .confirm_auth(1, &first.completion_token)
+            .confirm_auth(UserId(1), &first.completion_token)
             .await
             .unwrap_err(),
         Error::InvalidState
     );
-    let url = f.yandex.start_auth(1, "ru").await.unwrap();
+    let url = f.yandex.start_auth(UserId(1), Language::Ru).await.unwrap();
     let second = f.yandex.prepare_auth(&state(&url), "alice").await.unwrap();
-    f.yandex.disconnect(1).await.unwrap();
+    f.yandex.disconnect(UserId(1)).await.unwrap();
     assert_eq!(f.count("yandex_pending_grants").await, 0);
     assert_eq!(
         f.yandex
-            .confirm_auth(1, &second.completion_token)
+            .confirm_auth(UserId(1), &second.completion_token)
             .await
             .unwrap_err(),
         Error::InvalidState
     );
-    let url = f.yandex.start_auth(1, "ru").await.unwrap();
+    let url = f.yandex.start_auth(UserId(1), Language::Ru).await.unwrap();
     let third = f.yandex.prepare_auth(&state(&url), "alice").await.unwrap();
-    f.db.delete_user(1).await.unwrap();
+    f.db.delete_user(UserId(1)).await.unwrap();
     assert_eq!(f.count("yandex_pending_grants").await, 0);
     assert_eq!(
         f.yandex
-            .confirm_auth(1, &third.completion_token)
+            .confirm_auth(UserId(1), &third.completion_token)
             .await
             .unwrap_err(),
         Error::InvalidState
     );
-    let url = f.yandex.start_auth(1, "ru").await.unwrap();
+    let url = f.yandex.start_auth(UserId(1), Language::Ru).await.unwrap();
     let fourth = f.yandex.prepare_auth(&state(&url), "alice").await.unwrap();
-    f.yandex.start_auth(1, "ru").await.unwrap();
+    f.yandex.start_auth(UserId(1), Language::Ru).await.unwrap();
     assert_eq!(
         f.yandex
-            .confirm_auth(1, &fourth.completion_token)
+            .confirm_auth(UserId(1), &fourth.completion_token)
             .await
             .unwrap_err(),
         Error::InvalidState
@@ -756,8 +802,8 @@ async fn pending_grants_expire_and_disconnect_unregister_and_restart_invalidate_
 #[tokio::test]
 async fn response_timeout_after_action_is_claimed_never_retries() {
     let mut f = Fixture::new().await;
-    f.ready(1, "alice").await;
-    f.fire(1).await;
+    f.ready(UserId(1), "alice").await;
+    f.fire(UserId(1)).await;
     let mut provider = crate::adapters::yandex::provider::Provider::new(
         f.config.client_id.clone(),
         f.config.client_secret.clone(),
@@ -782,7 +828,12 @@ async fn response_timeout_after_action_is_claimed_never_retries() {
     f.yandex.worker_tick().await.unwrap();
     assert_eq!(f.mock.actions.load(Ordering::SeqCst), 1);
     assert_eq!(
-        f.yandex.status(1).await.unwrap().last_error.as_deref(),
+        f.yandex
+            .status(UserId(1))
+            .await
+            .unwrap()
+            .last_error
+            .as_deref(),
         Some("yandex_delivery_uncertain")
     );
 }
@@ -802,8 +853,8 @@ async fn queued_job_and_its_completed_claim_survive_database_reopening() {
         f.base.clone(),
     )
     .unwrap();
-    f.ready(1, "alice").await;
-    f.fire(1).await;
+    f.ready(UserId(1), "alice").await;
+    f.fire(UserId(1)).await;
     f.db = Db::open(&path).unwrap();
     f.yandex = yandex_with_endpoints(
         f.config.clone(),
@@ -831,8 +882,8 @@ async fn queued_job_and_its_completed_claim_survive_database_reopening() {
 #[tokio::test]
 async fn idle_connection_refreshes_well_before_expiry_and_reschedules_from_granted_lifetime() {
     let f = Fixture::new().await;
-    f.auth(1, "alice").await;
-    let initial = f.yandex.connection(1).await.unwrap().unwrap();
+    f.auth(UserId(1), "alice").await;
+    let initial = f.yandex.connection(UserId(1)).await.unwrap().unwrap();
     assert_eq!(
         initial.expires_at.unwrap() - initial.refresh_after.unwrap(),
         900
@@ -850,7 +901,7 @@ async fn idle_connection_refreshes_well_before_expiry_and_reschedules_from_grant
     f.mock.token_lifetime.store(120, Ordering::SeqCst);
     f.yandex.refresh_tick().await.unwrap();
     assert_eq!(f.mock.refreshes.load(Ordering::SeqCst), 1);
-    let refreshed = f.yandex.connection(1).await.unwrap().unwrap();
+    let refreshed = f.yandex.connection(UserId(1)).await.unwrap().unwrap();
     assert_eq!(
         refreshed.expires_at.unwrap() - refreshed.refresh_after.unwrap(),
         30
@@ -864,7 +915,7 @@ async fn idle_connection_refreshes_well_before_expiry_and_reschedules_from_grant
 #[tokio::test]
 async fn proactive_refresh_rate_limit_preserves_valid_grant_with_persisted_backoff() {
     let f = Fixture::new().await;
-    f.ready(1, "alice").await;
+    f.ready(UserId(1), "alice").await;
     f.db.call(|conn| {
         conn.execute("UPDATE yandex_connections SET refresh_after = 0", [])?;
         Ok(())
@@ -873,14 +924,14 @@ async fn proactive_refresh_rate_limit_preserves_valid_grant_with_persisted_backo
     .unwrap();
     let previous = f
         .yandex
-        .connection(1)
+        .connection(UserId(1))
         .await
         .unwrap()
         .unwrap()
         .encrypted_tokens;
     f.mock.token_status.store(429, Ordering::SeqCst);
     f.yandex.refresh_tick().await.unwrap();
-    let delayed = f.yandex.connection(1).await.unwrap().unwrap();
+    let delayed = f.yandex.connection(UserId(1)).await.unwrap().unwrap();
     assert_eq!(delayed.encrypted_tokens, previous);
     assert!(delayed.enabled && !delayed.requires_reconnect);
     assert!(delayed.refresh_after.unwrap() >= Utc::now().timestamp() + 290);
@@ -903,14 +954,14 @@ async fn proactive_refresh_rate_limit_preserves_valid_grant_with_persisted_backo
     .unwrap();
     restarted.refresh_tick().await.unwrap();
     assert_eq!(f.mock.token_requests.load(Ordering::SeqCst), requests + 1);
-    assert!(f.yandex.status(1).await.unwrap().enabled);
+    assert!(f.yandex.status(UserId(1)).await.unwrap().enabled);
 }
 
 #[tokio::test]
 async fn expired_grant_requires_reconnect_without_attempting_expired_refresh() {
     let f = Fixture::new().await;
-    f.ready(1, "alice").await;
-    f.fire(1).await;
+    f.ready(UserId(1), "alice").await;
+    f.fire(UserId(1)).await;
     f.db.call(|conn| {
         conn.execute("UPDATE yandex_connections SET expires_at = 0", [])?;
         Ok(())
@@ -919,7 +970,7 @@ async fn expired_grant_requires_reconnect_without_attempting_expired_refresh() {
     .unwrap();
     let requests = f.mock.token_requests.load(Ordering::SeqCst);
     f.yandex.refresh_tick().await.unwrap();
-    let status = f.yandex.status(1).await.unwrap();
+    let status = f.yandex.status(UserId(1)).await.unwrap();
     assert!(status.requires_reconnect && !status.connected && !status.enabled);
     assert_eq!(f.count("yandex_jobs").await, 0);
     assert_eq!(f.mock.token_requests.load(Ordering::SeqCst), requests);
@@ -929,7 +980,7 @@ async fn expired_grant_requires_reconnect_without_attempting_expired_refresh() {
 #[tokio::test]
 async fn unregister_during_proactive_refresh_cannot_restore_credentials() {
     let f = Fixture::new().await;
-    f.auth(1, "alice").await;
+    f.auth(UserId(1), "alice").await;
     f.db.call(|conn| {
         conn.execute("UPDATE yandex_connections SET refresh_after = 0", [])?;
         Ok(())
@@ -940,20 +991,23 @@ async fn unregister_during_proactive_refresh_cannot_restore_credentials() {
     let yandex = f.yandex.clone();
     let refreshing = tokio::spawn(async move { yandex.refresh_tick().await });
     f.mock.token_entered.notified().await;
-    f.db.delete_user(1).await.unwrap();
+    f.db.delete_user(UserId(1)).await.unwrap();
     f.mock.token_release.notify_one();
     refreshing.await.unwrap().unwrap();
-    assert!(!f.yandex.status(1).await.unwrap().connected);
+    assert!(!f.yandex.status(UserId(1)).await.unwrap().connected);
     assert_eq!(f.count("yandex_connections").await, 0);
 }
 #[tokio::test]
 async fn scenario_read_outage_preserves_enabled_jobs_and_recovers_without_reenable() {
     let f = Fixture::new().await;
-    f.ready(1, "alice").await;
-    f.fire(1).await;
+    f.ready(UserId(1), "alice").await;
+    f.fire(UserId(1)).await;
     f.mock.info_status.store(503, Ordering::SeqCst);
-    assert_eq!(f.yandex.scenarios(1).await.unwrap_err(), Error::Unavailable);
-    let status = f.yandex.status(1).await.unwrap();
+    assert_eq!(
+        f.yandex.scenarios(UserId(1)).await.unwrap_err(),
+        Error::Unavailable
+    );
+    let status = f.yandex.status(UserId(1)).await.unwrap();
     assert!(status.connected && status.enabled && !status.requires_reconnect);
     assert_eq!(status.last_error.as_deref(), Some("yandex_unavailable"));
     assert_eq!(f.count("yandex_jobs").await, 1);
@@ -970,18 +1024,25 @@ async fn scenario_read_outage_preserves_enabled_jobs_and_recovers_without_reenab
     assert_eq!(f.mock.info_requests.load(Ordering::SeqCst), requests);
     assert_eq!(f.mock.actions.load(Ordering::SeqCst), 0);
     f.mock.info_status.store(0, Ordering::SeqCst);
-    assert!(restarted.scenarios(1).await.is_ok());
-    assert!(restarted.status(1).await.unwrap().last_error.is_none());
+    assert!(restarted.scenarios(UserId(1)).await.is_ok());
+    assert!(
+        restarted
+            .status(UserId(1))
+            .await
+            .unwrap()
+            .last_error
+            .is_none()
+    );
     restarted.worker_tick().await.unwrap();
     assert_eq!(f.mock.actions.load(Ordering::SeqCst), 1);
-    assert!(restarted.status(1).await.unwrap().enabled);
+    assert!(restarted.status(UserId(1)).await.unwrap().enabled);
 }
 
 #[tokio::test]
 async fn preparation_failure_stays_pending_and_restart_never_marks_it_uncertain() {
     let f = Fixture::new().await;
-    f.ready(1, "alice").await;
-    f.fire(1).await;
+    f.ready(UserId(1), "alice").await;
+    f.fire(UserId(1)).await;
     f.mock.info_status.store(503, Ordering::SeqCst);
     f.yandex.worker_tick().await.unwrap();
     let state: String =
@@ -990,7 +1051,7 @@ async fn preparation_failure_stays_pending_and_restart_never_marks_it_uncertain(
             .unwrap();
     assert_eq!(state, "pending");
     f.yandex.recover_claims().await.unwrap();
-    assert!(f.yandex.status(1).await.unwrap().enabled);
+    assert!(f.yandex.status(UserId(1)).await.unwrap().enabled);
     let requests = f.mock.info_requests.load(Ordering::SeqCst);
     f.yandex.worker_tick().await.unwrap();
     assert_eq!(f.mock.info_requests.load(Ordering::SeqCst), requests);
@@ -1004,14 +1065,21 @@ async fn preparation_failure_stays_pending_and_restart_never_marks_it_uncertain(
     f.yandex.worker_tick().await.unwrap();
     f.yandex.worker_tick().await.unwrap();
     assert_eq!(f.mock.actions.load(Ordering::SeqCst), 1);
-    assert!(f.yandex.status(1).await.unwrap().last_error.is_none());
+    assert!(
+        f.yandex
+            .status(UserId(1))
+            .await
+            .unwrap()
+            .last_error
+            .is_none()
+    );
 }
 
 #[tokio::test]
 async fn shutdown_during_scenario_read_leaves_unclaimed_work_for_restart() {
     let f = Fixture::new().await;
-    f.ready(1, "alice").await;
-    f.fire(1).await;
+    f.ready(UserId(1), "alice").await;
+    f.fire(UserId(1)).await;
     f.mock.block_info.store(true, Ordering::SeqCst);
     let yandex = f.yandex.clone();
     let shutdown = CancellationToken::new();
@@ -1034,14 +1102,14 @@ async fn shutdown_during_scenario_read_leaves_unclaimed_work_for_restart() {
     assert_eq!(state, "pending");
     assert_eq!(f.mock.actions.load(Ordering::SeqCst), 0);
     f.yandex.recover_claims().await.unwrap();
-    assert!(f.yandex.status(1).await.unwrap().enabled);
+    assert!(f.yandex.status(UserId(1)).await.unwrap().enabled);
 }
 
 #[tokio::test]
 async fn shutdown_finishes_token_refresh_without_starting_a_scenario_action() {
     let f = Fixture::new().await;
-    f.ready(1, "alice").await;
-    f.fire(1).await;
+    f.ready(UserId(1), "alice").await;
+    f.fire(UserId(1)).await;
     f.db.call(|conn| {
         conn.execute(
             "UPDATE yandex_connections SET expires_at = unixepoch() + 30",
@@ -1071,7 +1139,7 @@ async fn shutdown_finishes_token_refresh_without_starting_a_scenario_action() {
     assert_eq!(f.mock.info_requests.load(Ordering::SeqCst), requests);
     assert!(
         f.yandex
-            .connection(1)
+            .connection(UserId(1))
             .await
             .unwrap()
             .unwrap()
@@ -1080,14 +1148,14 @@ async fn shutdown_finishes_token_refresh_without_starting_a_scenario_action() {
             > Utc::now().timestamp() + 60
     );
     f.yandex.recover_claims().await.unwrap();
-    assert!(f.yandex.status(1).await.unwrap().enabled);
+    assert!(f.yandex.status(UserId(1)).await.unwrap().enabled);
 }
 
 #[tokio::test]
 async fn shutdown_allows_a_dispatched_action_to_finish_without_replay() {
     let f = Fixture::new().await;
-    f.ready(1, "alice").await;
-    f.fire(1).await;
+    f.ready(UserId(1), "alice").await;
+    f.fire(UserId(1)).await;
     f.mock.block_action.store(true, Ordering::SeqCst);
     let yandex = f.yandex.clone();
     let shutdown = CancellationToken::new();
@@ -1111,5 +1179,5 @@ async fn shutdown_allows_a_dispatched_action_to_finish_without_replay() {
     f.yandex.recover_claims().await.unwrap();
     f.yandex.worker_tick().await.unwrap();
     assert_eq!(f.mock.actions.load(Ordering::SeqCst), 1);
-    assert!(f.yandex.status(1).await.unwrap().enabled);
+    assert!(f.yandex.status(UserId(1)).await.unwrap().enabled);
 }

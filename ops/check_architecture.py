@@ -56,6 +56,8 @@ for path in sorted(SRC.rglob("*.rs")):
     # An explicit module API makes dependencies reviewable; test globs/preludes are idiomatic.
     if re.search(r"\buse\s+(?:super|self|crate)::[^;]*\*", code):
         errors.append(f"{relative}: import project symbols explicitly")
+    if relative.parts[:2] == ("adapters", "http") and re.search(r"crate::adapters::telegram\b", code):
+        errors.append(f"{relative}: HTTP presentation must not depend on Telegram presentation")
     checked += 1
 if errors:
     print("\n".join(errors), file=sys.stderr)

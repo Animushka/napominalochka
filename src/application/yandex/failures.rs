@@ -1,10 +1,11 @@
 //! Yandex failures use cases.
 use super::YandexService;
 use super::types::{ConnectionFailure, DispatchWindow, Error, FailureDisposition, Result};
+use crate::domain::UserId;
 use chrono::Utc;
 
 impl YandexService {
-    pub(super) async fn reserve_action(&self, user_id: i64, generation: &str) -> Result<()> {
+    pub(super) async fn reserve_action(&self, user_id: UserId, generation: &str) -> Result<()> {
         let generation = generation.to_owned();
         let now = Utc::now().timestamp();
         let reserved = self
@@ -23,7 +24,7 @@ impl YandexService {
     /// to enable voice. Only a lost grant, missing scenario or uncertain action stops it.
     pub(super) async fn record_failure(
         &self,
-        user_id: i64,
+        user_id: UserId,
         generation: &str,
         error: Error,
     ) -> Result<()> {
@@ -53,7 +54,7 @@ impl YandexService {
 
     pub(super) async fn clear_temporary_failure(
         &self,
-        user_id: i64,
+        user_id: UserId,
         generation: &str,
     ) -> Result<()> {
         let generation = generation.to_owned();

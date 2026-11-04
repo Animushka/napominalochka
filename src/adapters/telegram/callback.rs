@@ -11,8 +11,8 @@ use crate::domain::{Recurrence, Snooze};
 /// What a time picker is for: a new reminder (draft) or an existing reminder being edited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Subject {
-    Draft(i64),
-    Reminder(i64),
+    Draft(crate::domain::DraftId),
+    Reminder(crate::domain::ReminderId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,19 +31,19 @@ pub(crate) enum Action {
     AtInstant(Subject, DateTime<Utc>),
     Save(Subject, NaiveDateTime, Recurrence),
     SaveInstant(Subject, DateTime<Utc>, Recurrence),
-    CancelDraft(i64),
-    Manage(i64),
-    Delete(i64),
+    CancelDraft(crate::domain::DraftId),
+    Manage(crate::domain::ReminderId),
+    Delete(crate::domain::ReminderId),
     List,
     ListPage(usize),
-    Done(i64),
+    Done(crate::domain::NaggingId),
     /// Undo one recorded completion, including a negative answer to its follow-up.
-    UndoCompletion(i64),
-    Snooze(i64, Snooze),
+    UndoCompletion(crate::domain::CompletionId),
+    Snooze(crate::domain::NaggingId, Snooze),
     /// `ack:<nagging_id>` from the first Rust release.
-    LegacyNaggingAck(i64),
+    LegacyNaggingAck(crate::domain::NaggingId),
     /// `{"Id": <reminder_id>}` from the .NET bot.
-    LegacyReminderAck(i64),
+    LegacyReminderAck(crate::domain::ReminderId),
     /// Replace the calendar feed link, revoking the old one.
     CalendarReset,
     /// Calendar padding and headers.
@@ -102,7 +102,7 @@ impl Action {
             #[derive(Deserialize)]
             struct Legacy {
                 #[serde(rename = "Id")]
-                id: i64,
+                id: crate::domain::ReminderId,
             }
             return serde_json::from_str::<Legacy>(data)
                 .ok()
@@ -152,7 +152,11 @@ impl Action {
             ["m", id] => Action::Manage(id.parse().ok()?),
             ["del", id] => Action::Delete(id.parse().ok()?),
             ["n", id, "ok"] => Action::Done(id.parse().ok()?),
-            ["undo", id] => Action::UndoCompletion(id.parse().ok().filter(|id| *id > 0)?),
+            ["undo", id] => Action::UndoCompletion(
+                id.parse::<crate::domain::CompletionId>()
+                    .ok()
+                    .filter(|id| id.0 > 0)?,
+            ),
             ["n", id, "10m"] => Action::Snooze(id.parse().ok()?, Snooze::TenMinutes),
             ["n", id, "1h"] => Action::Snooze(id.parse().ok()?, Snooze::OneHour),
             ["n", id, "tm"] => Action::Snooze(id.parse().ok()?, Snooze::TomorrowMorning),
@@ -178,10 +182,9 @@ fn subject(s: Subject) -> String {
 
 fn parse_subject(s: &str) -> Option<Subject> {
     let (kind, id) = s.split_at_checked(1)?;
-    let id = id.parse().ok()?;
     match kind {
-        "d" => Some(Subject::Draft(id)),
-        "r" => Some(Subject::Reminder(id)),
+        "d" => Some(Subject::Draft(id.parse().ok()?)),
+        "r" => Some(Subject::Reminder(id.parse().ok()?)),
         _ => None,
     }
 }

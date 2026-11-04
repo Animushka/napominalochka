@@ -1,12 +1,14 @@
 //! SQLite operations for occurrences.
 use super::Db;
 use super::mapping::{DbLocalTime, DbTime, reminder_by_id, reminder_from_row, user_tz};
+use crate::application::ports::StorageResult;
+use crate::domain::ReminderId;
 use crate::domain::{Nagging, Reminder};
 use chrono::{DateTime, Utc};
 use rusqlite::params;
 
 impl Db {
-    pub(crate) async fn due_reminders(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<Reminder>> {
+    pub(crate) async fn due_reminders(&self, now: DateTime<Utc>) -> StorageResult<Vec<Reminder>> {
         self.call(move |conn| {
             conn.prepare(
                 "SELECT reminder_id, user_id, description, due_at, recurrence, anchor_local, nag_interval_minutes, confirmation_check_minutes, voice_enabled
@@ -24,10 +26,10 @@ impl Db {
     /// Returns `None` if the reminder no longer exists or is no longer due.
     pub(crate) async fn fire_reminder(
         &self,
-        reminder_id: i64,
+        reminder_id: ReminderId,
         now: DateTime<Utc>,
         first_nag_at: DateTime<Utc>,
-    ) -> anyhow::Result<Option<Nagging>> {
+    ) -> StorageResult<Option<Nagging>> {
         self.call(move |conn| {
             let tx = conn.transaction()?;
             let Some(reminder) = reminder_by_id(&tx, reminder_id)? else {
@@ -44,7 +46,7 @@ impl Db {
                 params![reminder.id, reminder.user_id, reminder.description, DbTime(first_nag_at), DbTime(reminder.due_at), reminder.settings.nag_interval_minutes, reminder.settings.confirmation_check_minutes, reminder.settings.voice_enabled],
             )?;
             let nagging = Nagging {
-                id: tx.last_insert_rowid(),
+                id: crate::domain::NaggingId(tx.last_insert_rowid()),
                 reminder_id: Some(reminder.id),
                 user_id: reminder.user_id,
                 description: reminder.description.clone(),

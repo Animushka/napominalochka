@@ -129,7 +129,7 @@ pub(crate) async fn execute(
                 vec![language_panel(lang)]
             } else if matches!(code.as_str(), "ru" | "en") {
                 service
-                    .set_preferences(sender.chat_id, Some(&code), None, None)
+                    .set_preferences(sender.chat_id, Some(Lang::parse(&code)), None, None)
                     .await?;
                 let selected = Lang::parse(&code);
                 vec![

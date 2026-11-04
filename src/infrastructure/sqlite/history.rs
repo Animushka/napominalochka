@@ -1,5 +1,7 @@
 //! Durable completion journal and transactional restoration of accidental completion.
 
+use crate::application::ports::StorageResult;
+use crate::domain::{CompletionId, NaggingId, UserId};
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{OptionalExtension, Transaction, params};
 
@@ -23,14 +25,14 @@ const CAN_UNDO: &str = "h.undone_at IS NULL AND (
 /// one transaction. It is shared by modern occurrence buttons and legacy buttons.
 pub(super) fn complete(
     tx: &Transaction<'_>,
-    user_id: i64,
-    nagging_id: i64,
+    user_id: UserId,
+    nagging_id: NaggingId,
     now: DateTime<Utc>,
 ) -> rusqlite::Result<bool> {
     let completed = tx.query_row(
         "DELETE FROM naggings WHERE nagging_id=?1 AND user_id=?2 RETURNING description,reminder_id,scheduled_at,nag_interval_minutes,confirmation_check_minutes,voice_enabled",
-        [nagging_id,user_id],
-        |row| Ok((row.get::<_,String>(0)?,row.get::<_,Option<i64>>(1)?,row.get::<_,Option<DbTime>>(2)?,
+        params![nagging_id,user_id],
+        |row| Ok((row.get::<_,String>(0)?,row.get::<_,Option<crate::domain::ReminderId>>(1)?,row.get::<_,Option<DbTime>>(2)?,
             ReminderSettings { nag_interval_minutes: row.get(3)?,confirmation_check_minutes:row.get(4)?,voice_enabled:row.get(5)? })),
     ).optional()?;
     let Some((description, reminder_id, scheduled_at, settings)) = completed else {
@@ -42,20 +44,20 @@ pub(super) fn complete(
         params![user_id,nagging_id,reminder_id,description,scheduled_at,DbTime(now),settings.nag_interval_minutes,settings.confirmation_check_minutes,settings.voice_enabled],
     )?;
     let completion_id = tx.last_insert_rowid();
-    let inherited: i64 = tx
+    let inherited: crate::domain::ConfirmationDelay = tx
         .query_row(
             "SELECT confirmation_check_minutes FROM preferences WHERE user_id=?1",
             [user_id],
             |row| row.get(0),
         )
         .optional()?
-        .unwrap_or(0);
+        .unwrap_or(crate::domain::ConfirmationDelay::Disabled);
     let delay = settings.confirmation_check_minutes.unwrap_or(inherited);
-    if delay == 20 {
+    if delay == crate::domain::ConfirmationDelay::TwentyMinutes {
         tx.execute(
             "INSERT INTO confirmations(source_nagging_id,reminder_id,user_id,description,due_at,completion_id)
              VALUES(?1,?2,?3,?4,?5,?6)",
-            params![nagging_id,reminder_id,user_id,description,DbTime(now+Duration::minutes(delay)),completion_id],
+            params![nagging_id,reminder_id,user_id,description,DbTime(now+Duration::minutes(delay.minutes())),completion_id],
         )?;
     }
     Ok(true)
@@ -76,10 +78,10 @@ fn completion_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Completion> 
 impl Db {
     pub(crate) async fn completion_history(
         &self,
-        user_id: i64,
-        before: Option<i64>,
+        user_id: UserId,
+        before: Option<CompletionId>,
         limit: usize,
-    ) -> anyhow::Result<HistoryPage> {
+    ) -> StorageResult<HistoryPage> {
         let limit = limit.clamp(1, 100);
         self.call(move |conn| {
             let sql = format!(
@@ -106,29 +108,29 @@ impl Db {
 
     pub(crate) async fn completion_for_source(
         &self,
-        user_id: i64,
-        nagging_id: i64,
-    ) -> anyhow::Result<Option<Completion>> {
+        user_id: UserId,
+        nagging_id: NaggingId,
+    ) -> StorageResult<Option<Completion>> {
         self.call(move |conn| {
             let sql = format!("SELECT h.completion_id,h.user_id,h.description,h.scheduled_at,h.completed_at,h.undone_at,({CAN_UNDO}) FROM completion_history h WHERE h.user_id=?1 AND h.source_nagging_id=?2");
-            conn.query_row(&sql,[user_id,nagging_id],completion_from_row).optional()
+            conn.query_row(&sql,params![user_id,nagging_id],completion_from_row).optional()
         }).await
     }
 
     pub(crate) async fn undo_completion(
         &self,
-        user_id: i64,
-        completion_id: i64,
+        user_id: UserId,
+        completion_id: CompletionId,
         now: DateTime<Utc>,
-    ) -> anyhow::Result<UndoResult> {
+    ) -> StorageResult<UndoResult> {
         self.call(move |conn| {
             let tx = conn.transaction()?;
             let sql = format!(
                 "SELECT h.description,h.reminder_id,h.scheduled_at,h.undone_at,({CAN_UNDO}),h.nag_interval_minutes,h.confirmation_check_minutes,h.voice_enabled
                  FROM completion_history h WHERE h.user_id=?1 AND h.completion_id=?2"
             );
-            let entry = tx.query_row(&sql, [user_id,completion_id], |row| {
-                Ok((row.get::<_,String>(0)?,row.get::<_,Option<i64>>(1)?,row.get::<_,Option<DbTime>>(2)?,
+            let entry = tx.query_row(&sql, params![user_id,completion_id], |row| {
+                Ok((row.get::<_,String>(0)?,row.get::<_,Option<crate::domain::ReminderId>>(1)?,row.get::<_,Option<DbTime>>(2)?,
                     row.get::<_,Option<DbTime>>(3)?,row.get::<_,bool>(4)?,ReminderSettings { nag_interval_minutes:row.get(5)?,confirmation_check_minutes:row.get(6)?,voice_enabled:row.get(7)? }))
             }).optional()?;
             let Some((description,reminder_id,scheduled_at,undone_at,allowed,settings)) = entry else {
@@ -141,12 +143,12 @@ impl Db {
             let settings = match reminder_id {
                 Some(reminder_id) => tx.query_row(
                     "SELECT nag_interval_minutes,confirmation_check_minutes,voice_enabled FROM reminders WHERE user_id=?1 AND reminder_id=?2",
-                    [user_id,reminder_id],
+                    params![user_id,reminder_id],
                     |row| Ok(ReminderSettings { nag_interval_minutes:row.get(0)?,confirmation_check_minutes:row.get(1)?,voice_enabled:row.get(2)? }),
                 )?,
                 None => settings,
             };
-            tx.execute("DELETE FROM confirmations WHERE completion_id=?1 AND user_id=?2", [completion_id,user_id])?;
+            tx.execute("DELETE FROM confirmations WHERE completion_id=?1 AND user_id=?2", params![completion_id,user_id])?;
             tx.execute(
                 "INSERT INTO naggings(reminder_id,user_id,description,next_at,scheduled_at,nag_interval_minutes,confirmation_check_minutes,voice_enabled) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
                 params![reminder_id,user_id,description,DbTime(now+Duration::minutes(10)),scheduled_at,settings.nag_interval_minutes,settings.confirmation_check_minutes,settings.voice_enabled],

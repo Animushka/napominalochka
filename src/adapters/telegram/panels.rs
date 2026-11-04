@@ -1,11 +1,13 @@
 //! Message text and inline keyboards for each step of the reminder flow.
 
+use crate::domain::{CompletionId, NaggingId};
 use chrono::{
     DateTime, Datelike, Duration, Months, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc,
 };
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 
 use crate::adapters::i18n::Lang;
+use crate::adapters::presentation::relative_lang;
 use crate::adapters::telegram::callback::{Action, Subject};
 use crate::domain::Snooze;
 use crate::domain::{Recurrence, Reminder, ReminderTime, User, UserTz};
@@ -27,26 +29,6 @@ fn button(label: impl Into<String>, action: Action) -> InlineKeyboardButton {
 
 fn blank() -> InlineKeyboardButton {
     button(" ", Action::Noop)
-}
-
-/// "in 5 min", "in 3 h 20 min", "in 4 days".
-pub(crate) fn relative_lang(from: DateTime<Utc>, to: DateTime<Utc>, lang: Lang) -> String {
-    let minutes = (to - from).num_minutes().max(0);
-    match minutes {
-        0 => lang.text("relative.now"),
-        1..=59 => lang.render("relative.minutes", &[("minutes", minutes.to_string())]),
-        60..=2879 => match minutes % 60 {
-            0 => lang.render("relative.hours", &[("hours", (minutes / 60).to_string())]),
-            m => lang.render(
-                "relative.hours_minutes",
-                &[
-                    ("hours", (minutes / 60).to_string()),
-                    ("minutes", m.to_string()),
-                ],
-            ),
-        },
-        _ => lang.render("relative.days", &[("days", (minutes / 1440).to_string())]),
-    }
 }
 
 fn back_or_cancel(lang: Lang, subject: Subject, back: Action) -> Vec<InlineKeyboardButton> {
@@ -561,7 +543,7 @@ fn truncate(text: &str, max_chars: usize) -> String {
 
 /// Localized labels for the reminder acknowledgement controls.
 pub(crate) fn nag_keyboard_lang(
-    nagging_id: i64,
+    nagging_id: NaggingId,
     lang: crate::adapters::i18n::Lang,
 ) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new([
@@ -583,7 +565,10 @@ pub(crate) fn nag_keyboard_lang(
     ])
 }
 
-pub(crate) fn completion_keyboard_lang(completion_id: i64, lang: Lang) -> InlineKeyboardMarkup {
+pub(crate) fn completion_keyboard_lang(
+    completion_id: CompletionId,
+    lang: Lang,
+) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new([[button(
         lang.text("button.undo_completion"),
         Action::UndoCompletion(completion_id),
@@ -593,7 +578,7 @@ pub(crate) fn completion_keyboard_lang(completion_id: i64, lang: Lang) -> Inline
 /// A legacy check has no journal entry to restore. New checks refer to a durable
 /// completion even after the delivery queue removes its successfully sent row.
 pub(crate) fn confirmation_keyboard_lang(
-    completion_id: Option<i64>,
+    completion_id: Option<CompletionId>,
     lang: Lang,
 ) -> InlineKeyboardMarkup {
     let mut rows = vec![vec![InlineKeyboardButton::callback(

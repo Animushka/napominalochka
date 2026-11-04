@@ -1,7 +1,9 @@
 //! SQLite operations for drafts.
 use super::Db;
 use super::mapping::{DbLocalTime, DbTime, draft_from_row};
+use crate::application::ports::StorageResult;
 use crate::domain::{Draft, Recurrence, Reminder, ReminderSettings};
+use crate::domain::{DraftId, UserId};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use rusqlite::{OptionalExtension, params};
 
@@ -9,10 +11,10 @@ impl Db {
     /// Stores text waiting for a time. A user has at most one draft; older ones are replaced.
     pub(crate) async fn create_draft(
         &self,
-        user_id: i64,
+        user_id: UserId,
         text: String,
         now: DateTime<Utc>,
-    ) -> anyhow::Result<Draft> {
+    ) -> StorageResult<Draft> {
         self.call(move |conn| {
             let tx = conn.transaction()?;
             tx.execute("DELETE FROM drafts WHERE user_id = ?1", [user_id])?;
@@ -21,7 +23,7 @@ impl Db {
                 params![user_id, text, DbTime(now)],
             )?;
             let draft = Draft {
-                id: tx.last_insert_rowid(),
+                id: crate::domain::DraftId(tx.last_insert_rowid()),
                 user_id,
                 text,
                 created_at: now,
@@ -32,11 +34,15 @@ impl Db {
         .await
     }
 
-    pub(crate) async fn draft(&self, user_id: i64, draft_id: i64) -> anyhow::Result<Option<Draft>> {
+    pub(crate) async fn draft(
+        &self,
+        user_id: UserId,
+        draft_id: DraftId,
+    ) -> StorageResult<Option<Draft>> {
         self.call(move |conn| {
             conn.query_row(
                 "SELECT draft_id, user_id, text, created_at FROM drafts WHERE draft_id = ?1 AND user_id = ?2",
-                [draft_id, user_id],
+                params![draft_id, user_id],
                 draft_from_row,
             )
             .optional()
@@ -47,9 +53,9 @@ impl Db {
     /// The user's draft, if it was created after `since`.
     pub(crate) async fn pending_draft(
         &self,
-        user_id: i64,
+        user_id: UserId,
         since: DateTime<Utc>,
-    ) -> anyhow::Result<Option<Draft>> {
+    ) -> StorageResult<Option<Draft>> {
         self.call(move |conn| {
             conn.query_row(
                 "SELECT draft_id, user_id, text, created_at FROM drafts
@@ -63,11 +69,15 @@ impl Db {
         .await
     }
 
-    pub(crate) async fn delete_draft(&self, user_id: i64, draft_id: i64) -> anyhow::Result<bool> {
+    pub(crate) async fn delete_draft(
+        &self,
+        user_id: UserId,
+        draft_id: DraftId,
+    ) -> StorageResult<bool> {
         self.call(move |conn| {
             Ok(conn.execute(
                 "DELETE FROM drafts WHERE draft_id = ?1 AND user_id = ?2",
-                [draft_id, user_id],
+                params![draft_id, user_id],
             )? > 0)
         })
         .await
@@ -78,29 +88,29 @@ impl Db {
     #[cfg(test)]
     pub(crate) async fn save_draft(
         &self,
-        user_id: i64,
-        draft_id: i64,
+        user_id: UserId,
+        draft_id: DraftId,
         due_at: DateTime<Utc>,
         recurrence: Recurrence,
-    ) -> anyhow::Result<Option<Reminder>> {
+    ) -> StorageResult<Option<Reminder>> {
         self.save_draft_with_anchor(user_id, draft_id, due_at, recurrence, None)
             .await
     }
 
     pub(crate) async fn save_draft_with_anchor(
         &self,
-        user_id: i64,
-        draft_id: i64,
+        user_id: UserId,
+        draft_id: DraftId,
         due_at: DateTime<Utc>,
         recurrence: Recurrence,
         anchor_local: Option<NaiveDateTime>,
-    ) -> anyhow::Result<Option<Reminder>> {
+    ) -> StorageResult<Option<Reminder>> {
         self.call(move |conn| {
             let tx = conn.transaction()?;
             let text: Option<String> = tx
                 .query_row(
                     "DELETE FROM drafts WHERE draft_id = ?1 AND user_id = ?2 RETURNING text",
-                    [draft_id, user_id],
+                    params![draft_id, user_id],
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -111,17 +121,14 @@ impl Db {
                 "INSERT INTO reminders (user_id, description, due_at, recurrence, anchor_local) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![user_id, description, DbTime(due_at), recurrence.code(), anchor_local.map(DbLocalTime)],
             )?;
-            let reminder = Reminder { id: tx.last_insert_rowid(), user_id, description, due_at, recurrence, anchor_local, settings: ReminderSettings::default() };
+            let reminder = Reminder { id: crate::domain::ReminderId(tx.last_insert_rowid()), user_id, description, due_at, recurrence, anchor_local, settings: ReminderSettings::default() };
             tx.commit()?;
             Ok(Some(reminder))
         })
         .await
     }
 
-    pub(crate) async fn delete_drafts_before(
-        &self,
-        cutoff: DateTime<Utc>,
-    ) -> anyhow::Result<usize> {
+    pub(crate) async fn delete_drafts_before(&self, cutoff: DateTime<Utc>) -> StorageResult<usize> {
         self.call(move |conn| {
             conn.execute("DELETE FROM drafts WHERE created_at < ?1", [DbTime(cutoff)])
         })

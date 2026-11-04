@@ -3,68 +3,70 @@ use super::types::{
     ActionResult, AuthState, Connection, ConnectionFailure, DispatchWindow, Job, NewAuth,
     PendingGrant, Result, Scenario, TokenResponse,
 };
+use crate::application::ports::StorageResult;
+use crate::domain::UserId;
 use futures_util::future::BoxFuture;
 
 pub(crate) trait YandexRepository: Send + Sync + 'static {
-    fn recover_claims(&self) -> BoxFuture<'_, anyhow::Result<()>>;
+    fn recover_claims(&self) -> BoxFuture<'_, StorageResult<()>>;
     fn finish_job(
         &self,
         job: Job,
         result: Result<ActionResult>,
-    ) -> BoxFuture<'_, anyhow::Result<()>>;
-    fn next_job(&self, window: DispatchWindow) -> BoxFuture<'_, anyhow::Result<Option<Job>>>;
-    fn claim_job(&self, job: Job, window: DispatchWindow) -> BoxFuture<'_, anyhow::Result<bool>>;
-    fn job_valid(&self, job: Job, window: DispatchWindow) -> BoxFuture<'_, anyhow::Result<bool>>;
-    fn save_auth(&self, auth: NewAuth) -> BoxFuture<'_, anyhow::Result<()>>;
-    fn cancel_auth(&self, user_id: i64, hash: String) -> BoxFuture<'_, anyhow::Result<()>>;
-    fn save_grant(&self, grant: PendingGrant) -> BoxFuture<'_, anyhow::Result<bool>>;
+    ) -> BoxFuture<'_, StorageResult<()>>;
+    fn next_job(&self, window: DispatchWindow) -> BoxFuture<'_, StorageResult<Option<Job>>>;
+    fn claim_job(&self, job: Job, window: DispatchWindow) -> BoxFuture<'_, StorageResult<bool>>;
+    fn job_valid(&self, job: Job, window: DispatchWindow) -> BoxFuture<'_, StorageResult<bool>>;
+    fn save_auth(&self, auth: NewAuth) -> BoxFuture<'_, StorageResult<()>>;
+    fn cancel_auth(&self, user_id: UserId, hash: String) -> BoxFuture<'_, StorageResult<()>>;
+    fn save_grant(&self, grant: PendingGrant) -> BoxFuture<'_, StorageResult<bool>>;
     fn confirm_auth(
         &self,
-        user_id: i64,
+        user_id: UserId,
         hash: String,
         now: i64,
-    ) -> BoxFuture<'_, anyhow::Result<bool>>;
+    ) -> BoxFuture<'_, StorageResult<bool>>;
     fn consume_state(
         &self,
         hash: String,
         now: i64,
-    ) -> BoxFuture<'_, anyhow::Result<Option<AuthState>>>;
+    ) -> BoxFuture<'_, StorageResult<Option<AuthState>>>;
     fn configure(
         &self,
-        user_id: i64,
+        user_id: UserId,
         generation: String,
         selected: Option<Scenario>,
         enabled: bool,
-    ) -> BoxFuture<'_, anyhow::Result<bool>>;
-    fn disconnect(&self, user_id: i64) -> BoxFuture<'_, anyhow::Result<()>>;
-    fn connection(&self, user_id: i64) -> BoxFuture<'_, anyhow::Result<Option<Connection>>>;
+    ) -> BoxFuture<'_, StorageResult<bool>>;
+    fn disconnect(&self, user_id: UserId) -> BoxFuture<'_, StorageResult<()>>;
+    fn connection(&self, user_id: UserId) -> BoxFuture<'_, StorageResult<Option<Connection>>>;
     fn update_tokens(
         &self,
-        user_id: i64,
+        user_id: UserId,
         generation: String,
         encrypted: Vec<u8>,
         expires_at: i64,
         refresh_after: i64,
-    ) -> BoxFuture<'_, anyhow::Result<bool>>;
-    fn refresh_candidate(&self, now: i64) -> BoxFuture<'_, anyhow::Result<Option<i64>>>;
+    ) -> BoxFuture<'_, StorageResult<bool>>;
+    fn refresh_candidate(&self, now: i64) -> BoxFuture<'_, StorageResult<Option<UserId>>>;
     fn defer_refresh(
         &self,
-        user_id: i64,
+        user_id: UserId,
         generation: String,
         retry_at: i64,
-    ) -> BoxFuture<'_, anyhow::Result<()>>;
+    ) -> BoxFuture<'_, StorageResult<()>>;
     fn reserve_action(
         &self,
-        user_id: i64,
+        user_id: UserId,
         generation: String,
         window: DispatchWindow,
-    ) -> BoxFuture<'_, anyhow::Result<bool>>;
-    fn record_failure(&self, failure: ConnectionFailure) -> BoxFuture<'_, anyhow::Result<()>>;
+    ) -> BoxFuture<'_, StorageResult<bool>>;
+    fn record_failure(&self, failure: ConnectionFailure) -> BoxFuture<'_, StorageResult<()>>;
     fn clear_temporary_failure(
         &self,
-        user_id: i64,
+        user_id: UserId,
         generation: String,
-    ) -> BoxFuture<'_, anyhow::Result<()>>;
+    ) -> BoxFuture<'_, StorageResult<()>>;
 }
 
 pub(crate) trait YandexProvider: Send + Sync + 'static {
@@ -78,7 +80,18 @@ pub(crate) trait YandexProvider: Send + Sync + 'static {
 }
 
 pub(crate) trait TokenVault: Send + Sync + 'static {
-    fn seal(&self, user_id: i64, generation: &str, kind: &str, plaintext: &[u8])
-    -> Result<Vec<u8>>;
-    fn open(&self, user_id: i64, generation: &str, kind: &str, envelope: &[u8]) -> Result<Vec<u8>>;
+    fn seal(
+        &self,
+        user_id: UserId,
+        generation: &str,
+        kind: &str,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>>;
+    fn open(
+        &self,
+        user_id: UserId,
+        generation: &str,
+        kind: &str,
+        envelope: &[u8],
+    ) -> Result<Vec<u8>>;
 }

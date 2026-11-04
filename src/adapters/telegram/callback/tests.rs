@@ -1,4 +1,5 @@
 use super::*;
+use crate::domain::{CompletionId, DraftId, NaggingId, ReminderId};
 
 #[test]
 fn round_trips_and_fits_in_64_bytes() {
@@ -6,26 +7,26 @@ fn round_trips_and_fits_in_64_bytes() {
     let at = date.and_hms_opt(23, 55, 0).unwrap();
     let big = i64::MAX;
     for action in [
-        Action::When(Subject::Draft(big)),
-        Action::Calendar(Subject::Reminder(big), 2026, 12),
-        Action::Day(Subject::Draft(big), date),
-        Action::Hour(Subject::Draft(big), date, 23),
-        Action::At(Subject::Reminder(big), at),
-        Action::Save(Subject::Draft(big), at, Recurrence::Yearly),
-        Action::AtInstant(Subject::Draft(big), at.and_utc()),
-        Action::SaveInstant(Subject::Draft(big), at.and_utc(), Recurrence::Once),
+        Action::When(Subject::Draft(DraftId(big))),
+        Action::Calendar(Subject::Reminder(ReminderId(big)), 2026, 12),
+        Action::Day(Subject::Draft(DraftId(big)), date),
+        Action::Hour(Subject::Draft(DraftId(big)), date, 23),
+        Action::At(Subject::Reminder(ReminderId(big)), at),
+        Action::Save(Subject::Draft(DraftId(big)), at, Recurrence::Yearly),
+        Action::AtInstant(Subject::Draft(DraftId(big)), at.and_utc()),
+        Action::SaveInstant(Subject::Draft(DraftId(big)), at.and_utc(), Recurrence::Once),
         Action::ListPage(usize::MAX),
-        Action::CancelDraft(big),
-        Action::Manage(big),
-        Action::Delete(big),
+        Action::CancelDraft(DraftId(big)),
+        Action::Manage(ReminderId(big)),
+        Action::Delete(ReminderId(big)),
         Action::List,
-        Action::Done(big),
-        Action::UndoCompletion(big),
-        Action::Snooze(big, Snooze::TenMinutes),
-        Action::Snooze(big, Snooze::OneHour),
-        Action::Snooze(big, Snooze::TomorrowMorning),
-        Action::LegacyNaggingAck(big),
-        Action::LegacyReminderAck(big),
+        Action::Done(NaggingId(big)),
+        Action::UndoCompletion(CompletionId(big)),
+        Action::Snooze(NaggingId(big), Snooze::TenMinutes),
+        Action::Snooze(NaggingId(big), Snooze::OneHour),
+        Action::Snooze(NaggingId(big), Snooze::TomorrowMorning),
+        Action::LegacyNaggingAck(NaggingId(big)),
+        Action::LegacyReminderAck(ReminderId(big)),
         Action::CalendarReset,
         Action::Noop,
     ] {

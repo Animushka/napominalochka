@@ -11,6 +11,7 @@ mod repository;
 #[cfg(test)]
 mod migration_tests;
 
+use crate::application::ports::StorageResult;
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -30,7 +31,7 @@ pub(crate) struct Db {
 }
 
 impl Db {
-    pub(crate) fn open(path: &Path) -> anyhow::Result<Self> {
+    pub(crate) fn open(path: &Path) -> StorageResult<Self> {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("creating database directory {}", dir.display()))?;
@@ -42,11 +43,11 @@ impl Db {
     }
 
     #[cfg(test)]
-    pub(crate) fn open_in_memory() -> anyhow::Result<Self> {
+    pub(crate) fn open_in_memory() -> StorageResult<Self> {
         Self::init(Connection::open_in_memory()?)
     }
 
-    fn init(mut conn: Connection) -> anyhow::Result<Self> {
+    fn init(mut conn: Connection) -> StorageResult<Self> {
         conn.busy_timeout(Duration::from_secs(5))?;
         schema::migrate(&mut conn).context("migrating database schema")?;
         conn.pragma_update(None, "foreign_keys", true)?;
@@ -55,7 +56,7 @@ impl Db {
         })
     }
 
-    pub(crate) async fn call<T, F>(&self, f: F) -> anyhow::Result<T>
+    pub(crate) async fn call<T, F>(&self, f: F) -> StorageResult<T>
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> rusqlite::Result<T> + Send + 'static,
@@ -66,11 +67,11 @@ impl Db {
             f(&mut conn)
         })
         .await
-        .context("database task panicked")?;
+        .map_err(|error| crate::application::ports::StorageError::Worker(Box::new(error)))?;
         Ok(result?)
     }
 
-    pub(crate) async fn vacuum(&self) -> anyhow::Result<()> {
+    pub(crate) async fn vacuum(&self) -> StorageResult<()> {
         self.call(|conn| conn.execute_batch("VACUUM;")).await
     }
 }
@@ -87,3 +88,7 @@ mod yandex;
 
 #[cfg(test)]
 mod tests;
+
+mod value_types;
+
+mod error;

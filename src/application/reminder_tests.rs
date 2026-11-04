@@ -1,5 +1,6 @@
 use crate::application::MAX_DESCRIPTION_CHARS;
 use crate::application::ports::Registration;
+use crate::domain::{ConfirmationDelay, Language, NagInterval, UserId};
 use crate::domain::{InputError, Preferences, Recurrence, Snooze, User, UserTz};
 use crate::infrastructure::sqlite::Db;
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
@@ -31,7 +32,7 @@ async fn setup() -> Fixture {
     let db = Db::open_in_memory().unwrap();
     let service = ReminderService::new(db.clone());
     let profile = Profile {
-        id: 1,
+        id: UserId(1),
         first_name: "Ada".into(),
         last_name: String::new(),
     };
@@ -138,7 +139,7 @@ async fn pending_actions_are_private_and_done_creates_exactly_one_followup() {
     let (other, _) = service
         .set_timezone(
             Profile {
-                id: 2,
+                id: UserId(2),
                 first_name: "Eve".into(),
                 last_name: String::new(),
             },
@@ -147,7 +148,7 @@ async fn pending_actions_are_private_and_done_creates_exactly_one_followup() {
         .await
         .unwrap();
     service
-        .set_preferences(user.id, None, None, Some(20))
+        .set_preferences(user.id, None, None, Some(ConfirmationDelay::TwentyMinutes))
         .await
         .unwrap();
     let reminder = service
@@ -217,7 +218,7 @@ async fn pending_actions_are_private_and_done_creates_exactly_one_followup() {
 async fn only_owners_can_change_reminders() {
     let Fixture { service, user, .. } = setup().await;
     let other = Profile {
-        id: 2,
+        id: UserId(2),
         first_name: "Eve".into(),
         last_name: String::new(),
     };
@@ -317,7 +318,7 @@ async fn schedule_anchor_survives_text_edits_and_resets_for_schedule_changes() {
     assert_eq!(stale_form_save.due_at, march.due_at);
     assert_eq!(stale_form_save.anchor_local, Some(anchor));
     assert!(matches!(
-        service.rename(2, reminder.id, "other user").await,
+        service.rename(UserId(2), reminder.id, "other user").await,
         Err(Error::NotFound)
     ));
 
@@ -355,7 +356,7 @@ async fn creating_inside_a_dst_gap_preserves_the_requested_clock() {
     let (user, _) = service
         .set_timezone(
             Profile {
-                id: 1,
+                id: UserId(1),
                 first_name: "Ada".into(),
                 last_name: String::new(),
             },
@@ -440,7 +441,7 @@ async fn snoozes_until_tomorrow_morning_local_time() {
 async fn calendar_feed_requires_registration_and_valid_token() {
     let Fixture { service, user, .. } = setup().await;
     assert!(matches!(
-        service.calendar_token(99, false).await,
+        service.calendar_token(UserId(99), false).await,
         Err(Error::NotRegistered)
     ));
     let token = service.calendar_token(user.id, false).await.unwrap();
@@ -458,45 +459,56 @@ async fn calendar_feed_requires_registration_and_valid_token() {
 async fn preferences_work_before_registration_and_manual_language_wins() {
     let service = ReminderService::new(Db::open_in_memory().unwrap());
     assert_eq!(
-        service.preferences(7).await.unwrap(),
+        service.preferences(UserId(7)).await.unwrap(),
         Preferences::default()
     );
-    service.initialize_language(7, Some("en-US")).await.unwrap();
-    assert_eq!(service.preferences(7).await.unwrap().language, "en");
     service
-        .set_preferences(7, Some("ru"), Some(30), Some(20))
+        .initialize_language(UserId(7), Some("en-US"))
         .await
         .unwrap();
-    service.initialize_language(7, Some("en")).await.unwrap();
-    let preferences = service.preferences(7).await.unwrap();
-    assert_eq!(preferences.language, "ru");
-    assert_eq!(preferences.nag_interval_minutes, 30);
-    assert_eq!(preferences.confirmation_check_minutes, 20);
-    assert!(service.user(7).await.unwrap().is_none());
     assert_eq!(
-        service.preferences(8).await.unwrap(),
+        service.preferences(UserId(7)).await.unwrap().language,
+        Language::En
+    );
+    service
+        .set_preferences(
+            UserId(7),
+            Some(Language::Ru),
+            Some(NagInterval::ThirtyMinutes),
+            Some(ConfirmationDelay::TwentyMinutes),
+        )
+        .await
+        .unwrap();
+    service
+        .initialize_language(UserId(7), Some("en"))
+        .await
+        .unwrap();
+    let preferences = service.preferences(UserId(7)).await.unwrap();
+    assert_eq!(preferences.language, Language::Ru);
+    assert_eq!(preferences.nag_interval_minutes, NagInterval::ThirtyMinutes);
+    assert_eq!(
+        preferences.confirmation_check_minutes,
+        ConfirmationDelay::TwentyMinutes
+    );
+    assert!(service.user(UserId(7)).await.unwrap().is_none());
+    assert_eq!(
+        service.preferences(UserId(8)).await.unwrap(),
         Preferences::default()
     );
-    service.initialize_language(8, Some("de")).await.unwrap();
-    assert_eq!(service.preferences(8).await.unwrap().language, "ru");
-    for (language, interval, check) in [
-        (Some("fr"), None, None),
-        (None, Some(2), None),
-        (None, None, Some(10)),
-    ] {
-        assert!(matches!(
-            service.set_preferences(7, language, interval, check).await,
-            Err(Error::InvalidPreferences(_))
-        ));
-        assert_eq!(
-            service.preferences(7).await.unwrap(),
-            preferences,
-            "invalid patches must be atomic"
-        );
-    }
-    service.unregister(7).await.unwrap();
+    service
+        .initialize_language(UserId(8), Some("de"))
+        .await
+        .unwrap();
     assert_eq!(
-        service.preferences(7).await.unwrap(),
+        service.preferences(UserId(8)).await.unwrap().language,
+        Language::Ru
+    );
+    assert!("fr".parse::<Language>().is_err());
+    assert!(NagInterval::try_from(2).is_err());
+    assert!(ConfirmationDelay::try_from(10).is_err());
+    service.unregister(UserId(7)).await.unwrap();
+    assert_eq!(
+        service.preferences(UserId(7)).await.unwrap(),
         Preferences::default(),
         "unregister also clears preferences before timezone registration"
     );
@@ -508,7 +520,7 @@ async fn an_elapsed_duration_preserves_the_second_clock_occurrence() {
     let (user, _) = service
         .set_timezone(
             Profile {
-                id: 1,
+                id: UserId(1),
                 first_name: "Ada".into(),
                 last_name: String::new(),
             },

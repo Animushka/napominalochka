@@ -1,5 +1,7 @@
 use super::*;
-use crate::domain::User;
+use crate::adapters::http::dto::LOCAL_FORMAT;
+use crate::domain::{ConfirmationDelay, Language, NagInterval, ReminderId, UserId};
+use crate::domain::{ReminderSettings, User};
 use chrono::Duration;
 
 async fn setup() -> (Router, ReminderService, Db, String) {
@@ -9,7 +11,7 @@ async fn setup() -> (Router, ReminderService, Db, String) {
         service
             .set_timezone(
                 Profile {
-                    id,
+                    id: UserId(id),
                     first_name: "Fixture".into(),
                     last_name: String::new(),
                 },
@@ -19,7 +21,12 @@ async fn setup() -> (Router, ReminderService, Db, String) {
             .unwrap();
     }
     service
-        .set_preferences(42, Some("en"), Some(60), Some(20))
+        .set_preferences(
+            UserId(42),
+            Some(Language::En),
+            Some(NagInterval::OneHour),
+            Some(ConfirmationDelay::TwentyMinutes),
+        )
         .await
         .unwrap();
     let app = router(Arc::new(WebState {
@@ -30,7 +37,7 @@ async fn setup() -> (Router, ReminderService, Db, String) {
         web_app_url: None,
         yandex: None,
     }));
-    (app, service, db, init_data(42, Utc::now()))
+    (app, service, db, init_data(UserId(42), Utc::now()))
 }
 
 #[tokio::test]
@@ -39,7 +46,7 @@ async fn history_http_flow_is_private_paginated_and_undo_is_idempotent() {
     let now = Utc::now();
     let reminder = db
         .add_reminder(
-            42,
+            UserId(42),
             "completed once".into(),
             now - Duration::minutes(1),
             Recurrence::Once,
@@ -81,7 +88,7 @@ async fn history_http_flow_is_private_paginated_and_undo_is_idempotent() {
     );
     assert!(page["items"][0].get("user_id").is_none());
     let id = page["items"][0]["id"].as_i64().unwrap();
-    let stranger = init_data(66, Utc::now());
+    let stranger = init_data(UserId(66), Utc::now());
     let other: serde_json::Value = serde_json::from_str(
         &call(&app, "GET", "/api/history", Some(&stranger), None)
             .await
@@ -100,7 +107,7 @@ async fn history_http_flow_is_private_paginated_and_undo_is_idempotent() {
         let state: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(state["pending"].as_array().unwrap().len(), 1);
     }
-    let restored = db.naggings_for_user(42).await.unwrap().remove(0);
+    let restored = db.naggings_for_user(UserId(42)).await.unwrap().remove(0);
     assert_ne!(restored.id, nagging.id);
     assert!(restored.next_at >= now + Duration::minutes(9));
     assert!(
@@ -157,7 +164,7 @@ async fn undoing_an_obsolete_occurrence_returns_a_stable_conflict() {
     let now = Utc::now();
     let r = db
         .add_reminder(
-            42,
+            UserId(42),
             "daily".into(),
             now - Duration::minutes(1),
             Recurrence::Daily,
@@ -165,9 +172,13 @@ async fn undoing_an_obsolete_occurrence_returns_a_stable_conflict() {
         .await
         .unwrap();
     let n = db.fire_reminder(r.id, now, now).await.unwrap().unwrap();
-    db.complete_nagging(42, n.id, now).await.unwrap();
-    let entry = db.completion_for_source(42, n.id).await.unwrap().unwrap();
-    let next = db.reminder(42, r.id).await.unwrap().unwrap();
+    db.complete_nagging(UserId(42), n.id, now).await.unwrap();
+    let entry = db
+        .completion_for_source(UserId(42), n.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let next = db.reminder(UserId(42), r.id).await.unwrap().unwrap();
     db.fire_reminder(r.id, next.due_at, next.due_at)
         .await
         .unwrap();
@@ -184,7 +195,7 @@ async fn undoing_an_obsolete_occurrence_returns_a_stable_conflict() {
         serde_json::from_str::<serde_json::Value>(&body).unwrap()["code"],
         "completion_unavailable"
     );
-    assert_eq!(db.naggings_for_user(42).await.unwrap().len(), 1);
+    assert_eq!(db.naggings_for_user(UserId(42)).await.unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -199,7 +210,11 @@ async fn settings_http_edits_are_atomic_and_do_not_change_user_defaults_or_sched
     let item: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(item["settings"]["nag_interval_minutes"], 5);
     let id = item["id"].as_i64().unwrap();
-    let old = db.reminder(42, id).await.unwrap().unwrap();
+    let old = db
+        .reminder(UserId(42), ReminderId(id))
+        .await
+        .unwrap()
+        .unwrap();
     let invalid=serde_json::json!({"description":"must not save","at":"ignored","recurrence":"daily","preserve_schedule":true,"settings":{"nag_interval_minutes":3,"confirmation_check_minutes":20,"voice_enabled":true}}).to_string();
     assert_eq!(
         call(
@@ -213,7 +228,13 @@ async fn settings_http_edits_are_atomic_and_do_not_change_user_defaults_or_sched
         .0,
         StatusCode::BAD_REQUEST
     );
-    assert_eq!(db.reminder(42, id).await.unwrap().unwrap(), old);
+    assert_eq!(
+        db.reminder(UserId(42), ReminderId(id))
+            .await
+            .unwrap()
+            .unwrap(),
+        old
+    );
     let reset=serde_json::json!({"description":"renamed","at":"ignored","recurrence":"daily","preserve_schedule":true,"settings":{"nag_interval_minutes":null,"confirmation_check_minutes":null,"voice_enabled":true}}).to_string();
     assert_eq!(
         call(
@@ -227,23 +248,56 @@ async fn settings_http_edits_are_atomic_and_do_not_change_user_defaults_or_sched
         .0,
         StatusCode::OK
     );
-    let current = db.reminder(42, id).await.unwrap().unwrap();
+    let current = db
+        .reminder(UserId(42), ReminderId(id))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(current.description, "renamed");
     assert_eq!(current.due_at, old.due_at);
     assert_eq!(current.anchor_local, old.anchor_local);
     assert_eq!(current.settings, ReminderSettings::default());
     assert_eq!(
-        service.preferences(42).await.unwrap().nag_interval_minutes,
-        60
+        service
+            .preferences(UserId(42))
+            .await
+            .unwrap()
+            .nag_interval_minutes,
+        NagInterval::OneHour
     );
     assert_eq!(
         service
-            .preferences(42)
+            .preferences(UserId(42))
             .await
             .unwrap()
             .confirmation_check_minutes,
-        20
+        ConfirmationDelay::TwentyMinutes
     );
-    let user: User = service.registered(42).await.unwrap();
-    assert_eq!(user.id, 42);
+    let user: User = service.registered(UserId(42)).await.unwrap();
+    assert_eq!(user.id, UserId(42));
+}
+
+#[tokio::test]
+async fn invalid_preference_patches_are_rejected_before_mutation() {
+    let (app, service, _, owner) = setup().await;
+    let before = service.preferences(UserId(42)).await.unwrap();
+    for input in [
+        serde_json::json!({"language":"fr"}),
+        serde_json::json!({"language":"EN"}),
+        serde_json::json!({"nag_interval_minutes":2}),
+        serde_json::json!({"confirmation_check_minutes":10}),
+    ] {
+        let (status, body) = call(
+            &app,
+            "PATCH",
+            "/api/preferences",
+            Some(&owner),
+            Some(&input.to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["code"], "invalid_preferences");
+        assert_eq!(service.preferences(UserId(42)).await.unwrap(), before);
+    }
 }

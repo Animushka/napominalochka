@@ -1,13 +1,18 @@
 //! Yandex auth use cases.
 use super::types::{AuthState, Error, NewAuth, PendingAuth, PendingGrant, Result, Status};
 use super::{AUTH_LIFETIME, YandexService, random_string, state_digest, validate_tokens};
+use crate::domain::UserId;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
 impl YandexService {
-    pub(crate) async fn start_auth(&self, user_id: i64, language: &str) -> Result<String> {
+    pub(crate) async fn start_auth(
+        &self,
+        user_id: UserId,
+        language: crate::domain::Language,
+    ) -> Result<String> {
         let _guard = self.lock(user_id).await;
         let state = random_string()?;
         let state_hash = state_digest(&state);
@@ -16,7 +21,6 @@ impl YandexService {
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         let generation = random_string()?;
         let now = Utc::now().timestamp();
-        let language = if language == "en" { "en" } else { "ru" }.to_owned();
         let hash = state_hash.clone();
         self.inner
             .repository
@@ -33,7 +37,7 @@ impl YandexService {
         self.inner.provider.authorization_url(&state, &challenge)
     }
 
-    pub(crate) async fn cancel_auth(&self, state: &str) -> Result<String> {
+    pub(crate) async fn cancel_auth(&self, state: &str) -> Result<crate::domain::Language> {
         let auth = self.consume_state(state).await?;
         let hash = auth.state_hash;
         self.inner
@@ -108,7 +112,7 @@ impl YandexService {
 
     pub(crate) async fn confirm_auth(
         &self,
-        user_id: i64,
+        user_id: UserId,
         completion_token: &str,
     ) -> Result<Status> {
         if completion_token.len() != 48 || !completion_token.bytes().all(|b| b.is_ascii_hexdigit())

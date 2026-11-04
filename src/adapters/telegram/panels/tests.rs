@@ -1,4 +1,5 @@
 use super::*;
+use crate::domain::{CompletionId, DraftId, ReminderId, UserId};
 
 fn local(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> NaiveDateTime {
     NaiveDate::from_ymd_opt(y, mo, d)
@@ -23,7 +24,7 @@ fn actions(panel: &Panel) -> Vec<Action> {
 #[test]
 fn calendar_disables_past_days_and_previous_month() {
     let today = NaiveDate::from_ymd_opt(2026, 10, 13).unwrap();
-    let panel = calendar(Subject::Draft(1), "x", 2026, 10, today);
+    let panel = calendar(Subject::Draft(DraftId(1)), "x", 2026, 10, today);
     let days: Vec<NaiveDate> = actions(&panel)
         .into_iter()
         .filter_map(|a| match a {
@@ -33,8 +34,8 @@ fn calendar_disables_past_days_and_previous_month() {
         .collect();
     assert_eq!(days.first(), Some(&today));
     assert_eq!(days.last(), NaiveDate::from_ymd_opt(2026, 10, 31).as_ref());
-    assert!(!actions(&panel).contains(&Action::Calendar(Subject::Draft(1), 2026, 9)));
-    assert!(actions(&panel).contains(&Action::Calendar(Subject::Draft(1), 2026, 11)));
+    assert!(!actions(&panel).contains(&Action::Calendar(Subject::Draft(DraftId(1)), 2026, 9)));
+    assert!(actions(&panel).contains(&Action::Calendar(Subject::Draft(DraftId(1)), 2026, 11)));
     assert!(
         panel
             .keyboard
@@ -47,7 +48,7 @@ fn calendar_disables_past_days_and_previous_month() {
 #[test]
 fn minute_picker_hides_past_times() {
     let now = local(2026, 10, 13, 10, 32);
-    let panel = minutes(Subject::Draft(1), "x", now.date(), 10, now);
+    let panel = minutes(Subject::Draft(DraftId(1)), "x", now.date(), 10, now);
     let first = actions(&panel).into_iter().find_map(|a| match a {
         Action::At(_, at) => Some(at),
         _ => None,
@@ -57,14 +58,17 @@ fn minute_picker_hides_past_times() {
 
 #[test]
 fn quick_choices_move_evening_to_tomorrow_when_late() {
-    let panel = when(Subject::Draft(1), "x", local(2026, 10, 13, 21, 0));
-    assert!(actions(&panel).contains(&Action::At(Subject::Draft(1), local(2026, 10, 14, 20, 0))));
+    let panel = when(Subject::Draft(DraftId(1)), "x", local(2026, 10, 13, 21, 0));
+    assert!(actions(&panel).contains(&Action::At(
+        Subject::Draft(DraftId(1)),
+        local(2026, 10, 14, 20, 0)
+    )));
 }
 
 #[test]
 fn russian_flow_localizes_controls_without_changing_user_content() {
     let panel = when_lang(
-        Subject::Draft(1),
+        Subject::Draft(DraftId(1)),
         "Every day",
         local(2026, 10, 13, 10, 0),
         Lang::Ru,
@@ -80,7 +84,7 @@ fn russian_flow_localizes_controls_without_changing_user_content() {
             .any(|button| button.text == "Завтра 09:00")
     );
     let panel = calendar_lang(
-        Subject::Draft(1),
+        Subject::Draft(DraftId(1)),
         "x",
         2026,
         10,
@@ -113,14 +117,14 @@ fn relative_times() {
 #[test]
 fn list_pages_fit_telegram_and_reach_every_reminder() {
     let user = User {
-        id: 7,
+        id: UserId(7),
         first_name: "Ada".into(),
         last_name: String::new(),
         tz: UserTz::parse("UTC").unwrap(),
     };
     let reminders: Vec<_> = (1..=37)
         .map(|id| Reminder {
-            id,
+            id: ReminderId(id),
             user_id: user.id,
             description: "💛".repeat(1000),
             due_at: local(2026, 10, 30, 9, 0).and_utc(),
@@ -146,9 +150,9 @@ fn list_pages_fit_telegram_and_reach_every_reminder() {
                 assert!(page_actions.contains(&Action::ListPage(page - 1)));
             }
         }
-        assert_eq!(reachable, (1..=37).collect::<Vec<_>>());
+        assert_eq!(reachable, (1..=37).map(ReminderId).collect::<Vec<_>>());
         let stale = list_page_lang(&reminders, &user, usize::MAX, lang);
-        assert!(actions(&stale).contains(&Action::Manage(37)));
+        assert!(actions(&stale).contains(&Action::Manage(ReminderId(37))));
     }
 }
 
@@ -156,20 +160,20 @@ fn list_pages_fit_telegram_and_reach_every_reminder() {
 fn elapsed_quick_choices_keep_utc_across_the_repeated_hour() {
     let tz = UserTz::parse("Europe/London").unwrap();
     let now = local(2026, 10, 25, 0, 30).and_utc();
-    let panel = when_at_lang(Subject::Draft(1), "pills", now, tz, Lang::En);
+    let panel = when_at_lang(Subject::Draft(DraftId(1)), "pills", now, tz, Lang::En);
     assert!(actions(&panel).contains(&Action::AtInstant(
-        Subject::Draft(1),
+        Subject::Draft(DraftId(1)),
         now + Duration::hours(1)
     )));
     let repeat = repeat_time_lang(
-        Subject::Draft(1),
+        Subject::Draft(DraftId(1)),
         "pills",
         ReminderTime::Instant(now + Duration::hours(1)),
         tz,
         Lang::En,
     );
     assert!(actions(&repeat).contains(&Action::SaveInstant(
-        Subject::Draft(1),
+        Subject::Draft(DraftId(1)),
         now + Duration::hours(1),
         Recurrence::Once
     )));
@@ -177,9 +181,9 @@ fn elapsed_quick_choices_keep_utc_across_the_repeated_hour() {
 #[test]
 fn completion_controls_refer_to_durable_history_and_legacy_checks_stay_compatible() {
     for lang in [Lang::Ru, Lang::En] {
-        let undo = completion_keyboard_lang(42, lang);
+        let undo = completion_keyboard_lang(CompletionId(42), lang);
         assert_eq!(undo.inline_keyboard.len(), 1);
-        let check = confirmation_keyboard_lang(Some(42), lang);
+        let check = confirmation_keyboard_lang(Some(CompletionId(42)), lang);
         assert_eq!(check.inline_keyboard.len(), 2);
         assert_eq!(check.inline_keyboard[0][0].text, lang.text("check.ack"));
         assert_eq!(check.inline_keyboard[1][0].text, lang.text("check.retry"));
@@ -187,7 +191,10 @@ fn completion_controls_refer_to_durable_history_and_legacy_checks_stay_compatibl
             text: String::new(),
             keyboard: check,
         };
-        assert_eq!(actions(&panel), vec![Action::UndoCompletion(42)]);
+        assert_eq!(
+            actions(&panel),
+            vec![Action::UndoCompletion(CompletionId(42))]
+        );
         let legacy = confirmation_keyboard_lang(None, lang);
         assert_eq!(legacy.inline_keyboard.len(), 1);
         assert_eq!(legacy.inline_keyboard[0][0].text, lang.text("check.ack"));

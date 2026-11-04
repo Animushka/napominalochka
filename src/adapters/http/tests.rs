@@ -1,8 +1,13 @@
+use crate::application::{Profile, ReminderInput, ReminderService};
+use crate::domain::{ConfirmationDelay, UserId};
+use crate::domain::{Recurrence, UserTz};
+use chrono::{DateTime, Utc};
 use hmac::{KeyInit, Mac};
 type HmacSha256 = hmac::Hmac<sha2::Sha256>;
 mod features;
 
 use super::*;
+
 use crate::infrastructure::sqlite::Db;
 use axum::body::Body;
 use axum::http::Request;
@@ -33,7 +38,7 @@ fn sign(fields: &[(&str, &str)], token: &str) -> String {
     serializer.finish()
 }
 
-fn init_data(user_id: i64, now: DateTime<Utc>) -> String {
+fn init_data(user_id: UserId, now: DateTime<Utc>) -> String {
     let user = format!(r#"{{"id":{user_id},"first_name":"Ada","last_name":"Lovelace"}}"#);
     sign(
         &[
@@ -45,7 +50,7 @@ fn init_data(user_id: i64, now: DateTime<Utc>) -> String {
     )
 }
 
-fn init_data_with_language(user_id: i64, language: &str, now: DateTime<Utc>) -> String {
+fn init_data_with_language(user_id: UserId, language: &str, now: DateTime<Utc>) -> String {
     let user = serde_json::json!({ "id": user_id, "first_name": "Ada", "language_code": language })
         .to_string();
     sign(
@@ -62,9 +67,9 @@ fn init_data_with_language(user_id: i64, language: &str, now: DateTime<Utc>) -> 
 fn accepts_valid_init_data() {
     let now = Utc::now();
     assert_eq!(
-        verify_init_data(&init_data(42, now), TOKEN, now),
+        verify_init_data(&init_data(UserId(42), now), TOKEN, now),
         Some(AuthUser {
-            id: 42,
+            id: UserId(42),
             first_name: "Ada".into(),
             last_name: "Lovelace".into(),
             language_code: None,
@@ -75,7 +80,7 @@ fn accepts_valid_init_data() {
 #[test]
 fn rejects_forged_or_stale_init_data() {
     let now = Utc::now();
-    let data = init_data(42, now);
+    let data = init_data(UserId(42), now);
     assert_eq!(verify_init_data(&data, "999:other-token", now), None);
     assert_eq!(
         verify_init_data(&data.replace("42", "43"), TOKEN, now),
@@ -128,8 +133,8 @@ async fn api_flow() {
         web_app_url: Some(Url::parse("https://reminders.example.com").unwrap()),
         yandex: None,
     }));
-    let ada = init_data_with_language(42, "en", Utc::now());
-    let eve = init_data(66, Utc::now());
+    let ada = init_data_with_language(UserId(42), "en", Utc::now());
+    let eve = init_data(UserId(66), Utc::now());
 
     assert_eq!(
         call(&app, "GET", "/api/state", None, None).await.0,
@@ -223,8 +228,8 @@ async fn preferences_persist_before_registration_and_remain_isolated() {
         web_app_url: None,
         yandex: None,
     }));
-    let ada = init_data_with_language(42, "en", Utc::now());
-    let eve = init_data_with_language(66, "ru", Utc::now());
+    let ada = init_data_with_language(UserId(42), "en", Utc::now());
+    let eve = init_data_with_language(UserId(66), "ru", Utc::now());
     assert_eq!(
         call(
             &app,
@@ -252,7 +257,7 @@ async fn preferences_persist_before_registration_and_remain_isolated() {
     assert_eq!(state["nag_interval_minutes"], 30);
     assert_eq!(state["confirmation_check_minutes"], 20);
     assert!(
-        service.user(42).await.unwrap().is_none(),
+        service.user(UserId(42)).await.unwrap().is_none(),
         "preferences do not register a timezone"
     );
     let (_, body) = call(&app, "GET", "/api/state", Some(&ada), None).await;
@@ -293,7 +298,7 @@ async fn preferences_validate_whole_patch_before_mutation() {
         web_app_url: None,
         yandex: None,
     }));
-    let auth = init_data(42, Utc::now());
+    let auth = init_data(UserId(42), Utc::now());
     for invalid in [
         r#"{"language":"fr"}"#,
         r#"{"language":"en","nag_interval_minutes":2}"#,
@@ -313,7 +318,7 @@ async fn preferences_validate_whole_patch_before_mutation() {
             "invalid_preferences"
         );
         assert_eq!(
-            service.preferences(42).await.unwrap(),
+            service.preferences(UserId(42)).await.unwrap(),
             crate::domain::Preferences::default()
         );
     }
@@ -331,7 +336,7 @@ async fn preferences_validate_whole_patch_before_mutation() {
         "unknown fields cannot redirect a patch"
     );
     assert_eq!(
-        service.preferences(66).await.unwrap(),
+        service.preferences(UserId(66)).await.unwrap(),
         crate::domain::Preferences::default()
     );
 }
@@ -365,7 +370,7 @@ async fn calendar_feed_flow() {
         web_app_url: Some(Url::parse("https://reminders.example.com").unwrap()),
         yandex: None,
     }));
-    let ada = init_data(42, Utc::now());
+    let ada = init_data(UserId(42), Utc::now());
 
     assert_eq!(
         call(&app, "GET", "/api/calendar", Some(&ada), None).await.0,
@@ -428,7 +433,7 @@ async fn pending_api_keeps_fired_items_isolated_and_completes_once() {
         service
             .set_timezone(
                 Profile {
-                    id,
+                    id: UserId(id),
                     first_name: "Test".into(),
                     last_name: String::new(),
                 },
@@ -438,13 +443,18 @@ async fn pending_api_keeps_fired_items_isolated_and_completes_once() {
             .unwrap();
     }
     service
-        .set_preferences(42, None, None, Some(20))
+        .set_preferences(
+            UserId(42),
+            None,
+            None,
+            Some(ConfirmationDelay::TwentyMinutes),
+        )
         .await
         .unwrap();
     let now = Utc::now();
     let reminder = db
         .add_reminder(
-            42,
+            UserId(42),
             "Water plants".into(),
             now - chrono::Duration::minutes(1),
             Recurrence::Once,
@@ -464,13 +474,13 @@ async fn pending_api_keeps_fired_items_isolated_and_completes_once() {
         web_app_url: None,
         yandex: None,
     }));
-    let owner = init_data(42, now);
-    let other = init_data(66, now);
+    let owner = init_data(UserId(42), now);
+    let other = init_data(UserId(66), now);
     let (_, body) = call(&app, "GET", "/api/state", Some(&owner), None).await;
     let state: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(state["reminders"].as_array().unwrap().len(), 0);
     assert_eq!(state["pending"].as_array().unwrap().len(), 1);
-    assert_eq!(state["pending"][0]["id"], nag.id);
+    assert_eq!(state["pending"][0]["id"], nag.id.0);
     assert!(state["pending"][0]["reminder_id"].is_null());
     let (_, body) = call(&app, "GET", "/api/state", Some(&other), None).await;
     assert!(
@@ -489,7 +499,7 @@ async fn pending_api_keeps_fired_items_isolated_and_completes_once() {
         call(&app, "POST", &done, Some(&other), None).await.0,
         StatusCode::OK
     );
-    assert_eq!(service.pending(42).await.unwrap().len(), 1);
+    assert_eq!(service.pending(UserId(42)).await.unwrap().len(), 1);
     assert_eq!(
         call(
             &app,
@@ -526,7 +536,7 @@ async fn pending_api_keeps_fired_items_isolated_and_completes_once() {
         .0,
         StatusCode::OK
     );
-    let pending = service.pending(42).await.unwrap();
+    let pending = service.pending(UserId(42)).await.unwrap();
     assert_eq!(pending.len(), 1);
     assert!(pending[0].next_at >= now + chrono::Duration::minutes(9));
     assert!(pending[0].next_at <= Utc::now() + chrono::Duration::minutes(10));
@@ -568,7 +578,7 @@ async fn text_only_http_edit_preserves_advanced_recurrence_and_anchor() {
     let (user, _) = service
         .set_timezone(
             Profile {
-                id: 42,
+                id: UserId(42),
                 first_name: "Test".into(),
                 last_name: String::new(),
             },
@@ -600,13 +610,13 @@ async fn text_only_http_edit_preserves_advanced_recurrence_and_anchor() {
         web_app_url: None,
         yandex: None,
     }));
-    let owner = init_data_with_language(42, "en", Utc::now());
-    let other = init_data(66, Utc::now());
+    let owner = init_data_with_language(UserId(42), "en", Utc::now());
+    let other = init_data(UserId(66), Utc::now());
     let uri = format!("/api/reminders/{}", reminder.id);
     let body = r#"{"description":"Renamed","at":"2027-01-31T09:00","recurrence":"monthly","preserve_schedule":true}"#;
     let (status, response) = call(&app, "PUT", &uri, Some(&owner), Some(body)).await;
     assert_eq!(status, StatusCode::OK, "{response}");
-    let changed = service.reminder(42, reminder.id).await.unwrap();
+    let changed = service.reminder(UserId(42), reminder.id).await.unwrap();
     assert_eq!(
         changed.due_at,
         "2027-02-28T09:00:00Z".parse::<DateTime<Utc>>().unwrap()
@@ -634,7 +644,7 @@ async fn too_long_descriptions_have_stable_code_and_private_api_is_not_cached() 
         web_app_url: None,
         yandex: None,
     }));
-    let owner = init_data(42, Utc::now());
+    let owner = init_data(UserId(42), Utc::now());
     call(
         &app,
         "PUT",

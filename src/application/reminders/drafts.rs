@@ -1,12 +1,13 @@
 //! Reminder drafts use cases.
 use super::{Error, ReminderService, Result, description, first_due, first_instant};
 use crate::domain::{Draft, Recurrence, Reminder, User};
+use crate::domain::{DraftId, UserId};
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 
 impl ReminderService {
     pub(crate) async fn start_draft(
         &self,
-        user_id: i64,
+        user_id: UserId,
         text: &str,
         now: DateTime<Utc>,
     ) -> Result<Draft> {
@@ -16,7 +17,7 @@ impl ReminderService {
             .await?)
     }
 
-    pub(crate) async fn draft(&self, user_id: i64, draft_id: i64) -> Result<Draft> {
+    pub(crate) async fn draft(&self, user_id: UserId, draft_id: DraftId) -> Result<Draft> {
         self.repository
             .draft(user_id, draft_id)
             .await?
@@ -26,14 +27,14 @@ impl ReminderService {
     /// The user's draft if it was started within `window`.
     pub(crate) async fn pending_draft(
         &self,
-        user_id: i64,
+        user_id: UserId,
         window: Duration,
         now: DateTime<Utc>,
     ) -> Result<Option<Draft>> {
         Ok(self.repository.pending_draft(user_id, now - window).await?)
     }
 
-    pub(crate) async fn cancel_draft(&self, user_id: i64, draft_id: i64) -> Result<()> {
+    pub(crate) async fn cancel_draft(&self, user_id: UserId, draft_id: DraftId) -> Result<()> {
         self.repository.delete_draft(user_id, draft_id).await?;
         Ok(())
     }
@@ -42,7 +43,7 @@ impl ReminderService {
     pub(crate) async fn save_draft(
         &self,
         user: &User,
-        draft_id: i64,
+        draft_id: DraftId,
         at: NaiveDateTime,
         recurrence: Recurrence,
         now: DateTime<Utc>,
@@ -58,7 +59,7 @@ impl ReminderService {
     pub(crate) async fn save_draft_at(
         &self,
         user: &User,
-        draft_id: i64,
+        draft_id: DraftId,
         at: DateTime<Utc>,
         recurrence: Recurrence,
         now: DateTime<Utc>,

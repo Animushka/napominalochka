@@ -6,12 +6,7 @@ use crate::application as service;
 use crate::domain::{InputError, Recurrence};
 use chrono::{Datelike, NaiveDateTime};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum Lang {
-    #[default]
-    Ru,
-    En,
-}
+pub(crate) use crate::domain::Language as Lang;
 
 static RU: LazyLock<BTreeMap<String, String>> = LazyLock::new(|| {
     serde_json::from_str(include_str!("../../locales/bot.ru.json"))
@@ -25,12 +20,6 @@ static EN: LazyLock<BTreeMap<String, String>> = LazyLock::new(|| {
 impl Lang {
     pub(crate) fn parse(code: &str) -> Self {
         if code == "en" { Self::En } else { Self::Ru }
-    }
-    pub(crate) fn code(self) -> &'static str {
-        match self {
-            Self::Ru => "ru",
-            Self::En => "en",
-        }
     }
     pub(crate) fn text(self, key: &str) -> String {
         lookup(if self == Self::Ru { &RU } else { &EN }, &EN, key).to_owned()
@@ -71,7 +60,7 @@ impl Lang {
             service::Error::CompletionUnavailable => self.text("undo.unavailable"),
             service::Error::Input(error) => self.input_error(error),
             service::Error::InvalidPreferences(_) => self.text("error.preferences"),
-            service::Error::Internal(_) => self.text("error.internal"),
+            service::Error::Storage(_) | service::Error::Internal(_) => self.text("error.internal"),
         }
     }
     pub(crate) fn date(self, at: NaiveDateTime) -> String {

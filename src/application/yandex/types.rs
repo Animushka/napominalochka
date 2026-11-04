@@ -1,4 +1,5 @@
 //! Yandex use-case contracts; no persistence or HTTP client types.
+use crate::domain::UserId;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -40,8 +41,8 @@ impl Error {
 }
 
 // Deliberately discard SQL/HTTP/body errors at this boundary. Only stable codes leave it.
-impl From<anyhow::Error> for Error {
-    fn from(_: anyhow::Error) -> Self {
+impl From<crate::application::ports::StorageError> for Error {
+    fn from(_: crate::application::ports::StorageError) -> Self {
         Self::Internal
     }
 }
@@ -67,7 +68,7 @@ pub(crate) struct Scenario {
 }
 
 pub(crate) struct PendingAuth {
-    pub(crate) language: String,
+    pub(crate) language: crate::domain::Language,
     pub(crate) completion_token: String,
 }
 
@@ -98,10 +99,10 @@ pub(super) struct Tokens {
 }
 
 pub(crate) struct AuthState {
-    pub(crate) user_id: i64,
+    pub(crate) user_id: UserId,
     pub(crate) state_hash: String,
     pub(crate) encrypted_verifier: Vec<u8>,
-    pub(crate) language: String,
+    pub(crate) language: crate::domain::Language,
 }
 
 pub(crate) enum ActionResult {
@@ -112,20 +113,20 @@ pub(crate) enum ActionResult {
 
 #[derive(Clone)]
 pub(crate) struct Job {
-    pub(crate) id: i64,
-    pub(crate) user_id: i64,
+    pub(crate) id: crate::domain::VoiceJobId,
+    pub(crate) user_id: UserId,
     pub(crate) generation: String,
     pub(crate) scenario_id: String,
 }
 
 pub(crate) struct NewAuth {
-    pub(crate) user_id: i64,
+    pub(crate) user_id: UserId,
     pub(crate) generation: String,
     pub(crate) hash: String,
     pub(crate) encrypted_verifier: Vec<u8>,
     pub(crate) now: i64,
     pub(crate) expires_at: i64,
-    pub(crate) language: String,
+    pub(crate) language: crate::domain::Language,
 }
 
 pub(crate) struct PendingGrant {
@@ -135,7 +136,7 @@ pub(crate) struct PendingGrant {
     pub(crate) pending_expires: i64,
     pub(crate) expires_at: i64,
     pub(crate) refresh_after: i64,
-    pub(crate) user_id: i64,
+    pub(crate) user_id: UserId,
     pub(crate) state_hash: String,
 }
 
@@ -147,7 +148,7 @@ pub(crate) enum FailureDisposition {
 }
 
 pub(crate) struct ConnectionFailure {
-    pub(crate) user_id: i64,
+    pub(crate) user_id: UserId,
     pub(crate) generation: String,
     pub(crate) error: Error,
     pub(crate) disposition: FailureDisposition,

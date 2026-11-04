@@ -29,6 +29,8 @@ fn every_static_chat_key_exists_in_both_catalogues() {
     for source in [
         include_str!("../telegram/commands.rs"),
         include_str!("../telegram/conversation.rs"),
+        include_str!("../telegram/conversation/callbacks.rs"),
+        include_str!("../presentation.rs"),
         include_str!("../telegram/panels.rs"),
         include_str!("../telegram/mod.rs"),
         include_str!("../calendar.rs"),

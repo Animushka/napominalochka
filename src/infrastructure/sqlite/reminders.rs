@@ -1,33 +1,36 @@
 //! SQLite operations for reminders.
 use super::mapping::reminder_from_row;
 use super::{Db, REMINDER_COLUMNS};
+use crate::application::ports::StorageResult;
 use crate::domain::{
     Recurrence, Reminder, ReminderChanges, ReminderSchedule, ReminderSettings, ReminderWrite,
 };
+use crate::domain::{ReminderId, UserId};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use rusqlite::OptionalExtension;
+use rusqlite::params;
 
 impl Db {
     #[cfg(test)]
     pub(crate) async fn add_reminder(
         &self,
-        user_id: i64,
+        user_id: UserId,
         description: String,
         due_at: DateTime<Utc>,
         recurrence: Recurrence,
-    ) -> anyhow::Result<Reminder> {
+    ) -> StorageResult<Reminder> {
         self.add_reminder_with_anchor(user_id, description, due_at, recurrence, None)
             .await
     }
 
     pub(crate) async fn add_reminder_with_anchor(
         &self,
-        user_id: i64,
+        user_id: UserId,
         description: String,
         due_at: DateTime<Utc>,
         recurrence: Recurrence,
         anchor_local: Option<NaiveDateTime>,
-    ) -> anyhow::Result<Reminder> {
+    ) -> StorageResult<Reminder> {
         self.insert_reminder(
             user_id,
             ReminderWrite {
@@ -41,7 +44,7 @@ impl Db {
         .await
     }
 
-    pub(crate) async fn reminders_for_user(&self, user_id: i64) -> anyhow::Result<Vec<Reminder>> {
+    pub(crate) async fn reminders_for_user(&self, user_id: UserId) -> StorageResult<Vec<Reminder>> {
         self.call(move |conn| {
             conn.prepare(
                 "SELECT reminder_id, user_id, description, due_at, recurrence, anchor_local, nag_interval_minutes, confirmation_check_minutes, voice_enabled
@@ -55,13 +58,13 @@ impl Db {
 
     pub(crate) async fn reminder(
         &self,
-        user_id: i64,
-        reminder_id: i64,
-    ) -> anyhow::Result<Option<Reminder>> {
+        user_id: UserId,
+        reminder_id: ReminderId,
+    ) -> StorageResult<Option<Reminder>> {
         self.call(move |conn| {
             conn.query_row(
                 &format!("SELECT {REMINDER_COLUMNS} FROM reminders WHERE reminder_id = ?1 AND user_id = ?2"),
-                [reminder_id, user_id],
+                params![reminder_id, user_id],
                 reminder_from_row,
             )
             .optional()
@@ -73,12 +76,12 @@ impl Db {
     #[cfg(test)]
     pub(crate) async fn update_reminder(
         &self,
-        user_id: i64,
-        reminder_id: i64,
+        user_id: UserId,
+        reminder_id: ReminderId,
         description: Option<String>,
         due_at: DateTime<Utc>,
         recurrence: Recurrence,
-    ) -> anyhow::Result<Option<Reminder>> {
+    ) -> StorageResult<Option<Reminder>> {
         self.update_reminder_with_anchor(
             user_id,
             reminder_id,
@@ -92,13 +95,13 @@ impl Db {
 
     pub(crate) async fn update_reminder_with_anchor(
         &self,
-        user_id: i64,
-        reminder_id: i64,
+        user_id: UserId,
+        reminder_id: ReminderId,
         description: Option<String>,
         due_at: DateTime<Utc>,
         recurrence: Recurrence,
         anchor_local: Option<NaiveDateTime>,
-    ) -> anyhow::Result<Option<Reminder>> {
+    ) -> StorageResult<Option<Reminder>> {
         self.patch_reminder(
             user_id,
             reminder_id,
@@ -119,10 +122,10 @@ impl Db {
     /// concurrently by the scheduler.
     pub(crate) async fn update_reminder_description(
         &self,
-        user_id: i64,
-        reminder_id: i64,
+        user_id: UserId,
+        reminder_id: ReminderId,
         description: Option<String>,
-    ) -> anyhow::Result<Option<Reminder>> {
+    ) -> StorageResult<Option<Reminder>> {
         self.patch_reminder(
             user_id,
             reminder_id,
@@ -138,18 +141,18 @@ impl Db {
     /// Deletes one of the user's reminders and stops any nagging it started.
     pub(crate) async fn delete_reminder(
         &self,
-        user_id: i64,
-        reminder_id: i64,
-    ) -> anyhow::Result<bool> {
+        user_id: UserId,
+        reminder_id: ReminderId,
+    ) -> StorageResult<bool> {
         self.call(move |conn| {
             let tx = conn.transaction()?;
             tx.execute(
                 "DELETE FROM naggings WHERE reminder_id = ?1 AND user_id = ?2",
-                [reminder_id, user_id],
+                params![reminder_id, user_id],
             )?;
             let removed = tx.execute(
                 "DELETE FROM reminders WHERE reminder_id = ?1 AND user_id = ?2",
-                [reminder_id, user_id],
+                params![reminder_id, user_id],
             )?;
             tx.commit()?;
             Ok(removed > 0)
@@ -158,7 +161,7 @@ impl Db {
     }
 
     /// Deletes all of the user's reminders and naggings; returns the number of reminders removed.
-    pub(crate) async fn delete_all_reminders(&self, user_id: i64) -> anyhow::Result<usize> {
+    pub(crate) async fn delete_all_reminders(&self, user_id: UserId) -> StorageResult<usize> {
         self.call(move |conn| {
             let tx = conn.transaction()?;
             tx.execute("DELETE FROM naggings WHERE user_id = ?1", [user_id])?;

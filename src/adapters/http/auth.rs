@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct AuthUser {
-    pub(crate) id: i64,
+    pub(crate) id: crate::domain::UserId,
     pub(crate) first_name: String,
     pub(crate) last_name: String,
     pub(crate) language_code: Option<String>,
@@ -84,7 +84,7 @@ pub(crate) fn verify_init_data(
 
     #[derive(Deserialize)]
     struct TelegramUser {
-        id: i64,
+        id: crate::domain::UserId,
         first_name: String,
         #[serde(default)]
         last_name: Option<String>,

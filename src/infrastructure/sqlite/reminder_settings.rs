@@ -1,5 +1,7 @@
 //! Typed reminder writes keep partial edits, schedules and inherited settings distinct.
 
+use crate::application::ports::StorageResult;
+use crate::domain::{ReminderId, UserId};
 use rusqlite::{OptionalExtension, params};
 
 use super::mapping::{DbLocalTime, DbTime, reminder_from_row};
@@ -21,9 +23,9 @@ pub(super) const EFFECTIVE_CONFIRMATION_CHECK: &str = "COALESCE(
 impl Db {
     pub(crate) async fn insert_reminder(
         &self,
-        user_id: i64,
+        user_id: UserId,
         input: ReminderWrite,
-    ) -> anyhow::Result<Reminder> {
+    ) -> StorageResult<Reminder> {
         self.call(move |conn| {
             conn.query_row(
                 &format!("INSERT INTO reminders(user_id,description,due_at,recurrence,anchor_local,nag_interval_minutes,confirmation_check_minutes,voice_enabled)
@@ -37,10 +39,10 @@ impl Db {
 
     pub(crate) async fn patch_reminder(
         &self,
-        user_id: i64,
-        reminder_id: i64,
+        user_id: UserId,
+        reminder_id: ReminderId,
         changes: ReminderChanges,
-    ) -> anyhow::Result<Option<Reminder>> {
+    ) -> StorageResult<Option<Reminder>> {
         self.call(move |conn| {
             let tx = conn.transaction()?;
             let schedule = changes.schedule;
@@ -67,14 +69,14 @@ impl Db {
                      WHERE user_id=?4 AND reminder_id=?5",
                     params![settings.nag_interval_minutes,settings.confirmation_check_minutes,settings.voice_enabled,user_id,reminder_id],
                 )?;
-                let inherited_check: i64 = tx.query_row(
+                let inherited_check: crate::domain::ConfirmationDelay = tx.query_row(
                     "SELECT confirmation_check_minutes FROM preferences WHERE user_id=?1",
                     [user_id], |row| row.get(0),
-                ).optional()?.unwrap_or(0);
-                if settings.confirmation_check_minutes.unwrap_or(inherited_check) == 0 {
+                ).optional()?.unwrap_or(crate::domain::ConfirmationDelay::Disabled);
+                if settings.confirmation_check_minutes.unwrap_or(inherited_check) == crate::domain::ConfirmationDelay::Disabled {
                     tx.execute(
                         "DELETE FROM confirmations WHERE user_id=?1 AND reminder_id=?2",
-                        [user_id,reminder_id],
+                        params![user_id,reminder_id],
                     )?;
                 }
                 if !settings.voice_enabled {
@@ -83,7 +85,7 @@ impl Db {
                     tx.execute(
                         "DELETE FROM yandex_jobs WHERE user_id=?1 AND state IN ('pending','claimed')
                          AND nagging_id IN (SELECT nagging_id FROM naggings WHERE user_id=?1 AND reminder_id=?2)",
-                        [user_id,reminder_id],
+                        params![user_id,reminder_id],
                     )?;
                 }
             }

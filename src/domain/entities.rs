@@ -1,21 +1,23 @@
 //! Reminder entities, settings and completion records.
 use super::{Recurrence, UserTz};
+use crate::domain::{CompletionId, ReminderId, UserId};
+use crate::domain::{ConfirmationId, DraftId, NaggingId};
 use chrono::{DateTime, NaiveDateTime, Utc};
 
 /// Settings are independent of timezone registration and isolated by Telegram user id.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Preferences {
-    pub(crate) language: String,
-    pub(crate) nag_interval_minutes: i64,
-    pub(crate) confirmation_check_minutes: i64,
+    pub(crate) language: crate::domain::Language,
+    pub(crate) nag_interval_minutes: crate::domain::NagInterval,
+    pub(crate) confirmation_check_minutes: crate::domain::ConfirmationDelay,
 }
 
 impl Default for Preferences {
     fn default() -> Self {
         Self {
-            language: "ru".into(),
-            nag_interval_minutes: 10,
-            confirmation_check_minutes: 0,
+            language: crate::domain::Language::Ru,
+            nag_interval_minutes: crate::domain::NagInterval::TenMinutes,
+            confirmation_check_minutes: crate::domain::ConfirmationDelay::Disabled,
         }
     }
 }
@@ -24,8 +26,8 @@ impl Default for Preferences {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct ReminderSettings {
-    pub(crate) nag_interval_minutes: Option<i64>,
-    pub(crate) confirmation_check_minutes: Option<i64>,
+    pub(crate) nag_interval_minutes: Option<crate::domain::NagInterval>,
+    pub(crate) confirmation_check_minutes: Option<crate::domain::ConfirmationDelay>,
     pub(crate) voice_enabled: bool,
 }
 
@@ -65,8 +67,8 @@ pub(crate) struct ReminderChanges {
 /// A completion mark records the user's action in the bot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Completion {
-    pub(crate) id: i64,
-    pub(crate) user_id: i64,
+    pub(crate) id: CompletionId,
+    pub(crate) user_id: UserId,
     pub(crate) description: String,
     pub(crate) scheduled_at: Option<DateTime<Utc>>,
     pub(crate) completed_at: DateTime<Utc>,
@@ -77,7 +79,7 @@ pub(crate) struct Completion {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HistoryPage {
     pub(crate) items: Vec<Completion>,
-    pub(crate) next_cursor: Option<i64>,
+    pub(crate) next_cursor: Option<CompletionId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,11 +93,11 @@ pub(crate) enum UndoResult {
 /// A single optional check after completion, never part of the nagging loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Confirmation {
-    pub(crate) id: i64,
-    pub(crate) user_id: i64,
+    pub(crate) id: ConfirmationId,
+    pub(crate) user_id: UserId,
     pub(crate) description: String,
     pub(crate) due_at: DateTime<Utc>,
-    pub(crate) completion_id: Option<i64>,
+    pub(crate) completion_id: Option<CompletionId>,
 }
 
 /// A calendar selection keeps its local wall clock; an elapsed interval keeps its instant.
@@ -117,7 +119,7 @@ impl ReminderTime {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct User {
-    pub(crate) id: i64,
+    pub(crate) id: UserId,
     pub(crate) first_name: String,
     pub(crate) last_name: String,
     pub(crate) tz: UserTz,
@@ -125,8 +127,8 @@ pub(crate) struct User {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Reminder {
-    pub(crate) id: i64,
-    pub(crate) user_id: i64,
+    pub(crate) id: ReminderId,
+    pub(crate) user_id: UserId,
     pub(crate) description: String,
     pub(crate) due_at: DateTime<Utc>,
     pub(crate) recurrence: Recurrence,
@@ -137,9 +139,9 @@ pub(crate) struct Reminder {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Nagging {
-    pub(crate) id: i64,
-    pub(crate) reminder_id: Option<i64>,
-    pub(crate) user_id: i64,
+    pub(crate) id: NaggingId,
+    pub(crate) reminder_id: Option<ReminderId>,
+    pub(crate) user_id: UserId,
     pub(crate) description: String,
     pub(crate) next_at: DateTime<Utc>,
 }
@@ -155,8 +157,8 @@ pub(crate) enum Snooze {
 /// Text the user sent that is waiting for a time to be chosen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Draft {
-    pub(crate) id: i64,
-    pub(crate) user_id: i64,
+    pub(crate) id: DraftId,
+    pub(crate) user_id: UserId,
     pub(crate) text: String,
     pub(crate) created_at: DateTime<Utc>,
 }

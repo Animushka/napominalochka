@@ -1,11 +1,12 @@
 //! Yandex tokens use cases.
 use super::types::{Connection, Error, Result, Tokens};
 use super::{YandexService, validate_tokens};
+use crate::domain::UserId;
 use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 
 impl YandexService {
-    pub(super) async fn access_token(&self, user_id: i64, c: &Connection) -> Result<String> {
+    pub(super) async fn access_token(&self, user_id: UserId, c: &Connection) -> Result<String> {
         let result = async {
             let tokens = self.decrypt_tokens(user_id, c)?;
             if c.expires_at
@@ -23,7 +24,7 @@ impl YandexService {
         result
     }
 
-    pub(super) fn decrypt_tokens(&self, user_id: i64, c: &Connection) -> Result<Tokens> {
+    pub(super) fn decrypt_tokens(&self, user_id: UserId, c: &Connection) -> Result<Tokens> {
         // Yandex's refresh grant expires together with the access token. After downtime
         // spanning that deadline, do not keep trying an expired grant indefinitely.
         if c.expires_at
@@ -42,7 +43,7 @@ impl YandexService {
 
     pub(super) async fn refresh_tokens(
         &self,
-        user_id: i64,
+        user_id: UserId,
         c: &Connection,
         tokens: Tokens,
     ) -> Result<String> {

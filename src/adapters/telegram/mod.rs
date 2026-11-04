@@ -50,7 +50,7 @@ pub(crate) async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>)
             || msg
                 .from
                 .as_ref()
-                .is_none_or(|user| user.id.0 as i64 != sender.chat_id)
+                .is_none_or(|user| user.id.0 as i64 != sender.chat_id.0)
         {
             return Ok(());
         }
@@ -103,7 +103,7 @@ pub(crate) async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>)
     };
 
     let replies = result.unwrap_or_else(|error| {
-        tracing::error!(?error, chat_id = sender.chat_id, "failed to handle message");
+        tracing::error!(?error, chat_id = %sender.chat_id, "failed to handle message");
         vec![Reply::text(
             error
                 .downcast_ref::<crate::application::Error>()
@@ -144,7 +144,7 @@ pub(crate) async fn handle_callback(
     state: Arc<AppState>,
 ) -> HandlerResult {
     let message = query.regular_message();
-    let user_id = message.map_or(query.from.id.0 as i64, |m| m.chat.id.0);
+    let user_id = crate::domain::UserId(message.map_or(query.from.id.0 as i64, |m| m.chat.id.0));
     let data = query.data.as_deref().unwrap_or_default();
     if message.is_some_and(|message| {
         matches!(message.chat.kind, ChatKind::Private(_))
@@ -187,7 +187,7 @@ pub(crate) async fn handle_callback(
     {
         state
             .service
-            .set_preferences(user_id, Some(code), None, None)
+            .set_preferences(user_id, Some(Lang::parse(code)), None, None)
             .await?;
         let selected = Lang::parse(code);
         bot.answer_callback_query(query.id.clone())
@@ -226,7 +226,7 @@ pub(crate) async fn handle_callback(
     {
         Ok(reply) => reply,
         Err(error) => {
-            tracing::error!(?error, user_id, data, "failed to handle button");
+            tracing::error!(?error, user_id = %user_id, data, "failed to handle button");
             bot.answer_callback_query(query.id.clone())
                 .text(lang.text("error.internal"))
                 .await?;
@@ -285,12 +285,12 @@ impl Notifier for TelegramNotifier {
             .1
             .preferences(nagging.user_id)
             .await
-            .map(|p| Lang::parse(&p.language))
+            .map(|p| p.language)
             .unwrap_or_default();
         let result = self
             .0
             .send_message(
-                ChatId(nagging.user_id),
+                ChatId(nagging.user_id.0),
                 format!("⏰ {}", nagging.description),
             )
             .reply_markup(panels::nag_keyboard_lang(nagging.id, lang))
@@ -306,7 +306,7 @@ impl Notifier for TelegramNotifier {
             .1
             .preferences(confirmation.user_id)
             .await
-            .map(|p| Lang::parse(&p.language))
+            .map(|p| p.language)
             .unwrap_or_default();
         let text = lang.render(
             "confirmation",
@@ -314,7 +314,7 @@ impl Notifier for TelegramNotifier {
         );
         match self
             .0
-            .send_message(ChatId(confirmation.user_id), text)
+            .send_message(ChatId(confirmation.user_id.0), text)
             .reply_markup(panels::confirmation_keyboard_lang(
                 confirmation.completion_id,
                 lang,
@@ -349,7 +349,7 @@ fn sender_of(msg: &Message) -> Sender {
         None => (msg.chat.title().unwrap_or("👋").to_owned(), String::new()),
     };
     Sender {
-        chat_id: msg.chat.id.0,
+        chat_id: crate::domain::UserId(msg.chat.id.0),
         first_name,
         last_name,
         private: matches!(msg.chat.kind, ChatKind::Private(_)),

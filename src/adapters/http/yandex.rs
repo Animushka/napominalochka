@@ -1,16 +1,30 @@
 //! Per-user Mini App endpoints and the public OAuth return page.
+use super::error::ErrorBody;
 use crate::adapters::http::{AuthUser, WebState};
 use crate::adapters::i18n::Lang;
 use crate::application::yandex;
+use crate::application::yandex::types::{Scenario, Status};
 use axum::extract::{Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+#[derive(Serialize)]
+struct ConnectResponse {
+    url: String,
+}
+#[derive(Serialize)]
+struct ScenariosResponse {
+    scenarios: Vec<Scenario>,
+}
+#[derive(Serialize)]
+struct SuccessResponse {
+    ok: bool,
+}
 
 const PUBLIC_BUTTON: &str = "inline-flex min-h-10 items-center justify-center rounded-4xl bg-primary px-5 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/80 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring";
 
@@ -38,7 +52,7 @@ async fn private_response(mut response: Response) -> Response {
 async fn language(state: &WebState, auth: &AuthUser) -> Lang {
     state.service.preferences(auth.id).await.map_or_else(
         |_| Lang::parse(auth.language_code.as_deref().unwrap_or("ru")),
-        |preferences| Lang::parse(&preferences.language),
+        |preferences| preferences.language,
     )
 }
 struct ApiError {
@@ -94,7 +108,10 @@ impl IntoResponse for ApiError {
         };
         (
             self.status,
-            Json(json!({"error": message, "code": self.code})),
+            Json(ErrorBody {
+                error: message.into(),
+                code: self.code,
+            }),
         )
             .into_response()
     }
@@ -102,38 +119,44 @@ impl IntoResponse for ApiError {
 async fn status(
     State(state): State<Arc<WebState>>,
     auth: AuthUser,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<Status>, ApiError> {
     let Some(integration) = &state.yandex else {
-        return Ok(Json(
-            json!({"available":false,"connected":false,"enabled":false,"requires_reconnect":false,"scenario_id":null,"scenario_name":null,"last_error":null}),
-        ));
+        return Ok(Json(Status {
+            available: false,
+            connected: false,
+            enabled: false,
+            requires_reconnect: false,
+            scenario_id: None,
+            scenario_name: None,
+            last_error: None,
+        }));
     };
     let lang = language(&state, &auth).await;
     let value = integration
         .status(auth.id)
         .await
         .map_err(|e| ApiError::from_yandex(e, lang))?;
-    Ok(Json(json!(value)))
+    Ok(Json(value))
 }
 async fn connect(
     State(state): State<Arc<WebState>>,
     auth: AuthUser,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ConnectResponse>, ApiError> {
     let lang = language(&state, &auth).await;
     let integration = state
         .yandex
         .as_ref()
         .ok_or_else(|| ApiError::unavailable(lang))?;
     let url = integration
-        .start_auth(auth.id, lang.code())
+        .start_auth(auth.id, lang)
         .await
         .map_err(|e| ApiError::from_yandex(e, lang))?;
-    Ok(Json(json!({"url":url})))
+    Ok(Json(ConnectResponse { url }))
 }
 async fn scenarios(
     State(state): State<Arc<WebState>>,
     auth: AuthUser,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ScenariosResponse>, ApiError> {
     let lang = language(&state, &auth).await;
     let integration = state
         .yandex
@@ -143,7 +166,7 @@ async fn scenarios(
         .scenarios(auth.id)
         .await
         .map_err(|e| ApiError::from_yandex(e, lang))?;
-    Ok(Json(json!({"scenarios": values})))
+    Ok(Json(ScenariosResponse { scenarios: values }))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -155,7 +178,7 @@ async fn configure(
     State(state): State<Arc<WebState>>,
     auth: AuthUser,
     Json(input): Json<Selection>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<Status>, ApiError> {
     let lang = language(&state, &auth).await;
     if input.scenario_id.len() > 256 {
         return Err(ApiError {
@@ -172,12 +195,12 @@ async fn configure(
         .configure(auth.id, &input.scenario_id, input.enabled)
         .await
         .map_err(|e| ApiError::from_yandex(e, lang))?;
-    Ok(Json(json!(value)))
+    Ok(Json(value))
 }
 async fn test_scenario(
     State(state): State<Arc<WebState>>,
     auth: AuthUser,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<SuccessResponse>, ApiError> {
     let lang = language(&state, &auth).await;
     let integration = state
         .yandex
@@ -187,12 +210,12 @@ async fn test_scenario(
         .test(auth.id)
         .await
         .map_err(|e| ApiError::from_yandex(e, lang))?;
-    Ok(Json(json!({"ok":true})))
+    Ok(Json(SuccessResponse { ok: true }))
 }
 async fn disconnect(
     State(state): State<Arc<WebState>>,
     auth: AuthUser,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<SuccessResponse>, ApiError> {
     let lang = language(&state, &auth).await;
     let integration = state
         .yandex
@@ -202,7 +225,7 @@ async fn disconnect(
         .disconnect(auth.id)
         .await
         .map_err(|e| ApiError::from_yandex(e, lang))?;
-    Ok(Json(json!({"ok":true})))
+    Ok(Json(SuccessResponse { ok: true }))
 }
 #[derive(Deserialize)]
 struct OAuthCallback {
@@ -221,7 +244,7 @@ async fn callback(
     {
         if query.error.is_some() {
             if let Ok(language) = integration.cancel_auth(nonce).await {
-                lang = Lang::parse(&language);
+                lang = language;
                 outcome = "cancelled";
             }
         } else if let Some(code) = query
@@ -230,7 +253,7 @@ async fn callback(
             .filter(|code| !code.is_empty() && code.len() <= 2048)
             && let Ok(pending) = integration.prepare_auth(nonce, code).await
         {
-            lang = Lang::parse(&pending.language);
+            lang = pending.language;
             if pending.completion_token.len() <= 48
                 && pending
                     .completion_token

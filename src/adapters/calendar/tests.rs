@@ -1,12 +1,13 @@
 use super::*;
 use crate::domain::UtcOffset;
+use crate::domain::{ReminderId, UserId};
 use chrono::{NaiveDate, TimeZone};
 use chrono_tz::Tz;
 
 fn reminder(id: i64, description: &str, due_at: DateTime<Utc>, recurrence: Recurrence) -> Reminder {
     Reminder {
-        id,
-        user_id: 1,
+        id: ReminderId(id),
+        user_id: UserId(1),
         description: description.into(),
         due_at,
         recurrence,

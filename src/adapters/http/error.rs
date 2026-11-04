@@ -2,6 +2,15 @@
 use crate::application as service;
 use crate::domain::InputError;
 use axum::Json;
+use serde::Serialize;
+use std::borrow::Cow;
+
+#[derive(Serialize)]
+pub(super) struct ErrorBody {
+    pub(super) error: Cow<'static, str>,
+    pub(super) code: &'static str,
+}
+
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
@@ -51,6 +60,7 @@ impl From<service::Error> for ApiError {
                 };
                 ApiError::bad_request(code, error.to_string())
             }
+            service::Error::Storage(error) => ApiError::Internal(error.into()),
             service::Error::Internal(error) => ApiError::Internal(error),
         }
     }
@@ -81,7 +91,10 @@ impl IntoResponse for ApiError {
         };
         (
             status,
-            Json(serde_json::json!({ "error": message, "code": code })),
+            Json(ErrorBody {
+                error: message.into(),
+                code,
+            }),
         )
             .into_response()
     }

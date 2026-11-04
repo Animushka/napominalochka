@@ -1,52 +1,38 @@
 //! Reminder preferences use cases.
-use super::{Error, ReminderService, Result};
+use super::{ReminderService, Result};
 use crate::domain::Preferences;
+use crate::domain::UserId;
 
 impl ReminderService {
-    pub(crate) async fn preferences(&self, user_id: i64) -> Result<Preferences> {
+    pub(crate) async fn preferences(&self, user_id: UserId) -> Result<Preferences> {
         Ok(self.repository.preferences(user_id).await?)
     }
 
     /// A manually chosen language is never overwritten by Telegram's language code.
     pub(crate) async fn initialize_language(
         &self,
-        user_id: i64,
+        user_id: UserId,
         telegram_language: Option<&str>,
     ) -> Result<()> {
-        let language = if telegram_language.is_some_and(|code| {
-            code.eq_ignore_ascii_case("en") || code.to_ascii_lowercase().starts_with("en-")
-        }) {
-            "en"
-        } else {
-            "ru"
-        };
+        let language = crate::domain::Language::from_telegram(telegram_language);
         self.repository
-            .initialize_language(user_id, language.into())
+            .initialize_language(user_id, language)
             .await?;
         Ok(())
     }
 
     pub(crate) async fn set_preferences(
         &self,
-        user_id: i64,
-        language: Option<&str>,
-        nag_interval_minutes: Option<i64>,
-        confirmation_check_minutes: Option<i64>,
+        user_id: UserId,
+        language: Option<crate::domain::Language>,
+        nag_interval_minutes: Option<crate::domain::NagInterval>,
+        confirmation_check_minutes: Option<crate::domain::ConfirmationDelay>,
     ) -> Result<Preferences> {
-        if language.is_some_and(|value| !matches!(value, "ru" | "en")) {
-            return Err(Error::InvalidPreferences("language"));
-        }
-        if nag_interval_minutes.is_some_and(|value| ![1, 5, 10, 20, 30, 60].contains(&value)) {
-            return Err(Error::InvalidPreferences("nag_interval_minutes"));
-        }
-        if confirmation_check_minutes.is_some_and(|value| ![0, 20].contains(&value)) {
-            return Err(Error::InvalidPreferences("confirmation_check_minutes"));
-        }
         Ok(self
             .repository
             .set_preferences(
                 user_id,
-                language.map(str::to_owned),
+                language,
                 nag_interval_minutes,
                 confirmation_check_minutes,
             )

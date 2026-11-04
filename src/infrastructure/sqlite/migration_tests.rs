@@ -4,6 +4,7 @@
 use super::Db;
 use super::schema::MIGRATIONS;
 use crate::application::delivery::DeliveryQueue;
+use crate::domain::{NagInterval, NaggingId, ReminderId, UserId};
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 
@@ -37,21 +38,31 @@ async fn upgrading_schema_seven_preserves_pending_work_and_integration_settings(
     .unwrap();
 
     let db = Db::init(conn).unwrap();
-    assert_eq!(db.preferences(1).await.unwrap().nag_interval_minutes, 60);
-    let reminder = db.reminder(1, 7).await.unwrap().unwrap();
+    assert_eq!(
+        db.preferences(UserId(1))
+            .await
+            .unwrap()
+            .nag_interval_minutes,
+        NagInterval::OneHour
+    );
+    let reminder = db
+        .reminder(UserId(1), ReminderId(7))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(reminder.description, "existing reminder");
     assert_eq!(
         reminder.anchor_local.unwrap().to_string(),
         "2026-10-29 09:00:00"
     );
-    let pending = db.naggings_for_user(1).await.unwrap();
+    let pending = db.naggings_for_user(UserId(1)).await.unwrap();
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].id, 41);
+    assert_eq!(pending[0].id, NaggingId(41));
     assert_eq!(pending[0].description, "existing pending");
     let now = DateTime::parse_from_rfc3339("2026-10-29T07:00:00Z")
         .unwrap()
         .with_timezone(&Utc);
-    assert_eq!(db.due_delivery_users(now).await.unwrap(), vec![1]);
+    assert_eq!(db.due_delivery_users(now).await.unwrap(), vec![UserId(1)]);
     db.call(|conn| {
         let defaults: (Option<String>, Option<String>, i64) = conn.query_row(
             "SELECT delivery_claim,delivery_lease_until,delivery_attempts FROM naggings WHERE nagging_id=41",
@@ -95,19 +106,21 @@ async fn history_upgrade_preserves_legacy_pending_and_completion_checks() {
     let now = DateTime::parse_from_rfc3339("2026-10-29T07:00:00Z")
         .unwrap()
         .with_timezone(&Utc);
-    assert_eq!(db.naggings_for_user(1).await.unwrap().len(), 1);
+    assert_eq!(db.naggings_for_user(UserId(1)).await.unwrap().len(), 1);
     let checks = db.due_confirmations(now).await.unwrap();
     assert_eq!(checks.len(), 1);
     assert_eq!(checks[0].completion_id, None);
     assert!(
-        db.completion_history(1, None, 20)
+        db.completion_history(UserId(1), None, 20)
             .await
             .unwrap()
             .items
             .is_empty()
     );
-    db.complete_nagging(1, 41, now).await.unwrap();
-    let journal = db.completion_history(1, None, 20).await.unwrap();
+    db.complete_nagging(UserId(1), NaggingId(41), now)
+        .await
+        .unwrap();
+    let journal = db.completion_history(UserId(1), None, 20).await.unwrap();
     assert_eq!(journal.items.len(), 1);
     assert_eq!(
         journal.items[0].scheduled_at, None,

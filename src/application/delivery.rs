@@ -5,6 +5,7 @@
 //! work available after a restart. External APIs cannot provide exactly-once delivery:
 //! a response lost after Telegram accepted a message can still result in a later repeat.
 
+use crate::domain::UserId;
 use std::collections::{BTreeSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
@@ -49,10 +50,10 @@ pub(crate) enum Item {
 }
 
 impl Item {
-    pub(crate) fn identity(&self) -> (i64, i64) {
+    pub(crate) fn identity(&self) -> (i64, UserId) {
         match self {
-            Self::Reminder(item) => (item.id, item.user_id),
-            Self::Confirmation(item) => (item.id, item.user_id),
+            Self::Reminder(item) => (item.id.0, item.user_id),
+            Self::Confirmation(item) => (item.id.0, item.user_id),
         }
     }
 }
@@ -69,22 +70,22 @@ pub(crate) trait DeliveryQueue: Send + Sync {
     fn due_delivery_users(
         &self,
         now: DateTime<Utc>,
-    ) -> impl Future<Output = anyhow::Result<Vec<i64>>> + Send;
+    ) -> impl Future<Output = crate::application::ports::StorageResult<Vec<UserId>>> + Send;
     fn claim_delivery(
         &self,
-        user_id: i64,
+        user_id: UserId,
         now: DateTime<Utc>,
         lease_until: DateTime<Utc>,
-    ) -> impl Future<Output = anyhow::Result<Option<Claimed>>> + Send;
+    ) -> impl Future<Output = crate::application::ports::StorageResult<Option<Claimed>>> + Send;
     fn finish_delivery(
         &self,
         job: Claimed,
         outcome: Delivery,
         now: DateTime<Utc>,
-    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+    ) -> impl Future<Output = crate::application::ports::StorageResult<()>> + Send;
 }
 
-type ChatWork = Pin<Box<dyn Future<Output = (i64, anyhow::Result<()>)> + Send>>;
+type ChatWork = Pin<Box<dyn Future<Output = (UserId, anyhow::Result<()>)> + Send>>;
 
 /// Bounded delivery workers with a FIFO of ready chats. Completing one chat starts
 /// the next immediately; the planner's polling interval never throttles this queue.
@@ -93,9 +94,9 @@ pub(crate) struct Workers<N, Q> {
     queue: Q,
     shutdown: CancellationToken,
     running: FuturesUnordered<ChatWork>,
-    busy: BTreeSet<i64>,
-    pending: VecDeque<i64>,
-    queued: BTreeSet<i64>,
+    busy: BTreeSet<UserId>,
+    pending: VecDeque<UserId>,
+    queued: BTreeSet<UserId>,
 }
 
 impl<N: Notifier, Q: DeliveryQueue + Clone + 'static> Workers<N, Q> {
@@ -115,7 +116,7 @@ impl<N: Notifier, Q: DeliveryQueue + Clone + 'static> Workers<N, Q> {
         !self.running.is_empty()
     }
 
-    pub(crate) fn enqueue(&mut self, users: impl IntoIterator<Item = i64>) {
+    pub(crate) fn enqueue(&mut self, users: impl IntoIterator<Item = UserId>) {
         for user_id in users {
             if !self.busy.contains(&user_id) && self.queued.insert(user_id) {
                 self.pending.push_back(user_id);
@@ -124,7 +125,7 @@ impl<N: Notifier, Q: DeliveryQueue + Clone + 'static> Workers<N, Q> {
         self.refill();
     }
 
-    pub(crate) async fn next_completion(&mut self) -> Option<(i64, anyhow::Result<()>)> {
+    pub(crate) async fn next_completion(&mut self) -> Option<(UserId, anyhow::Result<()>)> {
         let finished = self.running.next().await?;
         self.busy.remove(&finished.0);
         self.refill();
@@ -181,7 +182,7 @@ pub(crate) async fn drain<N: Notifier, Q: DeliveryQueue>(
 pub(crate) async fn deliver_chat<N: Notifier, Q: DeliveryQueue>(
     notifier: &N,
     db: &Q,
-    user_id: i64,
+    user_id: UserId,
     now: DateTime<Utc>,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<()> {
@@ -214,7 +215,7 @@ pub(crate) async fn deliver_chat<N: Notifier, Q: DeliveryQueue>(
         };
         if let Delivery::Failed(ref error) = outcome {
             tracing::warn!(
-                user_id,
+                user_id = %user_id,
                 error,
                 "Telegram delivery failed; technical retry scheduled"
             );

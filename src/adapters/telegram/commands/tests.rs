@@ -1,4 +1,5 @@
 use super::*;
+use crate::domain::{Language, UserId};
 
 #[test]
 fn parses_commands_and_old_names() {
@@ -56,7 +57,7 @@ async fn language_choice_persists_before_registration_and_localizes_onboarding()
     let service =
         ReminderService::new(crate::infrastructure::sqlite::Db::open_in_memory().unwrap());
     let sender = Sender {
-        chat_id: 71,
+        chat_id: UserId(71),
         first_name: "Ada".into(),
         last_name: String::new(),
         private: true,
@@ -80,8 +81,11 @@ async fn language_choice_persists_before_registration_and_localizes_onboarding()
     .await
     .unwrap();
     assert!(replies[0].text.contains("Language saved: English"));
-    assert_eq!(service.preferences(71).await.unwrap().language, "en");
-    assert!(service.user(71).await.unwrap().is_none());
+    assert_eq!(
+        service.preferences(UserId(71)).await.unwrap().language,
+        Language::En
+    );
+    assert!(service.user(UserId(71)).await.unwrap().is_none());
     let replies = execute(Command::Start, &sender, &bot, &service, Utc::now())
         .await
         .unwrap();
@@ -100,5 +104,8 @@ async fn language_choice_persists_before_registration_and_localizes_onboarding()
         .unwrap();
     assert!(replies[0].text.contains("создать напоминание"));
     assert!(replies[0].text.contains("/language"));
-    assert_eq!(service.preferences(71).await.unwrap().language, "ru");
+    assert_eq!(
+        service.preferences(UserId(71)).await.unwrap().language,
+        Language::Ru
+    );
 }

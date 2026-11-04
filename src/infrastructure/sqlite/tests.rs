@@ -2,6 +2,7 @@ use super::Db;
 use super::mapping::new_token;
 use super::schema::MIGRATIONS;
 use crate::application::ports::Registration;
+use crate::domain::{ConfirmationDelay, Language, NagInterval, UserId};
 use crate::domain::{Preferences, Recurrence, User, UserTz, UtcOffset};
 use chrono::Duration as ChronoDuration;
 use chrono::TimeZone;
@@ -14,7 +15,7 @@ fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
 
 fn user(id: i64) -> User {
     User {
-        id,
+        id: UserId(id),
         first_name: "Ada".into(),
         last_name: String::new(),
         tz: UserTz::Fixed(UtcOffset::from_minutes(480).unwrap()),
@@ -39,7 +40,7 @@ async fn calendar_anchors_survive_reopening_and_legacy_rows_gain_an_anchor() {
     // An unanchored legacy row is upgraded using its current due local date.
     let monthly = db
         .add_reminder(
-            1,
+            UserId(1),
             "monthly".into(),
             utc(2027, 1, 31, 9, 0),
             Recurrence::Monthly,
@@ -50,7 +51,7 @@ async fn calendar_anchors_survive_reopening_and_legacy_rows_gain_an_anchor() {
     let daily_anchor = utc(2026, 3, 28, 1, 30).naive_utc();
     let daily = db
         .add_reminder_with_anchor(
-            2,
+            UserId(2),
             "daily".into(),
             london.utc(daily_anchor),
             Recurrence::Daily,
@@ -61,7 +62,7 @@ async fn calendar_anchors_survive_reopening_and_legacy_rows_gain_an_anchor() {
     let leap_anchor = utc(2028, 2, 29, 9, 0).naive_utc();
     let yearly = db
         .add_reminder_with_anchor(
-            1,
+            UserId(1),
             "yearly".into(),
             leap_anchor.and_utc(),
             Recurrence::Yearly,
@@ -77,7 +78,7 @@ async fn calendar_anchors_survive_reopening_and_legacy_rows_gain_an_anchor() {
     drop(db);
 
     let db = Db::open(&path).unwrap();
-    let monthly = db.reminder(1, monthly.id).await.unwrap().unwrap();
+    let monthly = db.reminder(UserId(1), monthly.id).await.unwrap().unwrap();
     assert_eq!(monthly.due_at, utc(2027, 2, 28, 9, 0));
     assert_eq!(
         monthly.anchor_local,
@@ -87,11 +88,15 @@ async fn calendar_anchors_survive_reopening_and_legacy_rows_gain_an_anchor() {
         .await
         .unwrap();
     assert_eq!(
-        db.reminder(1, monthly.id).await.unwrap().unwrap().due_at,
+        db.reminder(UserId(1), monthly.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .due_at,
         utc(2027, 3, 31, 9, 0)
     );
 
-    let daily = db.reminder(2, daily.id).await.unwrap().unwrap();
+    let daily = db.reminder(UserId(2), daily.id).await.unwrap().unwrap();
     assert_eq!(
         london.local(daily.due_at),
         utc(2026, 3, 29, 2, 30).naive_utc()
@@ -101,11 +106,17 @@ async fn calendar_anchors_survive_reopening_and_legacy_rows_gain_an_anchor() {
         .await
         .unwrap();
     assert_eq!(
-        london.local(db.reminder(2, daily.id).await.unwrap().unwrap().due_at),
+        london.local(
+            db.reminder(UserId(2), daily.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .due_at
+        ),
         utc(2026, 3, 30, 1, 30).naive_utc()
     );
 
-    let mut yearly = db.reminder(1, yearly.id).await.unwrap().unwrap();
+    let mut yearly = db.reminder(UserId(1), yearly.id).await.unwrap().unwrap();
     for year in 2029..=2032 {
         assert_eq!(yearly.anchor_local, Some(leap_anchor));
         assert_eq!(
@@ -115,7 +126,7 @@ async fn calendar_anchors_survive_reopening_and_legacy_rows_gain_an_anchor() {
         db.fire_reminder(yearly.id, yearly.due_at, yearly.due_at)
             .await
             .unwrap();
-        yearly = db.reminder(1, yearly.id).await.unwrap().unwrap();
+        yearly = db.reminder(UserId(1), yearly.id).await.unwrap().unwrap();
     }
     drop(db);
     std::fs::remove_file(path).unwrap();
@@ -135,7 +146,7 @@ async fn pending_one_offs_and_snoozes_survive_reopening_and_stay_private() {
     let mut nags = Vec::new();
     for (owner, text) in [(1, "first"), (1, "second"), (2, "private")] {
         let reminder = db
-            .add_reminder(owner, text.into(), due, Recurrence::Once)
+            .add_reminder(UserId(owner), text.into(), due, Recurrence::Once)
             .await
             .unwrap();
         nags.push(
@@ -145,10 +156,10 @@ async fn pending_one_offs_and_snoozes_survive_reopening_and_stay_private() {
                 .unwrap(),
         );
     }
-    assert!(db.reminders_for_user(1).await.unwrap().is_empty());
+    assert!(db.reminders_for_user(UserId(1)).await.unwrap().is_empty());
     assert!(db.due_naggings(due).await.unwrap().is_empty());
     assert_eq!(
-        db.naggings_for_user(1)
+        db.naggings_for_user(UserId(1))
             .await
             .unwrap()
             .iter()
@@ -157,13 +168,13 @@ async fn pending_one_offs_and_snoozes_survive_reopening_and_stay_private() {
         vec![nags[0].id, nags[1].id]
     );
     let snoozed_until = due + ChronoDuration::hours(1);
-    db.snooze_nagging(1, nags[0].id, snoozed_until)
+    db.snooze_nagging(UserId(1), nags[0].id, snoozed_until)
         .await
         .unwrap();
     drop(db);
 
     let db = Db::open(&path).unwrap();
-    let pending = db.naggings_for_user(1).await.unwrap();
+    let pending = db.naggings_for_user(UserId(1)).await.unwrap();
     assert_eq!(
         pending.iter().map(|n| n.id).collect::<Vec<_>>(),
         vec![nags[1].id, nags[0].id]
@@ -171,11 +182,14 @@ async fn pending_one_offs_and_snoozes_survive_reopening_and_stay_private() {
     assert!(
         pending
             .iter()
-            .all(|n| n.user_id == 1 && n.reminder_id.is_none())
+            .all(|n| n.user_id == UserId(1) && n.reminder_id.is_none())
     );
     assert_eq!(pending[1].next_at, snoozed_until);
-    assert_eq!(db.naggings_for_user(2).await.unwrap()[0].id, nags[2].id);
-    assert!(db.naggings_for_user(3).await.unwrap().is_empty());
+    assert_eq!(
+        db.naggings_for_user(UserId(2)).await.unwrap()[0].id,
+        nags[2].id
+    );
+    assert!(db.naggings_for_user(UserId(3)).await.unwrap().is_empty());
     drop(db);
     std::fs::remove_file(path).unwrap();
 }
@@ -186,42 +200,49 @@ async fn nagging_claim_requires_a_current_due_snapshot_and_only_one_worker_wins(
     db.upsert_user(user(1)).await.unwrap();
     let due = utc(2026, 3, 1, 8, 0);
     let reminder = db
-        .add_reminder(1, "task".into(), due, Recurrence::Once)
+        .add_reminder(UserId(1), "task".into(), due, Recurrence::Once)
         .await
         .unwrap();
     db.fire_reminder(reminder.id, due, due).await.unwrap();
     let observed = db.due_naggings(due).await.unwrap().remove(0);
     let next = due + ChronoDuration::minutes(10);
     let mut wrong_owner = observed.clone();
-    wrong_owner.user_id = 2;
+    wrong_owner.user_id = UserId(2);
     assert!(!db.claim_nagging(&wrong_owner, due, next).await.unwrap());
     let (first, second) = tokio::join!(
         db.claim_nagging(&observed, due, next),
         db.claim_nagging(&observed, due, next),
     );
     assert_ne!(first.unwrap(), second.unwrap());
-    let rescheduled = db.naggings_for_user(1).await.unwrap().remove(0);
+    let rescheduled = db.naggings_for_user(UserId(1)).await.unwrap().remove(0);
     assert!(
         !db.claim_nagging(&rescheduled, due, next).await.unwrap(),
         "future occurrence cannot be claimed"
     );
 
     let until = due + ChronoDuration::hours(1);
-    db.snooze_nagging(1, observed.id, until).await.unwrap();
+    db.snooze_nagging(UserId(1), observed.id, until)
+        .await
+        .unwrap();
     assert!(
         !db.claim_nagging(&rescheduled, next, next + ChronoDuration::minutes(10))
             .await
             .unwrap()
     );
-    assert_eq!(db.naggings_for_user(1).await.unwrap()[0].next_at, until);
-    let snoozed = db.naggings_for_user(1).await.unwrap().remove(0);
-    db.complete_nagging(1, observed.id, next).await.unwrap();
+    assert_eq!(
+        db.naggings_for_user(UserId(1)).await.unwrap()[0].next_at,
+        until
+    );
+    let snoozed = db.naggings_for_user(UserId(1)).await.unwrap().remove(0);
+    db.complete_nagging(UserId(1), observed.id, next)
+        .await
+        .unwrap();
     assert!(
         !db.claim_nagging(&snoozed, until, until + ChronoDuration::minutes(10))
             .await
             .unwrap()
     );
-    assert!(db.naggings_for_user(1).await.unwrap().is_empty());
+    assert!(db.naggings_for_user(UserId(1)).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -238,7 +259,7 @@ async fn snoozing_cancels_only_its_owners_undispatched_yandex_job() {
     let mut nags = Vec::new();
     for owner in [1, 1, 1, 2] {
         let reminder = db
-            .add_reminder(owner, "task".into(), due, Recurrence::Once)
+            .add_reminder(UserId(owner), "task".into(), due, Recurrence::Once)
             .await
             .unwrap();
         nags.push(
@@ -263,7 +284,11 @@ async fn snoozing_cancels_only_its_owners_undispatched_yandex_job() {
     })
     .await
     .unwrap();
-    assert!(!db.snooze_nagging(2, nags[0].id, later).await.unwrap());
+    assert!(
+        !db.snooze_nagging(UserId(2), nags[0].id, later)
+            .await
+            .unwrap()
+    );
     let count = || {
         db.call(|conn| {
             conn.query_row("SELECT COUNT(*) FROM yandex_jobs", [], |row| {
@@ -273,7 +298,11 @@ async fn snoozing_cancels_only_its_owners_undispatched_yandex_job() {
     };
     assert_eq!(count().await.unwrap(), 4);
     for nagging in &nags[..3] {
-        assert!(db.snooze_nagging(1, nagging.id, later).await.unwrap());
+        assert!(
+            db.snooze_nagging(UserId(1), nagging.id, later)
+                .await
+                .unwrap()
+        );
     }
     let remaining = db
         .call(|conn| {
@@ -288,13 +317,16 @@ async fn snoozing_cancels_only_its_owners_undispatched_yandex_job() {
     assert_eq!(
         remaining,
         vec![
-            (nags[2].id, "delivered".into()),
-            (nags[3].id, "pending".into())
+            (nags[2].id.0, "delivered".into()),
+            (nags[3].id.0, "pending".into())
         ]
     );
-    assert_eq!(db.naggings_for_user(1).await.unwrap().len(), 3);
-    assert_eq!(db.naggings_for_user(2).await.unwrap()[0].next_at, due);
-    let snoozed = db.naggings_for_user(1).await.unwrap().remove(0);
+    assert_eq!(db.naggings_for_user(UserId(1)).await.unwrap().len(), 3);
+    assert_eq!(
+        db.naggings_for_user(UserId(2)).await.unwrap()[0].next_at,
+        due
+    );
+    let snoozed = db.naggings_for_user(UserId(1)).await.unwrap().remove(0);
     assert!(
         db.claim_nagging(&snoozed, later, later + ChronoDuration::minutes(10))
             .await
@@ -326,16 +358,16 @@ async fn upgrades_a_database_created_by_the_dotnet_bot() {
 
     let db = Db::init(conn).unwrap();
 
-    let migrated = db.user(1).await.unwrap().unwrap();
+    let migrated = db.user(UserId(1)).await.unwrap().unwrap();
     assert_eq!(
         migrated.tz,
         UserTz::Fixed(UtcOffset::from_minutes(480).unwrap())
     );
-    let reminders = db.reminders_for_user(1).await.unwrap();
+    let reminders = db.reminders_for_user(UserId(1)).await.unwrap();
     assert_eq!(reminders.len(), 1);
     assert_eq!(reminders[0].due_at, utc(2026, 1, 1, 0, 0));
     assert_eq!(reminders[0].recurrence, Recurrence::Daily);
-    assert!(db.reminders_for_user(99).await.unwrap().is_empty());
+    assert!(db.reminders_for_user(UserId(99)).await.unwrap().is_empty());
     assert!(
         db.due_naggings(utc(2030, 1, 1, 0, 0))
             .await
@@ -357,7 +389,7 @@ async fn register_twice_updates_the_user() {
         db.upsert_user(updated.clone()).await.unwrap(),
         Registration::Updated
     );
-    assert_eq!(db.user(1).await.unwrap(), Some(updated));
+    assert_eq!(db.user(UserId(1)).await.unwrap(), Some(updated));
 }
 
 #[tokio::test]
@@ -366,7 +398,7 @@ async fn recurring_reminder_is_rescheduled_and_nags_until_acknowledged() {
     db.upsert_user(user(1)).await.unwrap();
     let due = utc(2026, 3, 1, 8, 0);
     let reminder = db
-        .add_reminder(1, "pills".into(), due, Recurrence::Daily)
+        .add_reminder(UserId(1), "pills".into(), due, Recurrence::Daily)
         .await
         .unwrap();
 
@@ -385,7 +417,7 @@ async fn recurring_reminder_is_rescheduled_and_nags_until_acknowledged() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        db.reminders_for_user(1).await.unwrap()[0].due_at,
+        db.reminders_for_user(UserId(1)).await.unwrap()[0].due_at,
         utc(2026, 3, 2, 8, 0)
     );
     assert!(db.due_reminders(due).await.unwrap().is_empty());
@@ -395,10 +427,10 @@ async fn recurring_reminder_is_rescheduled_and_nags_until_acknowledged() {
     );
 
     assert!(
-        !db.acknowledge_nagging(2, nagging.id).await.unwrap(),
+        !db.acknowledge_nagging(UserId(2), nagging.id).await.unwrap(),
         "other users cannot acknowledge"
     );
-    assert!(db.acknowledge_nagging(1, nagging.id).await.unwrap());
+    assert!(db.acknowledge_nagging(UserId(1), nagging.id).await.unwrap());
     assert!(db.due_naggings(nag_at).await.unwrap().is_empty());
 }
 
@@ -408,7 +440,7 @@ async fn next_occurrence_replaces_an_unacknowledged_nagging() {
     db.upsert_user(user(1)).await.unwrap();
     let due = utc(2026, 3, 1, 8, 0);
     let reminder = db
-        .add_reminder(1, "pills".into(), due, Recurrence::Daily)
+        .add_reminder(UserId(1), "pills".into(), due, Recurrence::Daily)
         .await
         .unwrap();
 
@@ -429,7 +461,7 @@ async fn one_off_reminder_is_consumed_but_keeps_nagging() {
     db.upsert_user(user(1)).await.unwrap();
     let due = utc(2026, 3, 1, 8, 0);
     let reminder = db
-        .add_reminder(1, "call mum".into(), due, Recurrence::Once)
+        .add_reminder(UserId(1), "call mum".into(), due, Recurrence::Once)
         .await
         .unwrap();
 
@@ -438,7 +470,7 @@ async fn one_off_reminder_is_consumed_but_keeps_nagging() {
         .await
         .unwrap()
         .unwrap();
-    assert!(db.reminders_for_user(1).await.unwrap().is_empty());
+    assert!(db.reminders_for_user(UserId(1)).await.unwrap().is_empty());
     let pending = db.due_naggings(due).await.unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].id, nagging.id);
@@ -451,7 +483,7 @@ async fn overdue_reminder_skips_missed_occurrences() {
     db.upsert_user(user(1)).await.unwrap();
     let reminder = db
         .add_reminder(
-            1,
+            UserId(1),
             "water plants".into(),
             utc(2026, 3, 1, 8, 0),
             Recurrence::Daily,
@@ -462,7 +494,7 @@ async fn overdue_reminder_skips_missed_occurrences() {
     let now = utc(2026, 3, 5, 12, 0);
     db.fire_reminder(reminder.id, now, now).await.unwrap();
     assert_eq!(
-        db.reminders_for_user(1).await.unwrap()[0].due_at,
+        db.reminders_for_user(UserId(1)).await.unwrap()[0].due_at,
         utc(2026, 3, 6, 8, 0)
     );
 }
@@ -473,16 +505,16 @@ async fn removing_a_reminder_stops_its_nagging() {
     db.upsert_user(user(1)).await.unwrap();
     let due = utc(2026, 3, 1, 8, 0);
     let reminder = db
-        .add_reminder(1, "pills".into(), due, Recurrence::Daily)
+        .add_reminder(UserId(1), "pills".into(), due, Recurrence::Daily)
         .await
         .unwrap();
     db.fire_reminder(reminder.id, due, due).await.unwrap();
 
     assert!(
-        !db.delete_reminder(2, reminder.id).await.unwrap(),
+        !db.delete_reminder(UserId(2), reminder.id).await.unwrap(),
         "other users cannot delete it"
     );
-    assert!(db.delete_reminder(1, reminder.id).await.unwrap());
+    assert!(db.delete_reminder(UserId(1), reminder.id).await.unwrap());
     assert!(db.due_naggings(due).await.unwrap().is_empty());
 }
 
@@ -492,18 +524,18 @@ async fn unregistering_removes_everything() {
     db.upsert_user(user(1)).await.unwrap();
     let due = utc(2026, 3, 1, 8, 0);
     let reminder = db
-        .add_reminder(1, "a".into(), due, Recurrence::Daily)
+        .add_reminder(UserId(1), "a".into(), due, Recurrence::Daily)
         .await
         .unwrap();
-    db.add_reminder(1, "b".into(), due, Recurrence::Once)
+    db.add_reminder(UserId(1), "b".into(), due, Recurrence::Once)
         .await
         .unwrap();
     db.fire_reminder(reminder.id, due, due).await.unwrap();
 
-    assert!(db.delete_user(1).await.unwrap());
-    assert!(db.reminders_for_user(1).await.unwrap().is_empty());
+    assert!(db.delete_user(UserId(1)).await.unwrap());
+    assert!(db.reminders_for_user(UserId(1)).await.unwrap().is_empty());
     assert!(db.due_naggings(due).await.unwrap().is_empty());
-    assert!(!db.delete_user(1).await.unwrap());
+    assert!(!db.delete_user(UserId(1)).await.unwrap());
 }
 
 #[tokio::test]
@@ -512,12 +544,16 @@ async fn legacy_acknowledgement_by_reminder_id() {
     db.upsert_user(user(1)).await.unwrap();
     let due = utc(2026, 3, 1, 8, 0);
     let reminder = db
-        .add_reminder(1, "pills".into(), due, Recurrence::Weekly)
+        .add_reminder(UserId(1), "pills".into(), due, Recurrence::Weekly)
         .await
         .unwrap();
     db.fire_reminder(reminder.id, due, due).await.unwrap();
 
-    assert!(db.acknowledge_reminder(1, reminder.id).await.unwrap());
+    assert!(
+        db.acknowledge_reminder(UserId(1), reminder.id)
+            .await
+            .unwrap()
+    );
     assert!(db.due_naggings(due).await.unwrap().is_empty());
 }
 
@@ -526,35 +562,44 @@ async fn draft_becomes_a_reminder_once() {
     let db = Db::open_in_memory().unwrap();
     db.upsert_user(user(1)).await.unwrap();
     let now = utc(2026, 3, 1, 8, 0);
-    let first = db.create_draft(1, "old".into(), now).await.unwrap();
-    let draft = db.create_draft(1, "call mum".into(), now).await.unwrap();
+    let first = db.create_draft(UserId(1), "old".into(), now).await.unwrap();
+    let draft = db
+        .create_draft(UserId(1), "call mum".into(), now)
+        .await
+        .unwrap();
     assert_eq!(
-        db.draft(1, first.id).await.unwrap(),
+        db.draft(UserId(1), first.id).await.unwrap(),
         None,
         "only the latest draft is kept"
     );
     assert_eq!(
-        db.draft(2, draft.id).await.unwrap(),
+        db.draft(UserId(2), draft.id).await.unwrap(),
         None,
         "drafts are private"
     );
-    assert_eq!(db.pending_draft(1, now).await.unwrap(), Some(draft.clone()));
+    assert_eq!(
+        db.pending_draft(UserId(1), now).await.unwrap(),
+        Some(draft.clone())
+    );
 
     let due = utc(2026, 3, 2, 1, 0);
     let reminder = db
-        .save_draft(1, draft.id, due, Recurrence::Weekdays)
+        .save_draft(UserId(1), draft.id, due, Recurrence::Weekdays)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(reminder.description, "call mum");
     assert_eq!(reminder.recurrence, Recurrence::Weekdays);
     assert_eq!(
-        db.save_draft(1, draft.id, due, Recurrence::Once)
+        db.save_draft(UserId(1), draft.id, due, Recurrence::Once)
             .await
             .unwrap(),
         None
     );
-    assert_eq!(db.reminders_for_user(1).await.unwrap(), vec![reminder]);
+    assert_eq!(
+        db.reminders_for_user(UserId(1)).await.unwrap(),
+        vec![reminder]
+    );
 }
 
 #[tokio::test]
@@ -563,20 +608,20 @@ async fn updates_and_snoozes() {
     db.upsert_user(user(1)).await.unwrap();
     let due = utc(2026, 3, 1, 8, 0);
     let reminder = db
-        .add_reminder(1, "pills".into(), due, Recurrence::Once)
+        .add_reminder(UserId(1), "pills".into(), due, Recurrence::Once)
         .await
         .unwrap();
 
     let later = utc(2026, 3, 3, 9, 0);
     assert_eq!(
-        db.update_reminder(2, reminder.id, None, later, Recurrence::Daily)
+        db.update_reminder(UserId(2), reminder.id, None, later, Recurrence::Daily)
             .await
             .unwrap(),
         None
     );
     let updated = db
         .update_reminder(
-            1,
+            UserId(1),
             reminder.id,
             Some("vitamins".into()),
             later,
@@ -601,12 +646,12 @@ async fn updates_and_snoozes() {
         .unwrap();
     let snooze_until = later + ChronoDuration::hours(1);
     assert!(
-        !db.snooze_nagging(2, nagging.id, snooze_until)
+        !db.snooze_nagging(UserId(2), nagging.id, snooze_until)
             .await
             .unwrap()
     );
     assert!(
-        db.snooze_nagging(1, nagging.id, snooze_until)
+        db.snooze_nagging(UserId(1), nagging.id, snooze_until)
             .await
             .unwrap()
     );
@@ -620,7 +665,7 @@ async fn named_timezone_round_trips() {
     let mut u = user(1);
     u.tz = UserTz::Named(chrono_tz::Tz::America__New_York);
     db.upsert_user(u.clone()).await.unwrap();
-    assert_eq!(db.user(1).await.unwrap(), Some(u));
+    assert_eq!(db.user(UserId(1)).await.unwrap(), Some(u));
 }
 
 #[tokio::test]
@@ -629,12 +674,12 @@ async fn ids_of_deleted_rows_are_not_reused() {
     db.upsert_user(user(1)).await.unwrap();
     let due = utc(2026, 3, 1, 8, 0);
     let first = db
-        .add_reminder(1, "a".into(), due, Recurrence::Once)
+        .add_reminder(UserId(1), "a".into(), due, Recurrence::Once)
         .await
         .unwrap();
-    db.delete_reminder(1, first.id).await.unwrap();
+    db.delete_reminder(UserId(1), first.id).await.unwrap();
     let second = db
-        .add_reminder(1, "b".into(), due, Recurrence::Once)
+        .add_reminder(UserId(1), "b".into(), due, Recurrence::Once)
         .await
         .unwrap();
     assert_ne!(first.id, second.id);
@@ -644,9 +689,9 @@ async fn ids_of_deleted_rows_are_not_reused() {
         .await
         .unwrap()
         .unwrap();
-    db.acknowledge_nagging(1, nag.id).await.unwrap();
+    db.acknowledge_nagging(UserId(1), nag.id).await.unwrap();
     let third = db
-        .add_reminder(1, "c".into(), due, Recurrence::Once)
+        .add_reminder(UserId(1), "c".into(), due, Recurrence::Once)
         .await
         .unwrap();
     let next_nag = db.fire_reminder(third.id, due, due).await.unwrap().unwrap();
@@ -657,22 +702,22 @@ async fn ids_of_deleted_rows_are_not_reused() {
 async fn calendar_tokens() {
     let db = Db::open_in_memory().unwrap();
     assert_eq!(
-        db.calendar_token(1, false).await.unwrap(),
+        db.calendar_token(UserId(1), false).await.unwrap(),
         None,
         "unregistered"
     );
     db.upsert_user(user(1)).await.unwrap();
     db.upsert_user(user(2)).await.unwrap();
 
-    let token = db.calendar_token(1, false).await.unwrap().unwrap();
+    let token = db.calendar_token(UserId(1), false).await.unwrap().unwrap();
     assert_eq!(token.len(), 64);
     assert_eq!(
-        db.calendar_token(1, false).await.unwrap().as_ref(),
+        db.calendar_token(UserId(1), false).await.unwrap().as_ref(),
         Some(&token),
         "stable"
     );
     assert_ne!(
-        db.calendar_token(2, false).await.unwrap().as_ref(),
+        db.calendar_token(UserId(2), false).await.unwrap().as_ref(),
         Some(&token)
     );
     assert_eq!(
@@ -680,10 +725,10 @@ async fn calendar_tokens() {
             .await
             .unwrap()
             .map(|u| u.id),
-        Some(1)
+        Some(UserId(1))
     );
 
-    let new = db.calendar_token(1, true).await.unwrap().unwrap();
+    let new = db.calendar_token(UserId(1), true).await.unwrap().unwrap();
     assert_ne!(new, token);
     assert_eq!(
         db.user_by_calendar_token(token).await.unwrap(),
@@ -692,7 +737,7 @@ async fn calendar_tokens() {
     );
     assert_eq!(
         db.user_by_calendar_token(new).await.unwrap().map(|u| u.id),
-        Some(1)
+        Some(UserId(1))
     );
 }
 #[tokio::test]
@@ -702,13 +747,18 @@ async fn preferences_and_completion_checks_survive_reopening() {
         new_token().unwrap()
     ));
     let db = Db::open(&path).unwrap();
-    db.set_preferences(7, Some("en".into()), Some(20), Some(20))
-        .await
-        .unwrap();
+    db.set_preferences(
+        UserId(7),
+        Some(Language::En),
+        Some(NagInterval::TwentyMinutes),
+        Some(ConfirmationDelay::TwentyMinutes),
+    )
+    .await
+    .unwrap();
     db.upsert_user(user(7)).await.unwrap();
     let due = utc(2026, 3, 1, 8, 0);
     let reminder = db
-        .add_reminder(7, "done".into(), due, Recurrence::Once)
+        .add_reminder(UserId(7), "done".into(), due, Recurrence::Once)
         .await
         .unwrap();
     let nagging = db
@@ -716,15 +766,17 @@ async fn preferences_and_completion_checks_survive_reopening() {
         .await
         .unwrap()
         .unwrap();
-    db.complete_nagging(7, nagging.id, due).await.unwrap();
+    db.complete_nagging(UserId(7), nagging.id, due)
+        .await
+        .unwrap();
     drop(db);
     let db = Db::open(&path).unwrap();
     assert_eq!(
-        db.preferences(7).await.unwrap(),
+        db.preferences(UserId(7)).await.unwrap(),
         Preferences {
-            language: "en".into(),
-            nag_interval_minutes: 20,
-            confirmation_check_minutes: 20
+            language: Language::En,
+            nag_interval_minutes: NagInterval::TwentyMinutes,
+            confirmation_check_minutes: ConfirmationDelay::TwentyMinutes
         }
     );
     assert!(
@@ -740,13 +792,18 @@ async fn preferences_and_completion_checks_survive_reopening() {
             .len(),
         1
     );
-    db.set_preferences(8, Some("ru".into()), Some(5), Some(20))
-        .await
-        .unwrap();
+    db.set_preferences(
+        UserId(8),
+        Some(Language::Ru),
+        Some(NagInterval::FiveMinutes),
+        Some(ConfirmationDelay::TwentyMinutes),
+    )
+    .await
+    .unwrap();
     db.upsert_user(user(8)).await.unwrap();
     let reminder = db
         .add_reminder(
-            8,
+            UserId(8),
             "other user's completed task".into(),
             due,
             Recurrence::Once,
@@ -758,8 +815,12 @@ async fn preferences_and_completion_checks_survive_reopening() {
         .await
         .unwrap()
         .unwrap();
-    db.complete_nagging(8, nagging.id, due).await.unwrap();
-    db.set_preferences(7, None, None, Some(0)).await.unwrap();
+    db.complete_nagging(UserId(8), nagging.id, due)
+        .await
+        .unwrap();
+    db.set_preferences(UserId(7), None, None, Some(ConfirmationDelay::Disabled))
+        .await
+        .unwrap();
     let remaining = db
         .due_confirmations(due + ChronoDuration::days(1))
         .await
@@ -769,8 +830,8 @@ async fn preferences_and_completion_checks_survive_reopening() {
         1,
         "disabling cancels only the owner's pending checks"
     );
-    assert_eq!(remaining[0].user_id, 8);
-    db.delete_user(8).await.unwrap();
+    assert_eq!(remaining[0].user_id, UserId(8));
+    db.delete_user(UserId(8)).await.unwrap();
     assert!(
         db.due_confirmations(due + ChronoDuration::days(1))
             .await
@@ -784,10 +845,17 @@ async fn preferences_and_completion_checks_survive_reopening() {
 async fn deleting_a_recurring_reminder_also_cancels_its_completion_check() {
     let db = Db::open_in_memory().unwrap();
     db.upsert_user(user(1)).await.unwrap();
-    db.set_preferences(1, None, None, Some(20)).await.unwrap();
+    db.set_preferences(
+        UserId(1),
+        None,
+        None,
+        Some(ConfirmationDelay::TwentyMinutes),
+    )
+    .await
+    .unwrap();
     let due = utc(2026, 3, 1, 8, 0);
     let reminder = db
-        .add_reminder(1, "daily".into(), due, Recurrence::Daily)
+        .add_reminder(UserId(1), "daily".into(), due, Recurrence::Daily)
         .await
         .unwrap();
     let nagging = db
@@ -795,7 +863,9 @@ async fn deleting_a_recurring_reminder_also_cancels_its_completion_check() {
         .await
         .unwrap()
         .unwrap();
-    db.complete_nagging(1, nagging.id, due).await.unwrap();
+    db.complete_nagging(UserId(1), nagging.id, due)
+        .await
+        .unwrap();
     assert_eq!(
         db.due_confirmations(due + ChronoDuration::minutes(20))
             .await
@@ -803,7 +873,7 @@ async fn deleting_a_recurring_reminder_also_cancels_its_completion_check() {
             .len(),
         1
     );
-    db.delete_reminder(1, reminder.id).await.unwrap();
+    db.delete_reminder(UserId(1), reminder.id).await.unwrap();
     assert!(
         db.due_confirmations(due + ChronoDuration::days(1))
             .await

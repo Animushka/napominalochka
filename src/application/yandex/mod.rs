@@ -4,6 +4,7 @@
 //! authorization URL or OAuth code is included in an error or log. Scenario POSTs are
 //! at-most-once: the durable claim is committed before the request and is never retried.
 
+use crate::domain::UserId;
 use std::sync::Arc;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -55,13 +56,13 @@ impl YandexService {
         }
     }
 
-    async fn lock(&self, user_id: i64) -> MutexGuard<'_, ()> {
-        self.inner.locks[(user_id as u64 % 64) as usize]
+    async fn lock(&self, user_id: UserId) -> MutexGuard<'_, ()> {
+        self.inner.locks[(user_id.0 as u64 % 64) as usize]
             .lock()
             .await
     }
 
-    pub(crate) async fn status(&self, user_id: i64) -> Result<Status> {
+    pub(crate) async fn status(&self, user_id: UserId) -> Result<Status> {
         let c = self.connection(user_id).await?;
         Ok(Status {
             available: true,
@@ -78,7 +79,7 @@ impl YandexService {
 
     fn seal(
         &self,
-        user_id: i64,
+        user_id: UserId,
         generation: &str,
         kind: &str,
         plaintext: &[u8],
@@ -86,7 +87,13 @@ impl YandexService {
         self.inner.cipher.seal(user_id, generation, kind, plaintext)
     }
 
-    fn open(&self, user_id: i64, generation: &str, kind: &str, envelope: &[u8]) -> Result<Vec<u8>> {
+    fn open(
+        &self,
+        user_id: UserId,
+        generation: &str,
+        kind: &str,
+        envelope: &[u8],
+    ) -> Result<Vec<u8>> {
         self.inner.cipher.open(user_id, generation, kind, envelope)
     }
 }

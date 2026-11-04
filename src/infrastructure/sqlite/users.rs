@@ -2,13 +2,15 @@
 use super::mapping::{new_token, preferences_from_row, user_from_row};
 use super::{Db, USER_COLUMNS, reminder_settings};
 use crate::application::ports::Registration;
+use crate::application::ports::StorageResult;
+use crate::domain::UserId;
 use crate::domain::{Preferences, User};
 use chrono::Utc;
 use rusqlite::{OptionalExtension, params};
 
 impl Db {
     /// Reading defaults does not register a user or overwrite Telegram's initial language.
-    pub(crate) async fn preferences(&self, user_id: i64) -> anyhow::Result<Preferences> {
+    pub(crate) async fn preferences(&self, user_id: UserId) -> StorageResult<Preferences> {
         self.call(move |conn| {
             Ok(conn.query_row(
                 "SELECT language, nag_interval_minutes, confirmation_check_minutes FROM preferences WHERE user_id = ?1",
@@ -19,9 +21,9 @@ impl Db {
 
     pub(crate) async fn initialize_language(
         &self,
-        user_id: i64,
-        language: String,
-    ) -> anyhow::Result<()> {
+        user_id: UserId,
+        language: crate::domain::Language,
+    ) -> StorageResult<()> {
         self.call(move |conn| {
             conn.execute(
                 "INSERT OR IGNORE INTO preferences (user_id, language) VALUES (?1, ?2)",
@@ -34,11 +36,11 @@ impl Db {
 
     pub(crate) async fn set_preferences(
         &self,
-        user_id: i64,
-        language: Option<String>,
-        nag_interval_minutes: Option<i64>,
-        confirmation_check_minutes: Option<i64>,
-    ) -> anyhow::Result<Preferences> {
+        user_id: UserId,
+        language: Option<crate::domain::Language>,
+        nag_interval_minutes: Option<crate::domain::NagInterval>,
+        confirmation_check_minutes: Option<crate::domain::ConfirmationDelay>,
+    ) -> StorageResult<Preferences> {
         self.call(move |conn| {
             let tx = conn.transaction()?;
             tx.execute("INSERT OR IGNORE INTO preferences (user_id) VALUES (?1)", [user_id])?;
@@ -46,7 +48,7 @@ impl Db {
                 "UPDATE preferences SET language = COALESCE(?1, language), nag_interval_minutes = COALESCE(?2, nag_interval_minutes), confirmation_check_minutes = COALESCE(?3, confirmation_check_minutes) WHERE user_id = ?4 RETURNING language, nag_interval_minutes, confirmation_check_minutes",
                 params![language, nag_interval_minutes, confirmation_check_minutes, user_id], preferences_from_row,
             )?;
-            if settings.confirmation_check_minutes == 0 {
+            if settings.confirmation_check_minutes == crate::domain::ConfirmationDelay::Disabled {
                 tx.execute(&format!("DELETE FROM confirmations WHERE user_id = ?1 AND ({}) <> 20", reminder_settings::EFFECTIVE_CONFIRMATION_CHECK), [user_id])?;
             }
             tx.commit()?;
@@ -54,7 +56,7 @@ impl Db {
         }).await
     }
 
-    pub(crate) async fn upsert_user(&self, user: User) -> anyhow::Result<Registration> {
+    pub(crate) async fn upsert_user(&self, user: User) -> StorageResult<Registration> {
         self.call(move |conn| {
             let tx = conn.transaction()?;
             let exists = tx
@@ -89,7 +91,7 @@ impl Db {
         .await
     }
 
-    pub(crate) async fn user(&self, user_id: i64) -> anyhow::Result<Option<User>> {
+    pub(crate) async fn user(&self, user_id: UserId) -> StorageResult<Option<User>> {
         self.call(move |conn| {
             conn.query_row(
                 &format!("SELECT {USER_COLUMNS} FROM users WHERE user_id = ?1"),
@@ -105,9 +107,9 @@ impl Db {
     /// revokes the previous feed URL. Returns `None` if the user is not registered.
     pub(crate) async fn calendar_token(
         &self,
-        user_id: i64,
+        user_id: UserId,
         reset: bool,
-    ) -> anyhow::Result<Option<String>> {
+    ) -> StorageResult<Option<String>> {
         let candidate = new_token()?;
         self.call(move |conn| {
             let sql = if reset {
@@ -125,7 +127,7 @@ impl Db {
     pub(crate) async fn user_by_calendar_token(
         &self,
         token: String,
-    ) -> anyhow::Result<Option<User>> {
+    ) -> StorageResult<Option<User>> {
         self.call(move |conn| {
             conn.query_row(
                 &format!("SELECT {USER_COLUMNS} FROM users WHERE calendar_token = ?1"),
@@ -138,7 +140,7 @@ impl Db {
     }
 
     /// Removes preferences/drafts even before registration; owned reminder data cascades.
-    pub(crate) async fn delete_user(&self, user_id: i64) -> anyhow::Result<bool> {
+    pub(crate) async fn delete_user(&self, user_id: UserId) -> StorageResult<bool> {
         self.call(move |conn| {
             let tx = conn.transaction()?;
             tx.execute("DELETE FROM preferences WHERE user_id = ?1", [user_id])?;

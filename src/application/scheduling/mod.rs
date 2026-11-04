@@ -71,7 +71,7 @@ async fn run_loop<N: Notifier, R: PlanningRepository + DeliveryQueue>(
             _ = ticker.tick() => {}
             Some((user_id, result)) = workers.next_completion(), if workers.has_running() => {
                 if let Err(error) = result {
-                    tracing::error!(?error, user_id, "Telegram delivery worker failed");
+                    tracing::error!(?error, user_id = %user_id, "Telegram delivery worker failed");
                 }
                 continue;
             }
@@ -114,8 +114,8 @@ async fn plan<R: PlanningRepository>(db: &R, now: DateTime<Utc>) -> anyhow::Resu
     for reminder in db.due_reminders(now).await? {
         if db.fire_reminder(reminder.id, now, now).await?.is_some() {
             tracing::info!(
-                reminder_id = reminder.id,
-                user_id = reminder.user_id,
+                reminder_id = %reminder.id,
+                user_id = %reminder.user_id,
                 "reminder planned"
             );
         }

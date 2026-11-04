@@ -1,10 +1,11 @@
 //! Reminder calendar use cases.
 use super::{Error, ReminderService, Result};
+use crate::domain::UserId;
 use crate::domain::{Reminder, User};
 
 impl ReminderService {
     /// The user's feed token; `reset` replaces it, revoking the old feed URL.
-    pub(crate) async fn calendar_token(&self, user_id: i64, reset: bool) -> Result<String> {
+    pub(crate) async fn calendar_token(&self, user_id: UserId, reset: bool) -> Result<String> {
         self.repository
             .calendar_token(user_id, reset)
             .await?

@@ -1,10 +1,11 @@
 //! Yandex scenarios use cases.
 use super::YandexService;
 use super::types::{ActionResult, Connection, Error, Job, Result, Scenario, Status};
+use crate::domain::UserId;
 use tokio_util::sync::CancellationToken;
 
 impl YandexService {
-    pub(crate) async fn scenarios(&self, user_id: i64) -> Result<Vec<Scenario>> {
+    pub(crate) async fn scenarios(&self, user_id: UserId) -> Result<Vec<Scenario>> {
         let _guard = self.lock(user_id).await;
         let c = self.require_connection(user_id).await?;
         let result = async {
@@ -21,7 +22,7 @@ impl YandexService {
 
     pub(crate) async fn configure(
         &self,
-        user_id: i64,
+        user_id: UserId,
         scenario_id: &str,
         enabled: bool,
     ) -> Result<Status> {
@@ -64,13 +65,13 @@ impl YandexService {
         self.status(user_id).await
     }
 
-    pub(crate) async fn disconnect(&self, user_id: i64) -> Result<()> {
+    pub(crate) async fn disconnect(&self, user_id: UserId) -> Result<()> {
         let _guard = self.lock(user_id).await;
         self.inner.repository.disconnect(user_id).await?;
         Ok(())
     }
 
-    pub(crate) async fn test(&self, user_id: i64) -> Result<()> {
+    pub(crate) async fn test(&self, user_id: UserId) -> Result<()> {
         let _guard = self.lock(user_id).await;
         let c = self.require_connection(user_id).await?;
         let scenario_id = c.scenario_id.clone().ok_or(Error::ScenarioMissing)?;
@@ -85,7 +86,7 @@ impl YandexService {
     /// Tests use the same preparation/dispatch boundary as queued delivery.
     pub(super) async fn execute(
         &self,
-        user_id: i64,
+        user_id: UserId,
         c: &Connection,
         scenario_id: &str,
         job: Option<&Job>,
@@ -106,7 +107,7 @@ impl YandexService {
     /// does not execute a device action. No durable action claim exists at this stage.
     pub(super) async fn prepare_action(
         &self,
-        user_id: i64,
+        user_id: UserId,
         c: &Connection,
         scenario_id: &str,
         shutdown: &CancellationToken,
@@ -134,7 +135,7 @@ impl YandexService {
     /// POST begins, allow its bounded HTTP deadline to finish; never cancel and replay it.
     pub(super) async fn dispatch_action(
         &self,
-        user_id: i64,
+        user_id: UserId,
         c: &Connection,
         scenario_id: &str,
         job: Option<&Job>,
@@ -161,7 +162,7 @@ impl YandexService {
         Ok(ActionResult::Delivered)
     }
 
-    pub(super) async fn require_connection(&self, user_id: i64) -> Result<Connection> {
+    pub(super) async fn require_connection(&self, user_id: UserId) -> Result<Connection> {
         let c = self.connection(user_id).await?.ok_or(Error::NotConnected)?;
         if c.requires_reconnect {
             return Err(Error::ReconnectRequired);
@@ -172,7 +173,7 @@ impl YandexService {
         Ok(c)
     }
 
-    pub(super) async fn connection(&self, user_id: i64) -> Result<Option<Connection>> {
+    pub(super) async fn connection(&self, user_id: UserId) -> Result<Option<Connection>> {
         Ok(self.inner.repository.connection(user_id).await?)
     }
 }

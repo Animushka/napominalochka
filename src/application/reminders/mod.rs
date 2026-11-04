@@ -5,7 +5,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use super::ports::ReminderRepository;
-use crate::domain::{InputError, Recurrence, ReminderSettings, UserTz};
+use crate::domain::{InputError, Recurrence, UserTz};
 
 pub(crate) const MAX_DESCRIPTION_CHARS: usize = 1000;
 /// "Snooze until tomorrow" means this local time.
@@ -25,6 +25,8 @@ pub(crate) enum Error {
     #[error(transparent)]
     Input(#[from] InputError),
     #[error(transparent)]
+    Storage(#[from] crate::application::ports::StorageError),
+    #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
 
@@ -32,7 +34,7 @@ pub(crate) type Result<T> = std::result::Result<T, Error>;
 
 /// Who a request is from, as reported by Telegram.
 pub(crate) struct Profile {
-    pub(crate) id: i64,
+    pub(crate) id: crate::domain::UserId,
     pub(crate) first_name: String,
     pub(crate) last_name: String,
 }
@@ -70,22 +72,6 @@ fn description(text: &str) -> Result<String> {
         return Err(InputError::DescriptionTooLong.into());
     }
     Ok(text.to_owned())
-}
-
-fn validate_settings(settings: &ReminderSettings) -> Result<()> {
-    if settings
-        .nag_interval_minutes
-        .is_some_and(|value| ![1, 5, 10, 20, 30, 60].contains(&value))
-    {
-        return Err(Error::InvalidPreferences("nag_interval_minutes"));
-    }
-    if settings
-        .confirmation_check_minutes
-        .is_some_and(|value| ![0, 20].contains(&value))
-    {
-        return Err(Error::InvalidPreferences("confirmation_check_minutes"));
-    }
-    Ok(())
 }
 
 /// A time that has passed moves to the next occurrence; for one-off reminders it is an error.
